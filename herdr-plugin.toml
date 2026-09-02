@@ -1,8 +1,8 @@
 id = "nathanflurry.jj-workspace"
 name = "jj workspaces"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.0"
-description = "Create and remove Jujutsu (jj) workspaces as Herdr workspaces or tabs."
+description = "Create jj workspaces with Codex on the left and a terminal on the right."
 platforms = ["linux", "macos"]
 
 # Built at install time (needs cargo). `plugin link` does not build, so local
@@ -10,21 +10,22 @@ platforms = ["linux", "macos"]
 [[build]]
 command = ["cargo", "build", "--release"]
 
-# Open a new jj workspace as a new Herdr workspace.
+# Open a new jj workspace as a new Herdr workspace with Codex + terminal.
 [[actions]]
 id = "new"
 title = "New jj workspace"
 contexts = ["workspace", "global"]
 command = ["./target/release/jj-workspace", "open", "workspace"]
 
-# Open a new jj workspace as a new tab in the current workspace.
+# Compatibility action: 0.2 always opens a full Herdr workspace so it can
+# provide the Codex-left, terminal-right layout.
 [[actions]]
 id = "new-tab"
-title = "New jj workspace (in tab)"
+title = "New jj workspace"
 contexts = ["workspace", "global"]
-command = ["./target/release/jj-workspace", "open", "tab"]
+command = ["./target/release/jj-workspace", "open", "workspace"]
 
-# Interactive wizard the actions above open (prompts for a name in a pane).
+# Interactive source-workspace + name selector opened by both actions.
 [[panes]]
 id = "wizard"
 title = "New jj workspace"

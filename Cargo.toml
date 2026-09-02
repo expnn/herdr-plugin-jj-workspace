@@ -1,6 +1,6 @@
 [package]
 name = "jj-workspace"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # Same TUI stack as Herdr, so the wizard pane renders the real worktree-style
@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.29"
+serde_json = "1"
 
 [profile.release]
 opt-level = "z"

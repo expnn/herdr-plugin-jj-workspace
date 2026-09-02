@@ -2,8 +2,8 @@
 // mirroring Herdr's own git-worktree flow and dialog.
 //
 // One binary, dispatched by subcommand (set in herdr-plugin.toml):
-//   open <workspace|tab>  action: resolve the focused repo, open the wizard pane
-//   wizard                pane:   the worktree-style modal, `jj workspace add`, open it
+//   open <workspace|tab>  action: capture the caller, open the wizard pane
+//   wizard                pane:   select a source + name, create the two-pane workspace
 //   remove                action: `jj workspace forget` + delete dir + close in Herdr
 //
 // The wizard renders the actual "new worktree" modal using the same TUI stack as
@@ -15,6 +15,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::{
@@ -24,13 +26,34 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame, Terminal,
 };
+use serde_json::Value;
+
+#[derive(Clone, Debug)]
+struct WorkspaceChoice {
+    id: String,
+    label: String,
+    path: String,
+}
+
+struct WizardResult {
+    source: WorkspaceChoice,
+    name: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WizardField {
+    Workspace,
+    Name,
+}
+
+const JJ_UPDATE_COMMAND: &str = "jj git fetch && jj rebase -s @ -d 'trunk()'";
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -46,12 +69,16 @@ fn main() {
     }
 }
 
-/// Action (headless): figure out which repo is focused, then open the wizard
-/// pane, handing it the repo and open-mode via `--env`.
-fn cmd_open(mode: &str) -> ! {
+/// Action (headless): capture the calling workspace, then open the wizard pane.
+fn cmd_open(_mode: &str) -> ! {
     let ctx = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
-    let repo = json_string_field(&ctx, "workspace_cwd")
-        .or_else(|| json_string_field(&ctx, "focused_pane_cwd"))
+    let cwd = json_string_field(&ctx, "focused_pane_cwd")
+        .or_else(|| json_string_field(&ctx, "workspace_cwd"))
+        .unwrap_or_default();
+    let workspace_id = env::var("HERDR_WORKSPACE_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| json_string_field(&ctx, "workspace_id"))
         .unwrap_or_default();
 
     let mut cmd = Command::new(herdr_bin());
@@ -65,9 +92,9 @@ fn cmd_open(mode: &str) -> ! {
         "wizard",
     ])
     .arg("--env")
-    .arg(format!("JJ_REPO={repo}"))
+    .arg(format!("JJ_CURRENT_CWD={cwd}"))
     .arg("--env")
-    .arg(format!("JJ_OPEN={mode}"))
+    .arg(format!("JJ_CURRENT_WORKSPACE={workspace_id}"))
     .arg("--focus");
     match cmd.status() {
         Ok(status) => process::exit(status.code().unwrap_or(0)),
@@ -78,137 +105,324 @@ fn cmd_open(mode: &str) -> ! {
     }
 }
 
-/// Pane (interactive TTY): the worktree-style modal, then create + open.
+/// Pane (interactive TTY): select a source workspace and name, then create the
+/// Codex-left / terminal-right Herdr workspace.
 fn cmd_wizard() -> ! {
-    if which("jj").is_none() {
-        fail("jj not found on PATH");
-    }
-    let mode = env::var("JJ_OPEN").unwrap_or_else(|_| "workspace".into());
-
-    let mut repo = env::var("JJ_REPO").unwrap_or_default();
-    if repo.is_empty() || !is_jj_workspace(&repo) {
-        repo = prompt("jj repo path: ");
-    }
-    let repo = repo.trim_end_matches('/').to_string();
-    if !is_jj_workspace(&repo) {
-        fail(&format!("{repo} is not a jj workspace"));
-    }
-    // Resolve to the MAIN workspace root. The wizard may be launched from a
-    // secondary workspace (e.g. ~/.herdr/workspaces/agent-os/pkg-perf); without
-    // this, repo_name would be the leaf ("pkg-perf") and new workspaces would be
-    // scattered under workspaces/pkg-perf/ instead of workspaces/agent-os/.
-    let repo = repo_root(&repo);
-
-    let repo_name = basename(&repo);
+    let current_cwd = env::var("JJ_CURRENT_CWD").unwrap_or_default();
+    let current_workspace = env::var("JJ_CURRENT_WORKSPACE").unwrap_or_default();
+    let choices = match load_workspace_choices(&current_workspace, &current_cwd) {
+        Ok(choices) if !choices.is_empty() => choices,
+        Ok(_) => fail("Herdr has no workspaces to select"),
+        Err(err) => fail(&err),
+    };
+    let selected = choices
+        .iter()
+        .position(|choice| choice.id == current_workspace)
+        .unwrap_or(0);
     let root = workspaces_root();
-    let default_branch = generated_name(seed());
 
-    // Run the ported worktree modal; None = the user pressed esc.
-    let branch = match run_wizard(&repo_name, &root, default_branch) {
-        Ok(Some(branch)) => branch,
+    let selection = match run_workspace_wizard(&choices, selected, &root, generated_name(seed())) {
+        Ok(Some(selection)) => selection,
         Ok(None) => process::exit(0),
         Err(err) => fail(&format!("terminal error: {err}")),
     };
-
-    let slug = branch_to_path_slug(&branch);
-    let dest_path = root.join(&repo_name).join(&slug);
-    if dest_path.exists() {
-        fail(&format!("checkout already exists: {}", dest_path.display()));
+    let source = selection.source.path.trim_end_matches('/').to_string();
+    if source.is_empty() || !Path::new(&source).is_dir() {
+        fail(&format!("workspace folder does not exist: {source}"));
     }
-    // jj workspace add does not create intermediate dirs (Herdr create_dir_all's
-    // the parent before `git worktree add` for the same reason).
-    if let Some(parent) = dest_path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            fail(&format!("could not create {}: {err}", parent.display()));
+
+    let is_jj = is_jj_workspace(&source);
+    let destination = if is_jj {
+        if which("jj").is_none() {
+            fail("jj not found on PATH");
         }
-    }
-    let dest = dest_path.display().to_string();
-
-    // Fetch so the new workspace starts from the latest origin main, not
-    // whatever the local repo last saw. Non-fatal: offline still works, the
-    // base is just whatever trunk() already points at locally.
-    eprintln!("+ jj git fetch");
-    let mut fetch = Command::new("jj");
-    fetch.current_dir(&repo).args(["git", "fetch"]);
-    if !run(fetch) {
-        eprintln!("warning: jj git fetch failed; basing workspace on the local trunk");
-    }
-
-    // Base the new workspace's working copy on origin's main. trunk() is jj's
-    // builtin alias for main@origin / master@origin. JJ_BASE_REV overrides.
-    let base = config_value("JJ_BASE_REV").unwrap_or_else(|| "trunk()".into());
-
-    // jj allows a slash in workspace names, so keep the full `workspace/<name>`
-    // for both the workspace and the bookmark.
-    eprintln!("+ jj workspace add --name {branch} -r {base} {dest}");
-    let mut add = Command::new("jj");
-    add.current_dir(&repo)
-        .args(["workspace", "add", "--name", &branch, "-r", &base, &dest]);
-    run_or(add, "jj workspace add", fail);
-
-    // Mirror Herdr's worktree branch with a jj bookmark of the same name (non-fatal).
-    let mut bookmark = Command::new("jj");
-    bookmark
-        .current_dir(&dest)
-        .args(["bookmark", "create", &branch, "-r", "@"]);
-    if !run(bookmark) {
-        eprintln!("warning: could not create bookmark {branch} (workspace still created)");
-    }
-
-    let herdr = herdr_bin();
-    let mut open = Command::new(&herdr);
-    if mode == "tab" {
-        eprintln!("+ herdr tab create --cwd {dest}");
-        open.args([
-            "tab", "create", "--cwd", &dest, "--label", &branch, "--focus",
-        ]);
-        let output = match open.output() {
-            Ok(output) => output,
-            Err(err) => fail(&format!("herdr tab create failed to start: {err}")),
-        };
-        io::stderr().write_all(&output.stderr).ok();
-        if !output.status.success() {
-            fail(&format!(
-                "herdr tab create failed (exit {})",
-                output.status.code().unwrap_or(-1)
-            ));
+        // Resolve secondary workspaces to the main repo so sibling checkouts
+        // remain grouped under a stable directory.
+        let repo = repo_root(&source);
+        let dest_path = root
+            .join(basename(&repo))
+            .join(branch_to_path_slug(&selection.name));
+        if dest_path.exists() {
+            fail(&format!("checkout already exists: {}", dest_path.display()));
         }
-        // When this wizard's overlay pane exits, herdr restores focus to the
-        // tab the overlay was opened from, clobbering --focus. Re-focus the new
-        // tab from a detached helper that outlives the overlay.
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(tab_id) = json_string_field(&stdout, "tab_id") {
-            let script = format!(
-                "for _ in 1 2 3 4 5 6; do sleep 0.2; '{herdr}' tab focus '{tab_id}' >/dev/null 2>&1; done"
-            );
-            let mut helper = Command::new("sh");
-            helper
-                .args(["-c", &script])
-                .stdin(process::Stdio::null())
-                .stdout(process::Stdio::null())
-                .stderr(process::Stdio::null());
-            // Detach into its own process group: the wizard's group gets SIGHUP
-            // when the overlay PTY closes, which would kill the helper first.
-            {
-                use std::os::unix::process::CommandExt;
-                helper.process_group(0);
+        if let Some(parent) = dest_path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                fail(&format!("could not create {}: {err}", parent.display()));
             }
-            let _ = helper.spawn();
         }
+        let dest = dest_path.display().to_string();
+
+        // Create from local state. Fetch + rebase run later in the right pane,
+        // after the new Herdr workspace and Codex are already available.
+        let base = config_value("JJ_BASE_REV").unwrap_or_else(|| "trunk()".into());
+        eprintln!(
+            "+ jj workspace add --name {} -r {base} {dest}",
+            selection.name
+        );
+        let mut add = Command::new("jj");
+        add.current_dir(&repo).args([
+            "workspace",
+            "add",
+            "--name",
+            &selection.name,
+            "-r",
+            &base,
+            &dest,
+        ]);
+        run_or(add, "jj workspace add", fail);
+
+        let mut bookmark = Command::new("jj");
+        bookmark
+            .current_dir(&dest)
+            .args(["bookmark", "create", &selection.name, "-r", "@"]);
+        if !run(bookmark) {
+            eprintln!(
+                "warning: could not create bookmark {} (workspace still created)",
+                selection.name
+            );
+        }
+        dest
     } else {
-        eprintln!("+ herdr workspace create --cwd {dest}");
-        open.args([
+        source
+    };
+
+    open_workspace_layout(&destination, &selection.name, is_jj);
+    process::exit(0);
+}
+
+fn load_workspace_choices(
+    current_workspace: &str,
+    current_cwd: &str,
+) -> Result<Vec<WorkspaceChoice>, String> {
+    let workspaces = herdr_json(&["workspace", "list"])?;
+    let panes = herdr_json(&["pane", "list"])?;
+    let workspace_values = workspaces
+        .pointer("/result/workspaces")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Herdr returned an invalid workspace list".to_string())?;
+    let pane_values = panes
+        .pointer("/result/panes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Herdr returned an invalid pane list".to_string())?;
+
+    let mut choices = Vec::new();
+    for workspace in workspace_values {
+        let Some(id) = workspace.get("workspace_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let label = workspace
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .to_string();
+        let active_tab = workspace
+            .get("active_tab_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let path = if id == current_workspace && !current_cwd.is_empty() {
+            Some(current_cwd.to_string())
+        } else if let Some(path) = workspace
+            .pointer("/worktree/checkout_path")
+            .and_then(Value::as_str)
+        {
+            Some(path.to_string())
+        } else {
+            let active_panes: Vec<&Value> = pane_values
+                .iter()
+                .filter(|pane| {
+                    pane.get("workspace_id").and_then(Value::as_str) == Some(id)
+                        && pane.get("tab_id").and_then(Value::as_str) == Some(active_tab)
+                })
+                .collect();
+            active_panes
+                .iter()
+                .copied()
+                .find(|pane| pane.get("focused").and_then(Value::as_bool) == Some(true))
+                .or_else(|| active_panes.first().copied())
+                .and_then(pane_path)
+        };
+
+        if let Some(path) = path.filter(|path| !path.is_empty()) {
+            choices.push(WorkspaceChoice {
+                id: id.into(),
+                label,
+                path,
+            });
+        }
+    }
+    Ok(choices)
+}
+
+fn pane_path(pane: &Value) -> Option<String> {
+    pane.get("foreground_cwd")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .or_else(|| pane.get("cwd").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn herdr_json(args: &[&str]) -> Result<Value, String> {
+    let output = Command::new(herdr_bin())
+        .args(args)
+        .output()
+        .map_err(|err| format!("herdr {} failed to start: {err}", args.join(" ")))?;
+    io::stderr().write_all(&output.stderr).ok();
+    if !output.status.success() {
+        return Err(format!(
+            "herdr {} failed (exit {})",
+            args.join(" "),
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("invalid JSON from herdr {}: {err}", args.join(" ")))
+}
+
+fn open_workspace_layout(cwd: &str, label: &str, is_jj: bool) {
+    let herdr = herdr_bin();
+    eprintln!("+ herdr workspace create --cwd {cwd}");
+    let created = command_json(
+        Command::new(&herdr).args([
             "workspace",
             "create",
             "--cwd",
-            &dest,
+            cwd,
             "--label",
-            &branch,
+            label,
             "--focus",
-        ]);
-        run_or(open, "herdr workspace create", fail);
+        ]),
+        "herdr workspace create",
+    );
+    let workspace_id = required_json_string(&created, "/result/workspace/workspace_id");
+    let left_pane = required_json_string(&created, "/result/root_pane/pane_id");
+
+    // workspace.created starts the existing auto-Codex hook. Wait until it has
+    // claimed the root pane before splitting, so it cannot mistake the right
+    // terminal for the initial pane or launch `co` twice.
+    if !wait_for_codex(&left_pane, Duration::from_secs(8)) {
+        fail("Codex did not start in the new workspace");
     }
-    process::exit(0);
+
+    let split = command_json(
+        Command::new(&herdr).args([
+            "pane",
+            "split",
+            "--pane",
+            &left_pane,
+            "--direction",
+            "right",
+            "--ratio",
+            "0.5",
+            "--cwd",
+            cwd,
+            "--no-focus",
+        ]),
+        "herdr pane split",
+    );
+    let right_pane = required_json_string(&split, "/result/pane/pane_id");
+
+    if is_jj {
+        let mut pull = Command::new(&herdr);
+        pull.args(["pane", "run", &right_pane, JJ_UPDATE_COMMAND]);
+        run_or(pull, "start jj update in right pane", fail);
+    } else {
+        let body = format!(
+            "{} is not a jj workspace; opened the same folder without creating a checkout.",
+            cwd
+        );
+        let mut toast = Command::new(&herdr);
+        toast.args([
+            "notification",
+            "show",
+            "No jj workspace created",
+            "--body",
+            &body,
+            "--position",
+            "top-right",
+            "--sound",
+            "none",
+        ]);
+        if !run(toast) {
+            eprintln!("warning: could not show the non-jj workspace notification");
+        }
+    }
+
+    let _ = Command::new(&herdr)
+        .args(["workspace", "focus", &workspace_id])
+        .status();
+    let _ = Command::new(&herdr)
+        .args(["agent", "focus", &left_pane])
+        .status();
+    spawn_refocus_helper(&herdr, &workspace_id, &left_pane);
+}
+
+fn command_json(command: &mut Command, what: &str) -> Value {
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(err) => fail(&format!("{what} failed to start: {err}")),
+    };
+    io::stderr().write_all(&output.stderr).ok();
+    if !output.status.success() {
+        fail(&format!(
+            "{what} failed (exit {})",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| fail(&format!("{what} returned invalid JSON: {err}")))
+}
+
+fn required_json_string(value: &Value, pointer: &str) -> String {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| fail(&format!("Herdr response is missing {pointer}")))
+}
+
+fn wait_for_codex(pane_id: &str, timeout: Duration) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if let Ok(agents) = herdr_json(&["agent", "list"]) {
+            let found = agents
+                .pointer("/result/agents")
+                .and_then(Value::as_array)
+                .is_some_and(|agents| {
+                    agents.iter().any(|agent| {
+                        agent.get("pane_id").and_then(Value::as_str) == Some(pane_id)
+                            && agent.get("agent").and_then(Value::as_str) == Some("codex")
+                    })
+                });
+            if found {
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+fn spawn_refocus_helper(herdr: &str, workspace_id: &str, left_pane: &str) {
+    let script = "for _ in 1 2 3 4 5 6; do sleep 0.2; \"$1\" workspace focus \"$2\" >/dev/null 2>&1; \"$1\" agent focus \"$3\" >/dev/null 2>&1; done";
+    let mut helper = Command::new("sh");
+    helper
+        .args([
+            "-c",
+            script,
+            "jj-workspace-refocus",
+            herdr,
+            workspace_id,
+            left_pane,
+        ])
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null());
+    {
+        use std::os::unix::process::CommandExt;
+        helper.process_group(0);
+    }
+    let _ = helper.spawn();
 }
 
 /// Action (headless): forget the current jj workspace, delete it, close in Herdr.
@@ -280,6 +494,7 @@ struct Palette {
     text: Color,
     subtext0: Color,
     red: Color,
+    yellow: Color,
 }
 
 fn catppuccin() -> Palette {
@@ -292,34 +507,97 @@ fn catppuccin() -> Palette {
         text: Color::Rgb(205, 214, 244),
         subtext0: Color::Rgb(166, 173, 200),
         red: Color::Rgb(243, 139, 168),
+        yellow: Color::Rgb(249, 226, 175),
     }
 }
 
-/// Returns Some(branch) on "create and open", None on cancel (esc / ctrl-c).
-fn run_wizard(repo_name: &str, root: &Path, initial: String) -> io::Result<Option<String>> {
+/// Returns the chosen source + name, or None when cancelled.
+fn run_workspace_wizard(
+    choices: &[WorkspaceChoice],
+    initial_selection: usize,
+    root: &Path,
+    initial_name: String,
+) -> io::Result<Option<WizardResult>> {
     enable_raw_mode()?;
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
-    // The generated name is prefilled but acts as a placeholder: the first edit
-    // replaces it wholesale (mirrors herdr's `name_input_replace_on_type`).
-    let mut name = initial;
+    let mut selected = initial_selection.min(choices.len().saturating_sub(1));
+    let mut field = WizardField::Workspace;
+    let mut name = initial_name;
     let mut replace_on_type = true;
     let mut error: Option<String> = None;
+
     let outcome = loop {
-        let _ = terminal.draw(|frame| draw_wizard(frame, &name, repo_name, root, error.as_deref()));
+        let _ = terminal.draw(|frame| {
+            draw_workspace_wizard(
+                frame,
+                choices,
+                selected,
+                field,
+                &name,
+                root,
+                error.as_deref(),
+            )
+        });
         match event::read() {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => break None,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
-                KeyCode::Enter => {
-                    if valid_branch(&name) {
-                        break Some(name.clone());
-                    }
-                    error = Some("branch must match [A-Za-z0-9._/-]".into());
+                KeyCode::Tab | KeyCode::BackTab => {
+                    field = match field {
+                        WizardField::Workspace => WizardField::Name,
+                        WizardField::Name => WizardField::Workspace,
+                    };
+                    error = None;
                 }
-                KeyCode::Backspace => {
+                KeyCode::Up if field == WizardField::Workspace => {
+                    selected = previous_index(selected, choices.len());
+                    error = None;
+                }
+                KeyCode::Down if field == WizardField::Workspace => {
+                    selected = next_index(selected, choices.len());
+                    error = None;
+                }
+                KeyCode::Char('p' | 'u' | 'k')
+                    if field == WizardField::Workspace
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    selected = previous_index(selected, choices.len());
+                    error = None;
+                }
+                KeyCode::Char('n' | 'd' | 'j')
+                    if field == WizardField::Workspace
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    selected = next_index(selected, choices.len());
+                    error = None;
+                }
+                KeyCode::Enter => {
+                    if !valid_branch(&name) {
+                        error = Some("name must match [A-Za-z0-9._/-]".into());
+                        continue;
+                    }
+                    let source = choices[selected].clone();
+                    if !Path::new(&source.path).is_dir() {
+                        error = Some(format!("folder does not exist: {}", source.path));
+                        continue;
+                    }
+                    if is_jj_workspace(&source.path) {
+                        let checkout = workspace_destination(root, &source.path, &name);
+                        if checkout.exists() {
+                            error =
+                                Some(format!("checkout already exists: {}", checkout.display()));
+                            continue;
+                        }
+                    }
+                    break Some(WizardResult {
+                        source,
+                        name: name.clone(),
+                    });
+                }
+                KeyCode::Backspace if field == WizardField::Name => {
                     if replace_on_type {
                         name.clear();
                         replace_on_type = false;
@@ -328,7 +606,11 @@ fn run_wizard(repo_name: &str, root: &Path, initial: String) -> io::Result<Optio
                     }
                     error = None;
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c)
+                    if field == WizardField::Name
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
                     if replace_on_type {
                         name.clear();
                         replace_on_type = false;
@@ -350,67 +632,163 @@ fn run_wizard(repo_name: &str, root: &Path, initial: String) -> io::Result<Optio
     Ok(outcome)
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    Ok(())
+fn previous_index(selected: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else if selected == 0 {
+        len - 1
+    } else {
+        selected - 1
+    }
 }
 
-/// Mirrors herdr's `render_new_linked_worktree_overlay`.
-fn draw_wizard(frame: &mut Frame, name: &str, repo_name: &str, root: &Path, error: Option<&str>) {
+fn next_index(selected: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        (selected + 1) % len
+    }
+}
+
+fn workspace_destination(root: &Path, source: &str, name: &str) -> PathBuf {
+    root.join(basename(&repo_root(source)))
+        .join(branch_to_path_slug(name))
+}
+
+fn draw_workspace_wizard(
+    frame: &mut Frame,
+    choices: &[WorkspaceChoice],
+    selected: usize,
+    field: WizardField,
+    name: &str,
+    root: &Path,
+    error: Option<&str>,
+) {
     let p = catppuccin();
     let area = frame.area();
     dim_background(frame, area);
-    let Some(inner) = render_modal_shell(frame, area, 68, 10, &p) else {
+    let Some(inner) = render_modal_shell(frame, area, 86, 22, &p) else {
         return;
     };
-    if inner.height < 7 {
+    if inner.height < 12 || choices.is_empty() {
         return;
     }
 
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas::<8>(inner);
+    let list_height = usize::from(inner.height.saturating_sub(10).clamp(3, 9));
+    let max_start = choices.len().saturating_sub(list_height);
+    let start = selected.saturating_sub(list_height / 2).min(max_start);
+    let end = (start + list_height).min(choices.len());
+    let mut y = inner.y;
 
-    render_modal_header(frame, rows[0], "new jj workspace", &p);
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, y, inner.width, 1),
+        "new workspace",
+        &p,
+    );
+    y += 1;
+    let source_style = if field == WizardField::Workspace {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.overlay0)
+    };
+    frame.render_widget(
+        Paragraph::new(" source workspace  ↑/↓ or ctrl+↑/↓").style(source_style),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
 
-    frame.render_widget(
-        Paragraph::new(" workspace").style(Style::default().fg(p.overlay0)),
-        rows[1],
-    );
-    let input_rect = Rect::new(rows[2].x, rows[2].y, rows[2].width, 1);
-    frame.render_widget(Clear, input_rect);
-    frame.render_widget(
-        Paragraph::new(format!(" {name}█")).style(Style::default().fg(p.text).bg(p.surface0)),
-        input_rect,
-    );
-
-    let checkout = root
-        .join(repo_name)
-        .join(branch_to_path_slug(name))
-        .display()
-        .to_string();
-    frame.render_widget(
-        Paragraph::new(" checkout").style(Style::default().fg(p.overlay0)),
-        rows[3],
-    );
-    frame.render_widget(
-        Paragraph::new(format!(" {checkout}")).style(Style::default().fg(p.subtext0)),
-        rows[4],
-    );
-
-    if let Some(error) = error {
+    for (index, choice) in choices[start..end].iter().enumerate() {
+        let absolute_index = start + index;
+        let active = absolute_index == selected;
+        let marker = if active { " ▸ " } else { "   " };
+        let kind = if is_jj_workspace(&choice.path) {
+            "jj"
+        } else {
+            "dir"
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{marker}{} ", choice.label),
+                Style::default().add_modifier(if active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+            Span::styled(
+                format!("[{kind}] {}", choice.path),
+                Style::default().fg(p.subtext0),
+            ),
+        ]);
+        let style = if active {
+            Style::default().fg(p.text).bg(p.surface0)
+        } else {
+            Style::default().fg(p.text)
+        };
         frame.render_widget(
-            Paragraph::new(format!(" {error}")).style(Style::default().fg(p.red)),
-            rows[5],
+            Paragraph::new(line).style(style),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+    }
+    while y < inner.y + 2 + list_height as u16 {
+        y += 1;
+    }
+
+    let name_style = if field == WizardField::Name {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.overlay0)
+    };
+    frame.render_widget(
+        Paragraph::new(" name  tab to edit").style(name_style),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
+    let cursor = if field == WizardField::Name {
+        "█"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(format!(" {name}{cursor}"))
+            .style(Style::default().fg(p.text).bg(p.surface0)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
+
+    let choice = &choices[selected];
+    let (preview_label, preview, warning) = if is_jj_workspace(&choice.path) {
+        (
+            " checkout",
+            workspace_destination(root, &choice.path, name)
+                .display()
+                .to_string(),
+            None,
+        )
+    } else {
+        (
+            " folder",
+            choice.path.clone(),
+            Some("not a jj workspace — the same folder will be opened"),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(preview_label).style(Style::default().fg(p.overlay0)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
+    frame.render_widget(
+        Paragraph::new(format!(" {preview}")).style(Style::default().fg(p.subtext0)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
+    if let Some(message) = error.or(warning) {
+        let color = if error.is_some() { p.red } else { p.yellow };
+        frame.render_widget(
+            Paragraph::new(format!(" {message}")).style(Style::default().fg(color)),
+            Rect::new(inner.x, y, inner.width, 1),
         );
     }
 
@@ -435,6 +813,12 @@ fn draw_wizard(frame: &mut Frame, name: &str, repo_name: &str, root: &Path, erro
             .bg(p.surface0)
             .add_modifier(Modifier::BOLD),
     );
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    Ok(())
 }
 
 // Ported verbatim from herdr's src/ui/widgets.rs / src/ui.rs.
@@ -691,14 +1075,6 @@ fn which(cmd: &str) -> Option<()> {
         .map(|_| ())
 }
 
-fn prompt(message: &str) -> String {
-    print!("{message}");
-    let _ = io::stdout().flush();
-    let mut line = String::new();
-    let _ = io::stdin().read_line(&mut line);
-    line.trim().to_string()
-}
-
 fn run_or(cmd: Command, what: &str, on_err: fn(&str) -> !) {
     let mut cmd = cmd;
     match cmd.status() {
@@ -754,4 +1130,34 @@ fn json_string_field(json: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_selector_wraps_in_both_directions() {
+        assert_eq!(previous_index(0, 3), 2);
+        assert_eq!(previous_index(2, 3), 1);
+        assert_eq!(next_index(2, 3), 0);
+        assert_eq!(next_index(0, 3), 1);
+    }
+
+    #[test]
+    fn workspace_name_maps_to_a_safe_checkout_slug() {
+        assert_eq!(
+            branch_to_path_slug("workspace/Fix API_v2"),
+            "workspace-fix-api-v2"
+        );
+        assert_eq!(branch_to_path_slug("///"), "workspace");
+    }
+
+    #[test]
+    fn update_runs_fetch_before_rebase() {
+        assert_eq!(
+            JJ_UPDATE_COMMAND,
+            "jj git fetch && jj rebase -s @ -d 'trunk()'"
+        );
+    }
 }
