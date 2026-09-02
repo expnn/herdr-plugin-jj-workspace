@@ -47,9 +47,21 @@ struct WizardResult {
     name: String,
 }
 
+#[derive(Clone, Copy)]
+struct WizardView<'a> {
+    choices: &'a [WorkspaceChoice],
+    filtered: &'a [usize],
+    selected: usize,
+    field: WizardField,
+    query: &'a str,
+    name: &'a str,
+    root: &'a Path,
+    error: Option<&'a str>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WizardField {
-    Workspace,
+    WorkspaceSearch,
     Name,
 }
 
@@ -610,8 +622,13 @@ fn run_workspace_wizard(
     execute!(out, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
-    let mut selected = initial_selection.min(choices.len().saturating_sub(1));
-    let mut field = WizardField::Workspace;
+    let mut query = String::new();
+    let mut filtered = filtered_choice_indices(choices, &query);
+    let mut selected = filtered
+        .iter()
+        .position(|index| *index == initial_selection)
+        .unwrap_or(0);
+    let mut field = WizardField::WorkspaceSearch;
     let mut name = initial_name;
     let mut replace_on_type = true;
     let mut error: Option<String> = None;
@@ -620,12 +637,16 @@ fn run_workspace_wizard(
         let _ = terminal.draw(|frame| {
             draw_workspace_wizard(
                 frame,
-                choices,
-                selected,
-                field,
-                &name,
-                root,
-                error.as_deref(),
+                &WizardView {
+                    choices,
+                    filtered: &filtered,
+                    selected,
+                    field,
+                    query: &query,
+                    name: &name,
+                    root,
+                    error: error.as_deref(),
+                },
             )
         });
         match event::read() {
@@ -634,39 +655,43 @@ fn run_workspace_wizard(
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
                 KeyCode::Tab | KeyCode::BackTab => {
                     field = match field {
-                        WizardField::Workspace => WizardField::Name,
-                        WizardField::Name => WizardField::Workspace,
+                        WizardField::WorkspaceSearch => WizardField::Name,
+                        WizardField::Name => WizardField::WorkspaceSearch,
                     };
                     error = None;
                 }
-                KeyCode::Up if field == WizardField::Workspace => {
-                    selected = previous_index(selected, choices.len());
+                KeyCode::Up if field == WizardField::WorkspaceSearch => {
+                    selected = previous_index(selected, filtered.len());
                     error = None;
                 }
-                KeyCode::Down if field == WizardField::Workspace => {
-                    selected = next_index(selected, choices.len());
+                KeyCode::Down if field == WizardField::WorkspaceSearch => {
+                    selected = next_index(selected, filtered.len());
                     error = None;
                 }
                 KeyCode::Char('p' | 'u' | 'k')
-                    if field == WizardField::Workspace
+                    if field == WizardField::WorkspaceSearch
                         && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    selected = previous_index(selected, choices.len());
+                    selected = previous_index(selected, filtered.len());
                     error = None;
                 }
                 KeyCode::Char('n' | 'd' | 'j')
-                    if field == WizardField::Workspace
+                    if field == WizardField::WorkspaceSearch
                         && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    selected = next_index(selected, choices.len());
+                    selected = next_index(selected, filtered.len());
                     error = None;
                 }
                 KeyCode::Enter => {
+                    let Some(choice_index) = filtered.get(selected).copied() else {
+                        error = Some("no matching workspace".into());
+                        continue;
+                    };
                     if !valid_branch(&name) {
                         error = Some("name must match [A-Za-z0-9._/-]".into());
                         continue;
                     }
-                    let source = choices[selected].clone();
+                    let source = choices[choice_index].clone();
                     if !Path::new(&source.path).is_dir() {
                         error = Some(format!("folder does not exist: {}", source.path));
                         continue;
@@ -683,6 +708,12 @@ fn run_workspace_wizard(
                         source,
                         name: name.clone(),
                     });
+                }
+                KeyCode::Backspace if field == WizardField::WorkspaceSearch => {
+                    query.pop();
+                    filtered = filtered_choice_indices(choices, &query);
+                    selected = 0;
+                    error = None;
                 }
                 KeyCode::Backspace if field == WizardField::Name => {
                     if replace_on_type {
@@ -705,6 +736,16 @@ fn run_workspace_wizard(
                     name.push(c);
                     error = None;
                 }
+                KeyCode::Char(c)
+                    if field == WizardField::WorkspaceSearch
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    query.push(c);
+                    filtered = filtered_choice_indices(choices, &query);
+                    selected = 0;
+                    error = None;
+                }
                 _ => {}
             },
             Ok(_) => {}
@@ -717,6 +758,67 @@ fn run_workspace_wizard(
 
     restore_terminal(&mut terminal)?;
     Ok(outcome)
+}
+
+fn filtered_choice_indices(choices: &[WorkspaceChoice], query: &str) -> Vec<usize> {
+    if query.trim().is_empty() {
+        return (0..choices.len()).collect();
+    }
+
+    let mut matches: Vec<(usize, i64)> = choices
+        .iter()
+        .enumerate()
+        .filter_map(|(index, choice)| {
+            let label_score = fuzzy_score(&choice.label, query).map(|score| score + 1_000);
+            let path_score = fuzzy_score(&choice.path, query);
+            label_score
+                .into_iter()
+                .chain(path_score)
+                .max()
+                .map(|score| (index, score))
+        })
+        .collect();
+    matches.sort_by(|(left_index, left_score), (right_index, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_index.cmp(right_index))
+    });
+    matches.into_iter().map(|(index, _)| index).collect()
+}
+
+fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
+    let query: Vec<char> = query
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if query.is_empty() {
+        return Some(0);
+    }
+
+    let candidate: Vec<char> = candidate.chars().flat_map(char::to_lowercase).collect();
+    let mut score = 0i64;
+    let mut search_from = 0usize;
+    let mut previous_match = None;
+
+    for needle in query {
+        let offset = candidate[search_from..]
+            .iter()
+            .position(|ch| *ch == needle)?;
+        let index = search_from + offset;
+        score += 20;
+        if previous_match == Some(index.saturating_sub(1)) {
+            score += 15;
+        }
+        if index == 0 || !candidate[index - 1].is_alphanumeric() {
+            score += 10;
+        }
+        score -= index as i64;
+        previous_match = Some(index);
+        search_from = index + 1;
+    }
+
+    Some(score)
 }
 
 fn previous_index(selected: usize, len: usize) -> usize {
@@ -742,15 +844,17 @@ fn workspace_destination(root: &Path, source: &str, name: &str) -> PathBuf {
         .join(branch_to_path_slug(name))
 }
 
-fn draw_workspace_wizard(
-    frame: &mut Frame,
-    choices: &[WorkspaceChoice],
-    selected: usize,
-    field: WizardField,
-    name: &str,
-    root: &Path,
-    error: Option<&str>,
-) {
+fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
+    let WizardView {
+        choices,
+        filtered,
+        selected,
+        field,
+        query,
+        name,
+        root,
+        error,
+    } = *view;
     let p = catppuccin();
     let area = frame.area();
     dim_background(frame, area);
@@ -761,10 +865,10 @@ fn draw_workspace_wizard(
         return;
     }
 
-    let list_height = usize::from(inner.height.saturating_sub(10).clamp(3, 9));
-    let max_start = choices.len().saturating_sub(list_height);
+    let list_height = usize::from(inner.height.saturating_sub(11).clamp(3, 8));
+    let max_start = filtered.len().saturating_sub(list_height);
     let start = selected.saturating_sub(list_height / 2).min(max_start);
-    let end = (start + list_height).min(choices.len());
+    let end = (start + list_height).min(filtered.len());
     let mut y = inner.y;
 
     render_modal_header(
@@ -774,19 +878,32 @@ fn draw_workspace_wizard(
         &p,
     );
     y += 1;
-    let source_style = if field == WizardField::Workspace {
+    let source_style = if field == WizardField::WorkspaceSearch {
         Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(p.overlay0)
     };
     frame.render_widget(
-        Paragraph::new(" source workspace  ↑/↓ or ctrl+↑/↓").style(source_style),
+        Paragraph::new(" source workspace  type to filter · ↑/↓ navigate · tab edit name")
+            .style(source_style),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
+    let query_cursor = if field == WizardField::WorkspaceSearch {
+        "█"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(format!(" {query}{query_cursor}"))
+            .style(Style::default().fg(p.text).bg(p.surface0)),
         Rect::new(inner.x, y, inner.width, 1),
     );
     y += 1;
 
-    for (index, choice) in choices[start..end].iter().enumerate() {
-        let absolute_index = start + index;
+    for (visible_index, choice_index) in filtered[start..end].iter().enumerate() {
+        let absolute_index = start + visible_index;
+        let choice = &choices[*choice_index];
         let active = absolute_index == selected;
         let marker = if active { " ▸ " } else { "   " };
         let kind = if is_jj_workspace(&choice.path) {
@@ -819,7 +936,14 @@ fn draw_workspace_wizard(
         );
         y += 1;
     }
-    while y < inner.y + 2 + list_height as u16 {
+    if filtered.is_empty() {
+        frame.render_widget(
+            Paragraph::new("   no matching workspaces").style(Style::default().fg(p.overlay0)),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+    }
+    while y < inner.y + 3 + list_height as u16 {
         y += 1;
     }
 
@@ -845,21 +969,21 @@ fn draw_workspace_wizard(
     );
     y += 1;
 
-    let choice = &choices[selected];
-    let (preview_label, preview, warning) = if is_jj_workspace(&choice.path) {
-        (
+    let choice = filtered.get(selected).map(|index| &choices[*index]);
+    let (preview_label, preview, warning) = match choice {
+        Some(choice) if is_jj_workspace(&choice.path) => (
             " checkout",
             workspace_destination(root, &choice.path, name)
                 .display()
                 .to_string(),
             None,
-        )
-    } else {
-        (
+        ),
+        Some(choice) => (
             " folder",
             choice.path.clone(),
             Some("not a jj workspace — the same folder will be opened"),
-        )
+        ),
+        None => (" workspace", "no matching workspace".into(), None),
     };
     frame.render_widget(
         Paragraph::new(preview_label).style(Style::default().fg(p.overlay0)),
@@ -1229,6 +1353,49 @@ mod tests {
         assert_eq!(previous_index(2, 3), 1);
         assert_eq!(next_index(2, 3), 0);
         assert_eq!(next_index(0, 3), 1);
+    }
+
+    #[test]
+    fn workspace_selector_fuzzy_filters_labels_and_paths() {
+        let choices = vec![
+            WorkspaceChoice {
+                id: "w1".into(),
+                label: "general".into(),
+                path: "/home/nathan/misc".into(),
+            },
+            WorkspaceChoice {
+                id: "w2".into(),
+                label: "rivet-website".into(),
+                path: "/home/nathan/rivet-website".into(),
+            },
+            WorkspaceChoice {
+                id: "w3".into(),
+                label: "docs".into(),
+                path: "/home/nathan/dynamic-apps".into(),
+            },
+        ];
+
+        assert_eq!(filtered_choice_indices(&choices, "rvws"), vec![1]);
+        assert_eq!(filtered_choice_indices(&choices, "DYN APP"), vec![2]);
+        assert!(filtered_choice_indices(&choices, "not-here").is_empty());
+    }
+
+    #[test]
+    fn workspace_selector_prefers_label_matches() {
+        let choices = vec![
+            WorkspaceChoice {
+                id: "w1".into(),
+                label: "website".into(),
+                path: "/tmp/project".into(),
+            },
+            WorkspaceChoice {
+                id: "w2".into(),
+                label: "project".into(),
+                path: "/tmp/website".into(),
+            },
+        ];
+
+        assert_eq!(filtered_choice_indices(&choices, "web"), vec![0, 1]);
     }
 
     #[test]

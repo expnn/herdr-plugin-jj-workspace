@@ -45,8 +45,9 @@ A [Herdr](https://herdr.dev) plugin to create and remove [Jujutsu](https://jj-vc
 - `prefix+a` or `prefix+shift+a` — choose a Herdr workspace, name the jj workspace, and open it as a new tab in the selected workspace
 - `prefix+d` — remove the current jj checkout and close its tab
 
-The source selector starts on the current workspace. Use `↑`/`↓` (including
-`Ctrl+↑`/`Ctrl+↓`) to select another workspace and `Tab` to edit the name.
+The source selector starts on the current workspace with fuzzy search focused.
+Type to filter by workspace label or path, use `↑`/`↓` (including
+`Ctrl+↑`/`Ctrl+↓`) to navigate the matches, and press `Tab` to edit the name.
 
 For a jj source, the plugin creates the checkout from local `trunk()` first and
 opens its tab immediately. The right terminal then runs `jj git fetch` and
