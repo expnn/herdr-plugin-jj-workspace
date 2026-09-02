@@ -55,12 +55,20 @@ fn cmd_open(mode: &str) -> ! {
         .unwrap_or_default();
 
     let mut cmd = Command::new(herdr_bin());
-    cmd.args(["plugin", "pane", "open", "--plugin", &plugin_id(), "--entrypoint", "wizard"])
-        .arg("--env")
-        .arg(format!("JJ_REPO={repo}"))
-        .arg("--env")
-        .arg(format!("JJ_OPEN={mode}"))
-        .arg("--focus");
+    cmd.args([
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        &plugin_id(),
+        "--entrypoint",
+        "wizard",
+    ])
+    .arg("--env")
+    .arg(format!("JJ_REPO={repo}"))
+    .arg("--env")
+    .arg(format!("JJ_OPEN={mode}"))
+    .arg("--focus");
     match cmd.status() {
         Ok(status) => process::exit(status.code().unwrap_or(0)),
         Err(err) => {
@@ -140,7 +148,9 @@ fn cmd_wizard() -> ! {
 
     // Mirror Herdr's worktree branch with a jj bookmark of the same name (non-fatal).
     let mut bookmark = Command::new("jj");
-    bookmark.current_dir(&dest).args(["bookmark", "create", &branch, "-r", "@"]);
+    bookmark
+        .current_dir(&dest)
+        .args(["bookmark", "create", &branch, "-r", "@"]);
     if !run(bookmark) {
         eprintln!("warning: could not create bookmark {branch} (workspace still created)");
     }
@@ -149,14 +159,19 @@ fn cmd_wizard() -> ! {
     let mut open = Command::new(&herdr);
     if mode == "tab" {
         eprintln!("+ herdr tab create --cwd {dest}");
-        open.args(["tab", "create", "--cwd", &dest, "--label", &branch, "--focus"]);
+        open.args([
+            "tab", "create", "--cwd", &dest, "--label", &branch, "--focus",
+        ]);
         let output = match open.output() {
             Ok(output) => output,
             Err(err) => fail(&format!("herdr tab create failed to start: {err}")),
         };
         io::stderr().write_all(&output.stderr).ok();
         if !output.status.success() {
-            fail(&format!("herdr tab create failed (exit {})", output.status.code().unwrap_or(-1)));
+            fail(&format!(
+                "herdr tab create failed (exit {})",
+                output.status.code().unwrap_or(-1)
+            ));
         }
         // When this wizard's overlay pane exits, herdr restores focus to the
         // tab the overlay was opened from, clobbering --focus. Re-focus the new
@@ -182,7 +197,15 @@ fn cmd_wizard() -> ! {
         }
     } else {
         eprintln!("+ herdr workspace create --cwd {dest}");
-        open.args(["workspace", "create", "--cwd", &dest, "--label", &branch, "--focus"]);
+        open.args([
+            "workspace",
+            "create",
+            "--cwd",
+            &dest,
+            "--label",
+            &branch,
+            "--focus",
+        ]);
         run_or(open, "herdr workspace create", fail);
     }
     process::exit(0);
@@ -213,10 +236,16 @@ fn cmd_remove() -> ! {
     // The MAIN workspace stores .jj/repo as a directory; a secondary workspace
     // stores it as a file pointer. Never remove the main workspace.
     if canon.join(".jj").join("repo").is_dir() {
-        die(&format!("refusing to remove the MAIN jj workspace ({})", canon.display()));
+        die(&format!(
+            "refusing to remove the MAIN jj workspace ({})",
+            canon.display()
+        ));
     }
     if canon == Path::new("/") || canon.parent().is_none() {
-        die(&format!("refusing to remove unsafe path: {}", canon.display()));
+        die(&format!(
+            "refusing to remove unsafe path: {}",
+            canon.display()
+        ));
     }
 
     let mut forget = Command::new("jj");
@@ -353,17 +382,26 @@ fn draw_wizard(frame: &mut Frame, name: &str, repo_name: &str, root: &Path, erro
 
     render_modal_header(frame, rows[0], "new jj workspace", &p);
 
-    frame.render_widget(Paragraph::new(" workspace").style(Style::default().fg(p.overlay0)), rows[1]);
+    frame.render_widget(
+        Paragraph::new(" workspace").style(Style::default().fg(p.overlay0)),
+        rows[1],
+    );
     let input_rect = Rect::new(rows[2].x, rows[2].y, rows[2].width, 1);
     frame.render_widget(Clear, input_rect);
     frame.render_widget(
-        Paragraph::new(format!(" {name}█"))
-            .style(Style::default().fg(p.text).bg(p.surface0)),
+        Paragraph::new(format!(" {name}█")).style(Style::default().fg(p.text).bg(p.surface0)),
         input_rect,
     );
 
-    let checkout = root.join(repo_name).join(branch_to_path_slug(name)).display().to_string();
-    frame.render_widget(Paragraph::new(" checkout").style(Style::default().fg(p.overlay0)), rows[3]);
+    let checkout = root
+        .join(repo_name)
+        .join(branch_to_path_slug(name))
+        .display()
+        .to_string();
+    frame.render_widget(
+        Paragraph::new(" checkout").style(Style::default().fg(p.overlay0)),
+        rows[3],
+    );
     frame.render_widget(
         Paragraph::new(format!(" {checkout}")).style(Style::default().fg(p.subtext0)),
         rows[4],
@@ -450,9 +488,17 @@ fn render_modal_header(frame: &mut Frame, area: Rect, title: &str, p: &Palette) 
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_action_button(frame: &mut Frame, rect: Rect, hint: Option<&str>, label: &str, style: Style) {
+fn render_action_button(
+    frame: &mut Frame,
+    rect: Rect,
+    hint: Option<&str>,
+    label: &str,
+    style: Style,
+) {
     frame.render_widget(
-        Paragraph::new(action_button_text(hint, label)).style(style).alignment(Alignment::Center),
+        Paragraph::new(action_button_text(hint, label))
+            .style(style)
+            .alignment(Alignment::Center),
         rect,
     );
 }
@@ -473,7 +519,9 @@ fn panel_contrast_fg(p: &Palette) -> Color {
 
 /// Herdr's `new_linked_worktree_button_rects`: a centered "create / cancel" row.
 fn button_rects(inner: Rect) -> (Rect, Rect) {
-    let create = action_button_text(Some("↵"), "create and open").chars().count() as u16;
+    let create = action_button_text(Some("↵"), "create and open")
+        .chars()
+        .count() as u16;
     let cancel = action_button_text(Some("esc"), "cancel").chars().count() as u16;
     let gap = 2u16;
     let total = create + cancel + gap;
@@ -487,10 +535,12 @@ fn button_rects(inner: Rect) -> (Rect, Rect) {
 
 // --- naming (mirrors src/worktree.rs in herdr) -----------------------------
 
-const ADJECTIVES: [&str; 8] =
-    ["brave", "calm", "clear", "green", "lucky", "quiet", "rapid", "silver"];
-const NOUNS: [&str; 8] =
-    ["river", "cloud", "field", "forest", "harbor", "meadow", "stone", "valley"];
+const ADJECTIVES: [&str; 8] = [
+    "brave", "calm", "clear", "green", "lucky", "quiet", "rapid", "silver",
+];
+const NOUNS: [&str; 8] = [
+    "river", "cloud", "field", "forest", "harbor", "meadow", "stone", "valley",
+];
 
 fn generated_name(seed: u64) -> String {
     let adjective = ADJECTIVES[(seed as usize) % ADJECTIVES.len()];
@@ -546,7 +596,10 @@ fn expand_tilde(path: &str) -> String {
 // --- helpers ---------------------------------------------------------------
 
 fn herdr_bin() -> String {
-    env::var("HERDR_BIN_PATH").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "herdr".into())
+    env::var("HERDR_BIN_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "herdr".into())
 }
 
 fn plugin_id() -> String {
@@ -580,7 +633,11 @@ fn repo_root(workspace: &str) -> String {
         Err(_) => return workspace.to_string(),
     };
     // Pointer is relative to `.jj/`; drop `repo` then `.jj` to reach the root.
-    let root = jj_dir.join(&pointer).parent().and_then(Path::parent).map(Path::to_path_buf);
+    let root = jj_dir
+        .join(&pointer)
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
     match root.and_then(|r| fs::canonicalize(r).ok()) {
         Some(canon) => canon.display().to_string(),
         None => workspace.to_string(),
@@ -589,11 +646,17 @@ fn repo_root(workspace: &str) -> String {
 
 fn valid_branch(branch: &str) -> bool {
     !branch.is_empty()
-        && branch.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        && branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
 }
 
 fn basename(path: &str) -> String {
-    Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("repo").to_string()
+    Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo")
+        .to_string()
 }
 
 fn config_value(key: &str) -> Option<String> {
@@ -623,7 +686,9 @@ fn config_value(key: &str) -> Option<String> {
 
 fn which(cmd: &str) -> Option<()> {
     let paths = env::var_os("PATH")?;
-    env::split_paths(&paths).find(|dir| dir.join(cmd).is_file()).map(|_| ())
+    env::split_paths(&paths)
+        .find(|dir| dir.join(cmd).is_file())
+        .map(|_| ())
 }
 
 fn prompt(message: &str) -> String {
@@ -638,7 +703,10 @@ fn run_or(cmd: Command, what: &str, on_err: fn(&str) -> !) {
     let mut cmd = cmd;
     match cmd.status() {
         Ok(status) if status.success() => {}
-        Ok(status) => on_err(&format!("{what} failed (exit {})", status.code().unwrap_or(-1))),
+        Ok(status) => on_err(&format!(
+            "{what} failed (exit {})",
+            status.code().unwrap_or(-1)
+        )),
         Err(err) => on_err(&format!("{what} failed to start: {err}")),
     }
 }
