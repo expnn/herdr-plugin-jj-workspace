@@ -1,6 +1,6 @@
 # jj workspaces
 
-A [Herdr](https://herdr.dev) plugin to create and remove [Jujutsu](https://jj-vcs.github.io/jj/) (`jj`) workspaces with one keypress. New workspaces open with Codex on the left and an interactive terminal on the right.
+A [Herdr](https://herdr.dev) plugin to create and remove [Jujutsu](https://jj-vcs.github.io/jj/) (`jj`) workspaces with one keypress. New tabs open with Codex on the left and an interactive terminal on the right.
 
 ## Install
 
@@ -42,14 +42,14 @@ A [Herdr](https://herdr.dev) plugin to create and remove [Jujutsu](https://jj-vc
 
 ## Quickstart
 
-- `prefix+a` or `prefix+shift+a` — choose a source workspace, name it, and open it as a new Herdr workspace
-- `prefix+d` — destroy the current workspace
+- `prefix+a` or `prefix+shift+a` — choose a Herdr workspace, name the jj workspace, and open it as a new tab in the selected workspace
+- `prefix+d` — remove the current jj checkout and close its tab
 
 The source selector starts on the current workspace. Use `↑`/`↓` (including
 `Ctrl+↑`/`Ctrl+↓`) to select another workspace and `Tab` to edit the name.
 
-For a jj source, the plugin creates the checkout from local `trunk()` first so
-Codex is available immediately. The right terminal then runs `jj git fetch` and
+For a jj source, the plugin creates the checkout from local `trunk()` first and
+opens its tab immediately. The right terminal then runs `jj git fetch` and
 rebases the new working-copy commit onto the updated `trunk()`. If the selected
 folder is not a jj workspace, the plugin opens the same folder and shows a
 warning instead of creating a checkout.

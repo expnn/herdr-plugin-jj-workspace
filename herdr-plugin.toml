@@ -1,6 +1,6 @@
 id = "nathanflurry.jj-workspace"
 name = "jj workspaces"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.7.0"
 description = "Create jj workspaces with Codex on the left and a terminal on the right."
 platforms = ["linux", "macos"]
@@ -10,20 +10,19 @@ platforms = ["linux", "macos"]
 [[build]]
 command = ["cargo", "build", "--release"]
 
-# Open a new jj workspace as a new Herdr workspace with Codex + terminal.
+# Open a new jj workspace as a tab in the selected Herdr workspace.
 [[actions]]
 id = "new"
 title = "New jj workspace"
 contexts = ["workspace", "global"]
-command = ["./target/release/jj-workspace", "open", "workspace"]
+command = ["./target/release/jj-workspace", "open", "tab"]
 
-# Compatibility action: 0.2 always opens a full Herdr workspace so it can
-# provide the Codex-left, terminal-right layout.
+# Compatibility alias for existing prefix+a configurations.
 [[actions]]
 id = "new-tab"
 title = "New jj workspace"
 contexts = ["workspace", "global"]
-command = ["./target/release/jj-workspace", "open", "workspace"]
+command = ["./target/release/jj-workspace", "open", "tab"]
 
 # Interactive source-workspace + name selector opened by both actions.
 [[panes]]

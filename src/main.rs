@@ -4,7 +4,7 @@
 // One binary, dispatched by subcommand (set in herdr-plugin.toml):
 //   open <workspace|tab>  action: capture the caller, open the wizard pane
 //   wizard                pane:   select a source + name, create the two-pane workspace
-//   remove                action: `jj workspace forget` + delete dir + close in Herdr
+//   remove                action: `jj workspace forget` + delete dir + close tab
 //
 // The wizard renders the actual "new worktree" modal using the same TUI stack as
 // Herdr (ratatui + crossterm), ported from herdr's src/ui/dialogs.rs and
@@ -60,6 +60,7 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("open") => cmd_open(args.get(2).map(String::as_str).unwrap_or("workspace")),
         Some("wizard") => cmd_wizard(),
+        Some("finish-tab") => cmd_finish_tab(&args),
         Some("remove") => cmd_remove(),
         other => {
             eprintln!("usage: jj-workspace <open [workspace|tab] | wizard | remove>");
@@ -186,7 +187,7 @@ fn cmd_wizard() -> ! {
         source
     };
 
-    open_workspace_layout(&destination, &selection.name, is_jj);
+    open_tab_layout(&selection.source.id, &destination, &selection.name, is_jj);
     process::exit(0);
 }
 
@@ -279,30 +280,32 @@ fn herdr_json(args: &[&str]) -> Result<Value, String> {
         .map_err(|err| format!("invalid JSON from herdr {}: {err}", args.join(" ")))
 }
 
-fn open_workspace_layout(cwd: &str, label: &str, is_jj: bool) {
+fn open_tab_layout(workspace_id: &str, cwd: &str, label: &str, is_jj: bool) {
     let herdr = herdr_bin();
-    eprintln!("+ herdr workspace create --cwd {cwd}");
+    eprintln!("+ herdr tab create --workspace {workspace_id} --cwd {cwd}");
     let created = command_json(
         Command::new(&herdr).args([
-            "workspace",
+            "tab",
             "create",
+            "--workspace",
+            workspace_id,
             "--cwd",
             cwd,
             "--label",
             label,
             "--focus",
         ]),
-        "herdr workspace create",
+        "herdr tab create",
     );
-    let workspace_id = required_json_string(&created, "/result/workspace/workspace_id");
+    let tab_id = required_json_string(&created, "/result/tab/tab_id");
     let left_pane = required_json_string(&created, "/result/root_pane/pane_id");
 
-    // workspace.created starts the existing auto-Codex hook. Wait until it has
-    // claimed the root pane before splitting, so it cannot mistake the right
-    // terminal for the initial pane or launch `co` twice.
-    if !wait_for_codex(&left_pane, Duration::from_secs(8)) {
-        fail("Codex did not start in the new workspace");
-    }
+    // This plugin owns Codex startup for the tab it creates. Keeping this out
+    // of the global tab.created hook prevents duplicate launches and lets the
+    // same flow work for non-jj source folders.
+    let mut start_codex = Command::new(&herdr);
+    start_codex.args(["pane", "run", &left_pane, "co"]);
+    run_or(start_codex, "start Codex in left pane", fail);
 
     let split = command_json(
         Command::new(&herdr).args([
@@ -321,12 +324,17 @@ fn open_workspace_layout(cwd: &str, label: &str, is_jj: bool) {
         "herdr pane split",
     );
     let right_pane = required_json_string(&split, "/result/pane/pane_id");
-
-    if is_jj {
-        let mut pull = Command::new(&herdr);
-        pull.args(["pane", "run", &right_pane, JJ_UPDATE_COMMAND]);
-        run_or(pull, "start jj update in right pane", fail);
+    let finish = finish_tab_shell_command(workspace_id, &tab_id, &left_pane);
+    let right_command = if is_jj {
+        format!("nohup {finish} >/dev/null 2>&1 </dev/null & {JJ_UPDATE_COMMAND}")
     } else {
+        finish
+    };
+    let mut run_right = Command::new(&herdr);
+    run_right.args(["pane", "run", &right_pane, &right_command]);
+    run_or(run_right, "start right-pane setup", fail);
+
+    if !is_jj {
         let body = format!(
             "{} is not a jj workspace; opened the same folder without creating a checkout.",
             cwd
@@ -347,14 +355,6 @@ fn open_workspace_layout(cwd: &str, label: &str, is_jj: bool) {
             eprintln!("warning: could not show the non-jj workspace notification");
         }
     }
-
-    let _ = Command::new(&herdr)
-        .args(["workspace", "focus", &workspace_id])
-        .status();
-    let _ = Command::new(&herdr)
-        .args(["agent", "focus", &left_pane])
-        .status();
-    spawn_refocus_helper(&herdr, &workspace_id, &left_pane);
 }
 
 fn command_json(command: &mut Command, what: &str) -> Value {
@@ -381,21 +381,63 @@ fn required_json_string(value: &Value, pointer: &str) -> String {
         .unwrap_or_else(|| fail(&format!("Herdr response is missing {pointer}")))
 }
 
-fn wait_for_codex(pane_id: &str, timeout: Duration) -> bool {
+fn wait_for_codex_and_accept_trust(pane_id: &str, timeout: Duration) -> bool {
     let started = std::time::Instant::now();
+    let mut trust_attempts = 0;
+    let mut blocked_without_trust_since: Option<std::time::Instant> = None;
+    let mut ready_since: Option<std::time::Instant> = None;
     while started.elapsed() < timeout {
+        let pane_text = read_pane_text(pane_id);
+        let normalized = pane_text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let trust_prompt = normalized.contains("Do you trust the contents of this directory?")
+            && normalized.contains("1. Yes, continue")
+            && normalized.contains("2. No, quit");
+        if trust_prompt {
+            if trust_attempts >= 5 {
+                return false;
+            }
+            let mut accept = Command::new(herdr_bin());
+            accept.args(["pane", "send-keys", pane_id, "enter"]);
+            if !run(accept) {
+                return false;
+            }
+            trust_attempts += 1;
+            blocked_without_trust_since = None;
+            ready_since = None;
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        if normalized.contains("OpenAI Codex") && normalized.contains("Ask Codex to do anything") {
+            let ready = ready_since.get_or_insert_with(std::time::Instant::now);
+            if ready.elapsed() >= Duration::from_secs(1) {
+                return true;
+            }
+        } else {
+            ready_since = None;
+        }
+
         if let Ok(agents) = herdr_json(&["agent", "list"]) {
-            let found = agents
+            let status = agents
                 .pointer("/result/agents")
                 .and_then(Value::as_array)
-                .is_some_and(|agents| {
-                    agents.iter().any(|agent| {
-                        agent.get("pane_id").and_then(Value::as_str) == Some(pane_id)
-                            && agent.get("agent").and_then(Value::as_str) == Some("codex")
-                    })
+                .and_then(|agents| {
+                    agents
+                        .iter()
+                        .find(|agent| {
+                            agent.get("pane_id").and_then(Value::as_str) == Some(pane_id)
+                                && agent.get("agent").and_then(Value::as_str) == Some("codex")
+                        })
+                        .and_then(|agent| agent.get("agent_status").and_then(Value::as_str))
                 });
-            if found {
-                return true;
+            match status {
+                Some("blocked") => {
+                    let blocked_since =
+                        blocked_without_trust_since.get_or_insert_with(std::time::Instant::now);
+                    if blocked_since.elapsed() >= Duration::from_secs(1) {
+                        return false;
+                    }
+                }
+                _ => blocked_without_trust_since = None,
             }
         }
         thread::sleep(Duration::from_millis(100));
@@ -403,38 +445,83 @@ fn wait_for_codex(pane_id: &str, timeout: Duration) -> bool {
     false
 }
 
-fn spawn_refocus_helper(herdr: &str, workspace_id: &str, left_pane: &str) {
-    let script = "for _ in 1 2 3 4 5 6; do sleep 0.2; \"$1\" workspace focus \"$2\" >/dev/null 2>&1; \"$1\" agent focus \"$3\" >/dev/null 2>&1; done";
-    let mut helper = Command::new("sh");
-    helper
+fn read_pane_text(pane_id: &str) -> String {
+    Command::new(herdr_bin())
         .args([
-            "-c",
-            script,
-            "jj-workspace-refocus",
-            herdr,
-            workspace_id,
-            left_pane,
+            "pane", "read", pane_id, "--source", "visible", "--lines", "80",
         ])
-        .stdin(process::Stdio::null())
-        .stdout(process::Stdio::null())
-        .stderr(process::Stdio::null());
-    {
-        use std::os::unix::process::CommandExt;
-        helper.process_group(0);
-    }
-    let _ = helper.spawn();
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
 }
 
-/// Action (headless): forget the current jj workspace, delete it, close in Herdr.
+fn finish_tab_shell_command(workspace_id: &str, tab_id: &str, left_pane: &str) -> String {
+    let executable = env::current_exe()
+        .unwrap_or_else(|err| fail(&format!("cannot resolve jj-workspace executable: {err}")));
+    format!(
+        "{} finish-tab {} {} {}",
+        shell_quote(&executable.display().to_string()),
+        shell_quote(workspace_id),
+        shell_quote(tab_id),
+        shell_quote(left_pane),
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn cmd_finish_tab(args: &[String]) -> ! {
+    let workspace_id = args.get(2).map(String::as_str).unwrap_or_default();
+    let tab_id = args.get(3).map(String::as_str).unwrap_or_default();
+    let left_pane = args.get(4).map(String::as_str).unwrap_or_default();
+    if workspace_id.is_empty() || tab_id.is_empty() || left_pane.is_empty() {
+        die("finish-tab requires workspace, tab, and pane IDs");
+    }
+
+    if !wait_for_codex_and_accept_trust(left_pane, Duration::from_secs(20)) {
+        let mut toast = Command::new(herdr_bin());
+        toast.args([
+            "notification",
+            "show",
+            "Codex needs attention",
+            "--body",
+            "Codex did not clear its startup prompt automatically.",
+            "--position",
+            "top-right",
+            "--sound",
+            "request",
+        ]);
+        let _ = toast.status();
+        process::exit(1);
+    }
+
+    let herdr = herdr_bin();
+    for _ in 0..6 {
+        let _ = Command::new(&herdr)
+            .args(["workspace", "focus", workspace_id])
+            .status();
+        let _ = Command::new(&herdr).args(["tab", "focus", tab_id]).status();
+        let _ = Command::new(&herdr)
+            .args(["agent", "focus", left_pane])
+            .status();
+        thread::sleep(Duration::from_millis(200));
+    }
+    process::exit(0);
+}
+
+/// Action (headless): forget the current jj workspace, delete it, close its tab.
 fn cmd_remove() -> ! {
     if which("jj").is_none() {
         die("jj not found on PATH");
     }
     let ctx = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
-    let ws = env::var("HERDR_WORKSPACE_ID")
+    let tab = env::var("HERDR_TAB_ID")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| json_string_field(&ctx, "workspace_id"));
+        .or_else(|| json_string_field(&ctx, "tab_id"));
     let cwd = json_string_field(&ctx, "workspace_cwd").unwrap_or_default();
     if cwd.is_empty() {
         die("no workspace cwd in context");
@@ -470,13 +557,13 @@ fn cmd_remove() -> ! {
         die(&format!("failed to delete {}: {err}", canon.display()));
     }
 
-    match ws {
-        Some(ws) => {
+    match tab {
+        Some(tab) => {
             let mut close = Command::new(herdr_bin());
-            close.args(["workspace", "close", &ws]);
-            run_or(close, "herdr workspace close", die);
+            close.args(["tab", "close", &tab]);
+            run_or(close, "herdr tab close", die);
         }
-        None => eprintln!("warning: no workspace id in context; Herdr workspace left open"),
+        None => eprintln!("warning: no tab id in context; Herdr tab left open"),
     }
     println!("removed jj workspace: {}", canon.display());
     process::exit(0);
@@ -1159,5 +1246,11 @@ mod tests {
             JJ_UPDATE_COMMAND,
             "jj git fetch && jj rebase -s @ -d 'trunk()'"
         );
+    }
+
+    #[test]
+    fn shell_arguments_are_single_quoted() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's"), "'it'\"'\"'s'");
     }
 }
