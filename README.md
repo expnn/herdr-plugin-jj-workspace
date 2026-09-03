@@ -49,11 +49,13 @@ The source selector starts on the current workspace with fuzzy search focused.
 Type to filter by workspace label or path, use `↑`/`↓` (including
 `Ctrl+↑`/`Ctrl+↓`) to navigate the matches, and press `Tab` to edit the name.
 
-For a jj source, the plugin creates the checkout from local `trunk()` first and
-opens its tab immediately. The right terminal then runs `jj git fetch` and
-rebases the new working-copy commit onto the updated `trunk()`. If the selected
-folder is not a jj workspace, the plugin opens the same folder and shows a
-warning instead of creating a checkout.
+For a jj source, the plugin creates an empty sparse checkout from local
+`trunk()`, materializes only Codex's startup instructions, and opens its tab.
+The right terminal materializes the full checkout, creates the bookmark, runs
+`jj git fetch`, and rebases the new working-copy commit onto the updated
+`trunk()` while Codex starts on the left. If the selected folder is not a jj
+workspace, the plugin opens the same folder and shows a warning instead of
+creating a checkout.
 
 ## License
 

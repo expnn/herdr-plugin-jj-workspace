@@ -1,6 +1,6 @@
 [package]
 name = "jj-workspace"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 # Same TUI stack as Herdr, so the wizard pane renders the real worktree-style

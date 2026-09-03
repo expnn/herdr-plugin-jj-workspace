@@ -1,6 +1,6 @@
 id = "nathanflurry.jj-workspace"
 name = "jj workspaces"
-version = "0.3.0"
+version = "0.4.0"
 min_herdr_version = "0.7.0"
 description = "Create jj workspaces with Codex on the left and a terminal on the right."
 platforms = ["linux", "macos"]

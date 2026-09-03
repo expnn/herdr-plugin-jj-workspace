@@ -65,6 +65,8 @@ enum WizardField {
     Name,
 }
 
+const CODEX_BOOTSTRAP_PATHS: [&str; 4] = ["AGENTS.md", "AGENTS.override.md", ".codex", ".agents"];
+const JJ_MATERIALIZE_COMMAND: &str = "jj sparse set --clear --add .";
 const JJ_UPDATE_COMMAND: &str = "jj git fetch && jj rebase -s @ -d 'trunk()'";
 
 fn main() {
@@ -165,11 +167,11 @@ fn cmd_wizard() -> ! {
         }
         let dest = dest_path.display().to_string();
 
-        // Create from local state. Fetch + rebase run later in the right pane,
-        // after the new Herdr workspace and Codex are already available.
+        // Create only the metadata and Codex startup files synchronously. The
+        // full checkout, bookmark, fetch, and rebase run in the right pane.
         let base = config_value("JJ_BASE_REV").unwrap_or_else(|| "trunk()".into());
         eprintln!(
-            "+ jj workspace add --name {} -r {base} {dest}",
+            "+ jj workspace add --name {} -r {base} --sparse-patterns empty {dest}",
             selection.name
         );
         let mut add = Command::new("jj");
@@ -180,20 +182,20 @@ fn cmd_wizard() -> ! {
             &selection.name,
             "-r",
             &base,
+            "--sparse-patterns",
+            "empty",
             &dest,
         ]);
         run_or(add, "jj workspace add", fail);
 
-        let mut bookmark = Command::new("jj");
-        bookmark
+        let mut bootstrap = Command::new("jj");
+        bootstrap
             .current_dir(&dest)
-            .args(["bookmark", "create", &selection.name, "-r", "@"]);
-        if !run(bookmark) {
-            eprintln!(
-                "warning: could not create bookmark {} (workspace still created)",
-                selection.name
-            );
+            .args(["sparse", "set", "--clear"]);
+        for path in CODEX_BOOTSTRAP_PATHS {
+            bootstrap.args(["--add", path]);
         }
+        run_or(bootstrap, "materialize Codex startup files", fail);
         dest
     } else {
         source
@@ -312,13 +314,6 @@ fn open_tab_layout(workspace_id: &str, cwd: &str, label: &str, is_jj: bool) {
     let tab_id = required_json_string(&created, "/result/tab/tab_id");
     let left_pane = required_json_string(&created, "/result/root_pane/pane_id");
 
-    // This plugin owns Codex startup for the tab it creates. Keeping this out
-    // of the global tab.created hook prevents duplicate launches and lets the
-    // same flow work for non-jj source folders.
-    let mut start_codex = Command::new(&herdr);
-    start_codex.args(["pane", "run", &left_pane, "co"]);
-    run_or(start_codex, "start Codex in left pane", fail);
-
     let split = command_json(
         Command::new(&herdr).args([
             "pane",
@@ -338,13 +333,22 @@ fn open_tab_layout(workspace_id: &str, cwd: &str, label: &str, is_jj: bool) {
     let right_pane = required_json_string(&split, "/result/pane/pane_id");
     let finish = finish_tab_shell_command(workspace_id, &tab_id, &left_pane);
     let right_command = if is_jj {
-        format!("nohup {finish} >/dev/null 2>&1 </dev/null & {JJ_UPDATE_COMMAND}")
+        format!(
+            "nohup {finish} >/dev/null 2>&1 </dev/null & {}",
+            jj_setup_command(label)
+        )
     } else {
         finish
     };
     let mut run_right = Command::new(&herdr);
     run_right.args(["pane", "run", &right_pane, &right_command]);
     run_or(run_right, "start right-pane setup", fail);
+
+    // Give checkout materialization a head start, then launch Codex without
+    // changing focus away from the left pane.
+    let mut start_codex = Command::new(&herdr);
+    start_codex.args(["pane", "run", &left_pane, "co"]);
+    run_or(start_codex, "start Codex in left pane", fail);
 
     if !is_jj {
         let body = format!(
@@ -367,6 +371,16 @@ fn open_tab_layout(workspace_id: &str, cwd: &str, label: &str, is_jj: bool) {
             eprintln!("warning: could not show the non-jj workspace notification");
         }
     }
+}
+
+fn jj_setup_command(workspace_name: &str) -> String {
+    let bookmark_warning = shell_quote(&format!(
+        "warning: could not create bookmark {workspace_name} (workspace still created)"
+    ));
+    format!(
+        "{JJ_MATERIALIZE_COMMAND} && (jj bookmark create {} -r @ || printf '%s\\n' {bookmark_warning} >&2) && {JJ_UPDATE_COMMAND}",
+        shell_quote(workspace_name)
+    )
 }
 
 fn command_json(command: &mut Command, what: &str) -> Value {
@@ -1412,6 +1426,14 @@ mod tests {
         assert_eq!(
             JJ_UPDATE_COMMAND,
             "jj git fetch && jj rebase -s @ -d 'trunk()'"
+        );
+    }
+
+    #[test]
+    fn right_pane_materializes_then_bookmarks_then_updates() {
+        assert_eq!(
+            jj_setup_command("workspace/fix-api"),
+            "jj sparse set --clear --add . && (jj bookmark create 'workspace/fix-api' -r @ || printf '%s\\n' 'warning: could not create bookmark workspace/fix-api (workspace still created)' >&2) && jj git fetch && jj rebase -s @ -d 'trunk()'"
         );
     }
 
