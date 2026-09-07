@@ -30,9 +30,10 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
+use serde::Deserialize;
 use serde_json::Value;
 
 #[derive(Clone, Debug)]
@@ -45,6 +46,10 @@ struct WorkspaceChoice {
 struct WizardResult {
     source: WorkspaceChoice,
     name: String,
+    /// The base revision for workspace creation: the resolution-chain value
+    /// evaluated for the finally selected source, or the user-edited revset
+    /// (validated) when the base field was touched. Unused for non-jj sources.
+    base_rev: String,
 }
 
 #[derive(Clone, Copy)]
@@ -55,19 +60,431 @@ struct WizardView<'a> {
     field: WizardField,
     query: &'a str,
     name: &'a str,
+    base: &'a str,
     root: &'a Path,
     error: Option<&'a str>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WizardField {
     WorkspaceSearch,
     Name,
+    Base,
 }
 
-const CODEX_BOOTSTRAP_PATHS: [&str; 4] = ["AGENTS.md", "AGENTS.override.md", ".codex", ".agents"];
-const JJ_MATERIALIZE_COMMAND: &str = "jj sparse set --clear --add .";
-const JJ_UPDATE_COMMAND: &str = "jj git fetch && jj rebase -s @ -d 'trunk()'";
+/// Tab/BackTab cycle order of the wizard's editable fields.
+fn next_wizard_field(field: WizardField) -> WizardField {
+    match field {
+        WizardField::WorkspaceSearch => WizardField::Name,
+        WizardField::Name => WizardField::Base,
+        WizardField::Base => WizardField::WorkspaceSearch,
+    }
+}
+
+/// The yellow warning shown for non-jj sources. The base-rev field only
+/// applies to jj workspaces, so the warning also says it is ignored.
+fn source_warning(is_jj: bool) -> Option<&'static str> {
+    if is_jj {
+        None
+    } else {
+        Some("not a jj workspace — the same folder will be opened; base-rev is ignored")
+    }
+}
+
+const DEFAULT_BOOTSTRAP_PATHS: [&str; 4] = ["AGENTS.md", "AGENTS.override.md", ".codex", ".agents"];
+
+// --- plugin config ---------------------------------------------------------
+//
+// Single config channel: `$HERDR_PLUGIN_CONFIG_DIR/config.toml`. herdr injects
+// HERDR_PLUGIN_CONFIG_DIR and guarantees the directory exists before every
+// plugin command/pane spawn, so the path is always read from that env var and
+// never hardcoded. Process env vars and `.env` are NOT config sources. A
+// missing file means all built-in defaults; any other problem (syntax error,
+// wrong type, unknown key, empty string value) is a hard fail-fast error.
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct Config {
+    jj: JjConfig,
+    agent: AgentConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct JjConfig {
+    base_rev: String,
+    workspace_root: String,
+    /// The jj executable: a bare name (looked up on PATH) or an absolute path,
+    /// or a full argv whose first element is the executable.
+    command: JjCommandValue,
+}
+
+/// Value of `jj.command`: either a single string — a bare name or an absolute
+/// (or `~`-prefixed) path, classified by `resolve_jj_command` — or a full argv
+/// list whose first element is the executable and whose remaining elements are
+/// leading arguments prepended to every jj invocation.
+#[derive(Debug, Clone, PartialEq)]
+enum JjCommandValue {
+    Single(String),
+    Argv(Vec<String>),
+}
+
+impl Default for JjCommandValue {
+    fn default() -> Self {
+        JjCommandValue::Single("jj".into())
+    }
+}
+
+impl<'de> Deserialize<'de> for JjCommandValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct JjCommandVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for JjCommandVisitor {
+            type Value = JjCommandValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "a string or a list of strings for `jj.command`")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(JjCommandValue::Single(value.to_string()))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element::<String>()? {
+                    items.push(item);
+                }
+                Ok(JjCommandValue::Argv(items))
+            }
+        }
+
+        deserializer.deserialize_any(JjCommandVisitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct AgentConfig {
+    command: String,
+    bootstrap_paths: Vec<String>,
+    /// `false` (default): never auto-answer any agent prompt; a blocked agent
+    /// is surfaced as a toast. `true`: auto-press Enter ONLY for a codex
+    /// trust prompt inside the startup window (see `trust_window_secs`).
+    auto_trust: bool,
+    /// Startup window (seconds, from finish-tab start) during which codex
+    /// trust prompts may be auto-answered when `auto_trust` is on.
+    trust_window_secs: u64,
+    /// Total wait budget (seconds) for the agent to be detected.
+    startup_timeout_secs: u64,
+    /// `herdr agent list` polling interval (milliseconds).
+    poll_interval_ms: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            jj: JjConfig::default(),
+            agent: AgentConfig::default(),
+        }
+    }
+}
+
+impl Default for JjConfig {
+    fn default() -> Self {
+        JjConfig {
+            base_rev: "trunk()".into(),
+            workspace_root: "~/.herdr/workspaces".into(),
+            command: JjCommandValue::default(),
+        }
+    }
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        AgentConfig {
+            command: "codex".into(),
+            bootstrap_paths: DEFAULT_BOOTSTRAP_PATHS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            auto_trust: false,
+            trust_window_secs: 10,
+            startup_timeout_secs: 20,
+            poll_interval_ms: 200,
+        }
+    }
+}
+
+/// Why `load_config` failed. Every variant carries a user-facing message that
+/// names the offending key or file.
+#[derive(Debug)]
+enum ConfigError {
+    /// The config directory/file exists but could not be read.
+    Io(String),
+    /// TOML syntax error, type error, or unknown key (serde reports the key).
+    Parse(String),
+    /// An explicitly empty string value, which is invalid config.
+    Empty(String),
+    /// A numeric value below its required minimum.
+    BelowMinimum {
+        key: String,
+        minimum: u64,
+        actual: u64,
+    },
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Io(message) => write!(f, "could not read config: {message}"),
+            ConfigError::Parse(message) => write!(f, "invalid config: {message}"),
+            ConfigError::Empty(key) => write!(f, "invalid config: `{key}` must not be empty"),
+            ConfigError::BelowMinimum {
+                key,
+                minimum,
+                actual,
+            } => write!(
+                f,
+                "invalid config: `{key}` must be >= {minimum} (got {actual})"
+            ),
+        }
+    }
+}
+
+/// Load and validate the plugin config. A missing `config.toml` is not an
+/// error: it yields all built-in defaults. Anything else malformed is a hard
+/// error (fail-fast).
+fn load_config() -> Result<Config, ConfigError> {
+    let Some(dir) = env::var("HERDR_PLUGIN_CONFIG_DIR").ok() else {
+        return Ok(Config::default());
+    };
+    load_config_from(&Path::new(&dir).join("config.toml"))
+}
+
+fn load_config_from(path: &Path) -> Result<Config, ConfigError> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(err) => return Err(ConfigError::Io(err.to_string())),
+    };
+    let config: Config = toml::from_str(&content)
+        .map_err(|err| ConfigError::Parse(err.to_string()))?;
+    config.validate()
+}
+
+impl Config {
+    /// Reject explicitly empty string values. This is a BREAKING change from
+    /// the old `config_value` semantics, where an empty value meant "use the
+    /// default".
+    fn validate(self) -> Result<Config, ConfigError> {
+        if self.jj.base_rev.is_empty() {
+            return Err(ConfigError::Empty("jj.base_rev".into()));
+        }
+        if self.jj.workspace_root.is_empty() {
+            return Err(ConfigError::Empty("jj.workspace_root".into()));
+        }
+        if self.agent.command.is_empty() {
+            return Err(ConfigError::Empty("agent.command".into()));
+        }
+        match &self.jj.command {
+            JjCommandValue::Single(value) if value.is_empty() => {
+                return Err(ConfigError::Empty("jj.command".into()));
+            }
+            JjCommandValue::Argv(items) if items.is_empty() => {
+                return Err(ConfigError::Empty("jj.command".into()));
+            }
+            JjCommandValue::Argv(items) if items[0].is_empty() => {
+                return Err(ConfigError::Empty("jj.command (argv[0])".into()));
+            }
+            _ => {}
+        }
+        for (index, path) in self.agent.bootstrap_paths.iter().enumerate() {
+            if path.is_empty() {
+                return Err(ConfigError::Empty(format!("agent.bootstrap_paths[{index}]")));
+            }
+        }
+        for (key, value, minimum) in [
+            ("agent.trust_window_secs", self.agent.trust_window_secs, 1),
+            (
+                "agent.startup_timeout_secs",
+                self.agent.startup_timeout_secs,
+                1,
+            ),
+            ("agent.poll_interval_ms", self.agent.poll_interval_ms, 10),
+        ] {
+            if value < minimum {
+                return Err(ConfigError::BelowMinimum {
+                    key: key.into(),
+                    minimum,
+                    actual: value,
+                });
+            }
+        }
+        Ok(self)
+    }
+}
+
+// --- jj executable resolution ----------------------------------------------
+
+/// The fully-resolved `jj` invocation: an absolute executable path validated
+/// to exist and carry the executable bit, plus any leading arguments from an
+/// argv-form `jj.command`. Resolution happens exactly once per plugin
+/// invocation and the result is threaded through every jj call, including the
+/// right-pane setup command (so the pane shell's PATH never participates).
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedJj {
+    executable: PathBuf,
+    extra_args: Vec<String>,
+}
+
+/// Why `jj.command` could not be resolved. `origin` is `"jj.command"` for the
+/// string form and `"jj.command argv[0]"` for the argv form.
+#[derive(Debug)]
+enum ResolveError {
+    /// A bare name that matched no executable in any PATH directory.
+    NotOnPath {
+        origin: &'static str,
+        value: String,
+        searched: Vec<PathBuf>,
+    },
+    /// An absolute path that does not exist, is not a regular file, or lacks
+    /// the executable bit.
+    BadAbsolutePath {
+        origin: &'static str,
+        path: String,
+        reason: &'static str,
+    },
+    /// A value containing `/` that is neither absolute nor `~`-expanded to an
+    /// absolute path.
+    RelativePath { origin: &'static str, value: String },
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::NotOnPath {
+                origin,
+                value,
+                searched,
+            } => {
+                let dirs = searched
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "{origin}: `{value}` was not found on PATH (searched: {dirs}). \
+                     Run `which jj` in your shell and write the result into `jj.command` in config.toml"
+                )
+            }
+            ResolveError::BadAbsolutePath { origin, path, reason } => {
+                write!(f, "{origin}: {path} {reason} (expected an executable file)")
+            }
+            ResolveError::RelativePath { origin, value } => write!(
+                f,
+                "{origin}: `{value}` is a relative path; only a bare name (looked up on PATH) \
+                 or an absolute path is supported"
+            ),
+        }
+    }
+}
+
+fn path_dirs() -> Vec<PathBuf> {
+    env::var_os("PATH")
+        .map(|paths| {
+            env::split_paths(&paths)
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve `jj.command` once per process. A string form classifies as a bare
+/// name (PATH lookup) or an absolute path (validated as-is); an argv form
+/// resolves only `argv[0]` and keeps the rest as leading arguments. `~` is
+/// expanded before classification. PATH directories come from the plugin
+/// process environment; tests inject their own directory list instead.
+fn resolve_jj_command(
+    value: &JjCommandValue,
+    path_dirs: &[PathBuf],
+) -> Result<ResolvedJj, ResolveError> {
+    let (head, extra_args, origin) = match value {
+        JjCommandValue::Single(value) => (value.clone(), Vec::new(), "jj.command"),
+        JjCommandValue::Argv(items) => (items[0].clone(), items[1..].to_vec(), "jj.command argv[0]"),
+    };
+    let home = env::var("HOME").ok();
+    resolve_jj_head(&head, extra_args, origin, home.as_deref(), path_dirs)
+}
+
+fn resolve_jj_head(
+    head: &str,
+    extra_args: Vec<String>,
+    origin: &'static str,
+    home: Option<&str>,
+    path_dirs: &[PathBuf],
+) -> Result<ResolvedJj, ResolveError> {
+    let head = expand_tilde_with_home(head, home);
+    if head.contains('/') {
+        if !head.starts_with('/') {
+            return Err(ResolveError::RelativePath {
+                origin,
+                value: head,
+            });
+        }
+        return match fs::metadata(&head) {
+            Ok(meta) if meta.is_file() && is_executable(&meta) => Ok(ResolvedJj {
+                executable: PathBuf::from(&head),
+                extra_args,
+            }),
+            Ok(_) => Err(ResolveError::BadAbsolutePath {
+                origin,
+                path: head,
+                reason: "is not an executable file",
+            }),
+            Err(_) => Err(ResolveError::BadAbsolutePath {
+                origin,
+                path: head,
+                reason: "does not exist",
+            }),
+        };
+    }
+    for dir in path_dirs {
+        let candidate = dir.join(&head);
+        if is_executable_file(&candidate) {
+            return Ok(ResolvedJj {
+                executable: candidate,
+                extra_args,
+            });
+        }
+    }
+    Err(ResolveError::NotOnPath {
+        origin,
+        value: head,
+        searched: path_dirs.to_vec(),
+    })
+}
+
+fn is_executable(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|meta| meta.is_file() && is_executable(&meta))
+        .unwrap_or(false)
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -84,8 +501,97 @@ fn main() {
     }
 }
 
+// --- base revision resolution ----------------------------------------------
+
+/// Resolve the base revision for workspace creation. The chain: `jj config get
+/// herdr.base-rev` (repo-level config wins; user-level config acts as a
+/// personal global default) → `jj.base_rev` in config.toml → the built-in
+/// `trunk()`. A missing key (`jj config get` exits non-zero) is never an
+/// error — it falls through to the next layer. An explicitly EMPTY value
+/// (exit 0, empty output) is invalid config and fails fast, mirroring the
+/// config.toml layer's empty-value semantics.
+fn resolve_base_rev(config: &Config, jj: &ResolvedJj, repo: &Path) -> Result<String, String> {
+    let mut command = Command::new(&jj.executable);
+    command
+        .current_dir(repo)
+        .args(&jj.extra_args)
+        .args(["config", "get", "herdr.base-rev"]);
+    if let Ok(output) = command.output() {
+        if output.status.success() {
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if value.is_empty() {
+                return Err(
+                    "jj config reports `herdr.base-rev` as empty — empty values are invalid. \
+                     Set it to a revset (`jj config set --repo herdr.base-rev <revset>`) \
+                     or remove the key to fall back to config.toml / trunk()."
+                        .into(),
+                );
+            }
+            return Ok(value);
+        }
+    }
+    Ok(config.jj.base_rev.clone())
+}
+
+/// Determine the final base revision at wizard submit time for a jj source:
+/// an untouched base field (dirty = false) is re-evaluated from the
+/// resolution chain so the *finally selected* source wins; a user-edited
+/// value (dirty = true) is validated against the repo with
+/// `jj log -r <expr>` (a cheap parse-only check with zero output). Failure
+/// keeps the wizard open with jj's own error message.
+fn wizard_final_base_rev(
+    config: &Config,
+    jj: &ResolvedJj,
+    repo: &Path,
+    entered: &str,
+    dirty: bool,
+) -> Result<String, String> {
+    // The FINAL base value is pre-validated regardless of its source:
+    // chain-resolved values come from the user's jj config and can reference
+    // nonexistent revisions (falsified during acceptance: `herdr.base-rev =
+    // <nonexistent change id>` used to slip through and fail only at
+    // `jj workspace add`). An invalid value keeps the wizard open so the
+    // user can edit the base field.
+    let value = if dirty {
+        entered.to_string()
+    } else {
+        resolve_base_rev(config, jj, repo)?
+    };
+    validate_revset(jj, repo, &value)?;
+    Ok(value)
+}
+
+/// Pre-validate a revset against the source repo: `jj log -r <value>` parses
+/// and resolves it; `--limit 0` keeps it fast and pager-free. Failure carries
+/// jj's native message into the wizard error line.
+fn validate_revset(jj: &ResolvedJj, repo: &Path, value: &str) -> Result<(), String> {
+    let mut validate = Command::new(&jj.executable);
+    validate
+        .current_dir(repo)
+        .args(&jj.extra_args)
+        .args(["log", "-r", value, "--no-graph", "--limit", "0", "--no-pager"]);
+    match validate.output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                format!("invalid revset: {value}")
+            } else {
+                stderr
+            })
+        }
+        Err(err) => Err(format!("could not validate revset: {err}")),
+    }
+}
+
 /// Action (headless): capture the calling workspace, then open the wizard pane.
 fn cmd_open(_mode: &str) -> ! {
+    let config = load_config().unwrap_or_else(|err| die(&err.to_string()));
+    // Resolve eagerly so a broken `jj.command` fails the action (and surfaces
+    // as a toast) instead of surfacing only inside the wizard pane.
+    if let Err(err) = resolve_jj_command(&config.jj.command, &path_dirs()) {
+        die(&err.to_string());
+    }
     let ctx = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
     let cwd = json_string_field(&ctx, "focused_pane_cwd")
         .or_else(|| json_string_field(&ctx, "workspace_cwd"))
@@ -123,6 +629,17 @@ fn cmd_open(_mode: &str) -> ! {
 /// Pane (interactive TTY): select a source workspace and name, then create the
 /// Codex-left / terminal-right Herdr workspace.
 fn cmd_wizard() -> ! {
+    let config = match load_config() {
+        Ok(config) => config,
+        Err(err) => show_config_error_and_exit(&err.to_string()),
+    };
+    // Resolve `jj.command` exactly once per invocation; the result is used for
+    // every jj call below and baked (absolute) into the right-pane setup
+    // command, so the pane shell's PATH never participates.
+    let jj = match resolve_jj_command(&config.jj.command, &path_dirs()) {
+        Ok(jj) => jj,
+        Err(err) => show_config_error_and_exit(&err.to_string()),
+    };
     let current_cwd = env::var("JJ_CURRENT_CWD").unwrap_or_default();
     let current_workspace = env::var("JJ_CURRENT_WORKSPACE").unwrap_or_default();
     let choices = match load_workspace_choices(&current_workspace, &current_cwd) {
@@ -134,9 +651,35 @@ fn cmd_wizard() -> ! {
         .iter()
         .position(|choice| choice.id == current_workspace)
         .unwrap_or(0);
-    let root = workspaces_root();
+    let root = workspaces_root(&config);
 
-    let selection = match run_workspace_wizard(&choices, selected, &root, generated_name(seed())) {
+    // Prefill the wizard's base field from the initially selected source. The
+    // value shown is display-only: at submit, an untouched field is
+    // re-evaluated from the resolution chain so the finally selected source
+    // wins (see `wizard_final_base_rev`).
+    let initial_choice = &choices[selected];
+    let initial_base = if is_jj_workspace(&initial_choice.path) {
+        // Display-only prefill: a repo-level resolution error (e.g. an
+        // explicit empty `herdr.base-rev` in jj repo config) must NOT kill
+        // the wizard at entry — fall back to the global default here. The
+        // real resolution happens at submit (wizard_final_base_rev), where
+        // errors surface as the wizard's own error line and the user can
+        // edit the base field to proceed.
+        resolve_base_rev(&config, &jj, Path::new(&repo_root(&initial_choice.path)))
+            .unwrap_or_else(|_| config.jj.base_rev.clone())
+    } else {
+        config.jj.base_rev.clone()
+    };
+
+    let selection = match run_workspace_wizard(
+        &choices,
+        selected,
+        &root,
+        &config,
+        &jj,
+        generated_name(seed()),
+        initial_base,
+    ) {
         Ok(Some(selection)) => selection,
         Ok(None) => process::exit(0),
         Err(err) => fail(&format!("terminal error: {err}")),
@@ -148,9 +691,7 @@ fn cmd_wizard() -> ! {
 
     let is_jj = is_jj_workspace(&source);
     let destination = if is_jj {
-        if which("jj").is_none() {
-            fail("jj not found on PATH");
-        }
+        // `jj.command` was already resolved and validated at wizard entry.
         // Resolve secondary workspaces to the main repo so sibling checkouts
         // remain grouped under a stable directory.
         let repo = repo_root(&source);
@@ -167,42 +708,110 @@ fn cmd_wizard() -> ! {
         }
         let dest = dest_path.display().to_string();
 
-        // Create only the metadata and Codex startup files synchronously. The
-        // full checkout, bookmark, fetch, and rebase run in the right pane.
-        let base = config_value("JJ_BASE_REV").unwrap_or_else(|| "trunk()".into());
+        // Create only the metadata and bootstrap startup files synchronously.
+        // The full checkout, bookmark, fetch, and rebase run in the right pane.
+        // The base revision comes from the wizard (resolution chain evaluated
+        // for this source, or the validated user input) so `workspace add -r`
+        // and the right-pane rebase destination always agree.
+        let base = &selection.base_rev;
         eprintln!(
-            "+ jj workspace add --name {} -r {base} --sparse-patterns empty {dest}",
+            "+ {} workspace add --name {} -r {base} --sparse-patterns empty {dest}",
+            jj.executable.display(),
             selection.name
         );
-        let mut add = Command::new("jj");
-        add.current_dir(&repo).args([
-            "workspace",
-            "add",
-            "--name",
-            &selection.name,
-            "-r",
-            &base,
-            "--sparse-patterns",
-            "empty",
-            &dest,
-        ]);
+        let mut add = Command::new(&jj.executable);
+        add.current_dir(&repo)
+            .args(&jj.extra_args)
+            .args([
+                "workspace",
+                "add",
+                "--name",
+                &selection.name,
+                "-r",
+                base,
+                "--sparse-patterns",
+                "empty",
+                &dest,
+            ]);
         run_or(add, "jj workspace add", fail);
 
-        let mut bootstrap = Command::new("jj");
+        let mut bootstrap = Command::new(&jj.executable);
         bootstrap
             .current_dir(&dest)
+            .args(&jj.extra_args)
             .args(["sparse", "set", "--clear"]);
-        for path in CODEX_BOOTSTRAP_PATHS {
+        for path in &config.agent.bootstrap_paths {
             bootstrap.args(["--add", path]);
         }
-        run_or(bootstrap, "materialize Codex startup files", fail);
+        run_or(bootstrap, "materialize agent bootstrap files", fail);
         dest
     } else {
         source
     };
 
-    open_tab_layout(&selection.source.id, &destination, &selection.name, is_jj);
+    open_tab_layout(
+        &config,
+        &jj,
+        &selection.source.id,
+        &destination,
+        &selection.name,
+        &selection.base_rev,
+        is_jj,
+    );
     process::exit(0);
+}
+
+/// Fail-fast: render an error in a minimal TUI screen, then exit non-zero.
+/// The wizard runs as an interactive pane (TTY), so the error must be visible
+/// there rather than only on stderr.
+fn show_config_error_and_exit(message: &str) -> ! {
+    // Fatal errors must reach error.log even when their UI outlet (this
+    // modal) is dismissed instantly.
+    log_error(message);
+    let _ = enable_raw_mode();
+    let mut out = io::stdout();
+    let _ = execute!(out, EnterAlternateScreen);
+    let mut terminal = match Terminal::new(CrosstermBackend::new(out)) {
+        Ok(terminal) => terminal,
+        Err(_) => {
+            let _ = disable_raw_mode();
+            fail(&message);
+        }
+    };
+    let _ = terminal.draw(|frame| {
+        let p = catppuccin();
+        let area = frame.area();
+        dim_background(frame, area);
+        if let Some(inner) = render_modal_shell(frame, area, 90, 12, &p) {
+            render_modal_header(
+                frame,
+                Rect::new(inner.x, inner.y, inner.width, 1),
+                "configuration error",
+                &p,
+            );
+            let body = Paragraph::new(vec![
+                Line::from(Span::styled(message, Style::default().fg(p.red))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "press enter to close",
+                    Style::default().fg(p.overlay0),
+                )),
+            ])
+            .wrap(Wrap { trim: false });
+            frame.render_widget(
+                body,
+                Rect::new(
+                    inner.x + 1,
+                    inner.y + 1,
+                    inner.width.saturating_sub(2),
+                    inner.height.saturating_sub(2),
+                ),
+            );
+        }
+    });
+    let _ = event::read();
+    let _ = restore_terminal(&mut terminal);
+    process::exit(1);
 }
 
 fn load_workspace_choices(
@@ -278,7 +887,12 @@ fn pane_path(pane: &Value) -> Option<String> {
 }
 
 fn herdr_json(args: &[&str]) -> Result<Value, String> {
-    let output = Command::new(herdr_bin())
+    herdr_json_with(&herdr_bin(), args)
+}
+
+/// Like `herdr_json`, with an injectable herdr executable (tests pass a fake).
+fn herdr_json_with(bin: &str, args: &[&str]) -> Result<Value, String> {
+    let output = Command::new(bin)
         .args(args)
         .output()
         .map_err(|err| format!("herdr {} failed to start: {err}", args.join(" ")))?;
@@ -294,7 +908,22 @@ fn herdr_json(args: &[&str]) -> Result<Value, String> {
         .map_err(|err| format!("invalid JSON from herdr {}: {err}", args.join(" ")))
 }
 
-fn open_tab_layout(workspace_id: &str, cwd: &str, label: &str, is_jj: bool) {
+/// Resolve the left-pane agent start command from `agent.command`. Empty
+/// values are rejected at config-parse time, so this is always the configured
+/// command or the built-in default.
+fn resolve_start_command(agent: &AgentConfig) -> String {
+    agent.command.clone()
+}
+
+fn open_tab_layout(
+    config: &Config,
+    jj: &ResolvedJj,
+    workspace_id: &str,
+    cwd: &str,
+    label: &str,
+    base_rev: &str,
+    is_jj: bool,
+) {
     let herdr = herdr_bin();
     eprintln!("+ herdr tab create --workspace {workspace_id} --cwd {cwd}");
     let created = command_json(
@@ -331,24 +960,32 @@ fn open_tab_layout(workspace_id: &str, cwd: &str, label: &str, is_jj: bool) {
         "herdr pane split",
     );
     let right_pane = required_json_string(&split, "/result/pane/pane_id");
-    let finish = finish_tab_shell_command(workspace_id, &tab_id, &left_pane);
     let right_command = if is_jj {
-        format!(
-            "nohup {finish} >/dev/null 2>&1 </dev/null & {}",
-            jj_setup_command(label)
+        setup_script_command(
+            &setup_script_path(),
+            jj,
+            base_rev,
+            label,
+            workspace_id,
+            &tab_id,
+            &left_pane,
         )
     } else {
-        finish
+        finish_tab_shell_command(workspace_id, &tab_id, &left_pane)
     };
     let mut run_right = Command::new(&herdr);
     run_right.args(["pane", "run", &right_pane, &right_command]);
     run_or(run_right, "start right-pane setup", fail);
 
-    // Give checkout materialization a head start, then launch Codex without
-    // changing focus away from the left pane.
+    // Give checkout materialization a head start, then launch the coding
+    // agent without changing focus away from the left pane. The start command
+    // comes from `agent.command` (default "codex"): panes run the user's
+    // shell, where agent launch aliases vary between setups and cannot be
+    // assumed.
+    let start_command = resolve_start_command(&config.agent);
     let mut start_codex = Command::new(&herdr);
-    start_codex.args(["pane", "run", &left_pane, "co"]);
-    run_or(start_codex, "start Codex in left pane", fail);
+    start_codex.args(["pane", "run", &left_pane, &start_command]);
+    run_or(start_codex, "start agent in left pane", fail);
 
     if !is_jj {
         let body = format!(
@@ -373,14 +1010,56 @@ fn open_tab_layout(workspace_id: &str, cwd: &str, label: &str, is_jj: bool) {
     }
 }
 
-fn jj_setup_command(workspace_name: &str) -> String {
-    let bookmark_warning = shell_quote(&format!(
-        "warning: could not create bookmark {workspace_name} (workspace still created)"
-    ));
-    format!(
-        "{JJ_MATERIALIZE_COMMAND} && (jj bookmark create {} -r @ || printf '%s\\n' {bookmark_warning} >&2) && {JJ_UPDATE_COMMAND}",
-        shell_quote(workspace_name)
-    )
+/// Plugin root directory: `HERDR_PLUGIN_ROOT` when injected, else derived from
+/// the running executable (`<root>/target/release/jj-workspace` — the layout
+/// the manifest's `[[build]]` and actions already depend on).
+fn plugin_root() -> PathBuf {
+    if let Some(root) = env::var_os("HERDR_PLUGIN_ROOT") {
+        if !root.is_empty() {
+            return PathBuf::from(root);
+        }
+    }
+    env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Path of the shipped right-pane setup script: `<plugin_root>/scripts/…`.
+fn setup_script_path() -> PathBuf {
+    plugin_root().join("scripts").join("setup-workspace.sh")
+}
+
+/// The right-pane command: a single call to the shipped setup script. Every
+/// argument is individually shell-quoted; the script inserts the leading
+/// arguments of an argv-form `jj.command` before each jj subcommand itself
+/// (via `"$@"`), so the pane shell only ever sees plain words — no command
+/// sequences, subshell groups, or PATH dependence.
+fn setup_script_command(
+    script: &Path,
+    jj: &ResolvedJj,
+    base_rev: &str,
+    bookmark_name: &str,
+    workspace_id: &str,
+    tab_id: &str,
+    pane_id: &str,
+) -> String {
+    let mut words = vec![
+        shell_quote(&script.display().to_string()),
+        shell_quote(&jj.executable.display().to_string()),
+        shell_quote(base_rev),
+        shell_quote(bookmark_name),
+        shell_quote(workspace_id),
+        shell_quote(tab_id),
+        shell_quote(pane_id),
+    ];
+    words.extend(jj.extra_args.iter().map(|arg| shell_quote(arg)));
+    words.join(" ")
 }
 
 fn command_json(command: &mut Command, what: &str) -> Value {
@@ -407,80 +1086,90 @@ fn required_json_string(value: &Value, pointer: &str) -> String {
         .unwrap_or_else(|| fail(&format!("Herdr response is missing {pointer}")))
 }
 
-fn wait_for_codex_and_accept_trust(pane_id: &str, timeout: Duration) -> bool {
-    let started = std::time::Instant::now();
-    let mut trust_attempts = 0;
-    let mut blocked_without_trust_since: Option<std::time::Instant> = None;
-    let mut ready_since: Option<std::time::Instant> = None;
-    while started.elapsed() < timeout {
-        let pane_text = read_pane_text(pane_id);
-        let normalized = pane_text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let trust_prompt = normalized.contains("Do you trust the contents of this directory?")
-            && normalized.contains("1. Yes, continue")
-            && normalized.contains("2. No, quit");
-        if trust_prompt {
-            if trust_attempts >= 5 {
-                return false;
-            }
-            let mut accept = Command::new(herdr_bin());
-            accept.args(["pane", "send-keys", pane_id, "enter"]);
-            if !run(accept) {
-                return false;
-            }
-            trust_attempts += 1;
-            blocked_without_trust_since = None;
-            ready_since = None;
-            thread::sleep(Duration::from_millis(200));
-            continue;
-        }
-        if normalized.contains("OpenAI Codex") && normalized.contains("Ask Codex to do anything") {
-            let ready = ready_since.get_or_insert_with(std::time::Instant::now);
-            if ready.elapsed() >= Duration::from_secs(1) {
-                return true;
-            }
-        } else {
-            ready_since = None;
-        }
+// --- agent readiness (herdr agent_status state machine) ---------------------
 
-        if let Ok(agents) = herdr_json(&["agent", "list"]) {
-            let status = agents
-                .pointer("/result/agents")
-                .and_then(Value::as_array)
-                .and_then(|agents| {
-                    agents
-                        .iter()
-                        .find(|agent| {
-                            agent.get("pane_id").and_then(Value::as_str) == Some(pane_id)
-                                && agent.get("agent").and_then(Value::as_str) == Some("codex")
-                        })
-                        .and_then(|agent| agent.get("agent_status").and_then(Value::as_str))
-                });
-            match status {
-                Some("blocked") => {
-                    let blocked_since =
-                        blocked_without_trust_since.get_or_insert_with(std::time::Instant::now);
-                    if blocked_since.elapsed() >= Duration::from_secs(1) {
-                        return false;
-                    }
-                }
-                _ => blocked_without_trust_since = None,
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    false
+/// Internal timing constants, deliberately not configurable: they guard
+/// against transient status flicker and pathological reply loops, and no
+/// realistic user needs to tune them.
+const BLOCKED_GRACE_SECS: u64 = 1;
+const TRUST_MAX_ATTEMPTS: u32 = 5;
+
+/// Outcome of the `finish-tab` agent wait.
+#[derive(Debug)]
+enum AgentWaitOutcome {
+    /// The agent was detected in the pane; ready to focus.
+    Ready,
+    /// The agent appeared but stayed blocked without qualifying for (or
+    /// surviving) auto-trust; surfaced as a toast.
+    NeedsAttention { label: String },
+    /// No agent was detected within the startup budget.
+    NotDetected,
 }
 
-fn read_pane_text(pane_id: &str) -> String {
-    Command::new(herdr_bin())
-        .args([
-            "pane", "read", pane_id, "--source", "visible", "--lines", "80",
-        ])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default()
+/// Layered readiness wait. Poll `herdr agent list` (JSON envelope) until the
+/// left pane has an agent entry — the entry itself means herdr's process-tree
+/// detection has seen the agent, which is all "ready to focus" requires. A
+/// `blocked` status stable longer than the grace constant means the agent is
+/// waiting for human input and is surfaced as a toast. The ONLY automated
+/// response is pressing Enter for a codex trust prompt when `auto_trust` is
+/// on, inside the startup window, confirmed by a state transition.
+fn wait_for_agent_ready(config: &AgentConfig, herdr: &str, pane_id: &str) -> AgentWaitOutcome {
+    let started = std::time::Instant::now();
+    let timeout = Duration::from_secs(config.startup_timeout_secs);
+    let poll = Duration::from_millis(config.poll_interval_ms);
+    let trust_window = Duration::from_secs(config.trust_window_secs);
+    let mut blocked_since: Option<std::time::Instant> = None;
+    let mut trust_attempts: u32 = 0;
+    while started.elapsed() < timeout {
+        let entry = herdr_json_with(herdr, &["agent", "list"])
+            .ok()
+            .and_then(|agents| {
+                agents
+                    .pointer("/result/agents")
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .find(|agent| agent.get("pane_id").and_then(Value::as_str) == Some(pane_id))
+                    .cloned()
+            });
+        let Some(entry) = entry else {
+            thread::sleep(poll);
+            continue;
+        };
+        let label = entry
+            .get("agent")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let status = entry
+            .get("agent_status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if status != "blocked" {
+            // Any non-blocked status (working/idle/done): the agent is up.
+            return AgentWaitOutcome::Ready;
+        }
+        // The agent is blocked (waiting for human input).
+        if config.auto_trust
+            && label == "codex"
+            && started.elapsed() < trust_window
+            && trust_attempts < TRUST_MAX_ATTEMPTS
+        {
+            let mut accept = Command::new(herdr);
+            accept.args(["pane", "send-keys", pane_id, "enter"]);
+            if run(accept) {
+                trust_attempts += 1;
+                blocked_since = None;
+                thread::sleep(poll);
+                continue;
+            }
+        }
+        let blocked_since = blocked_since.get_or_insert_with(std::time::Instant::now);
+        if blocked_since.elapsed() >= Duration::from_secs(BLOCKED_GRACE_SECS) {
+            return AgentWaitOutcome::NeedsAttention { label };
+        }
+        thread::sleep(poll);
+    }
+    AgentWaitOutcome::NotDetected
 }
 
 fn finish_tab_shell_command(workspace_id: &str, tab_id: &str, left_pane: &str) -> String {
@@ -500,6 +1189,7 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn cmd_finish_tab(args: &[String]) -> ! {
+    let config = load_config().unwrap_or_else(|err| die(&err.to_string()));
     let workspace_id = args.get(2).map(String::as_str).unwrap_or_default();
     let tab_id = args.get(3).map(String::as_str).unwrap_or_default();
     let left_pane = args.get(4).map(String::as_str).unwrap_or_default();
@@ -507,42 +1197,109 @@ fn cmd_finish_tab(args: &[String]) -> ! {
         die("finish-tab requires workspace, tab, and pane IDs");
     }
 
-    if !wait_for_codex_and_accept_trust(left_pane, Duration::from_secs(20)) {
-        let mut toast = Command::new(herdr_bin());
-        toast.args([
-            "notification",
-            "show",
-            "Codex needs attention",
-            "--body",
-            "Codex did not clear its startup prompt automatically.",
-            "--position",
-            "top-right",
-            "--sound",
-            "request",
-        ]);
-        let _ = toast.status();
-        process::exit(1);
+    let herdr = herdr_bin();
+    match wait_for_agent_ready(&config.agent, &herdr, left_pane) {
+        AgentWaitOutcome::Ready { .. } => {}
+        AgentWaitOutcome::NeedsAttention { label } => {
+            agent_attention_toast(&herdr, &label, &format!("{label} is waiting for your input."));
+            process::exit(1);
+        }
+        AgentWaitOutcome::NotDetected => {
+            agent_attention_toast(
+                &herdr,
+                "unknown",
+                "no agent was detected in the left pane before the startup timeout.",
+            );
+            process::exit(1);
+        }
     }
 
-    let herdr = herdr_bin();
     for _ in 0..6 {
         let _ = Command::new(&herdr)
             .args(["workspace", "focus", workspace_id])
             .status();
         let _ = Command::new(&herdr).args(["tab", "focus", tab_id]).status();
-        let _ = Command::new(&herdr)
-            .args(["agent", "focus", left_pane])
-            .status();
+        let _ = Command::new(&herdr).args(["agent", "focus", left_pane]).status();
         thread::sleep(Duration::from_millis(200));
     }
     process::exit(0);
 }
 
+/// Toast surfaced when the agent needs the user: the title carries the
+/// runtime detection label (never a hardcoded brand).
+fn agent_attention_toast(herdr: &str, label: &str, body: &str) {
+    let mut toast = Command::new(herdr);
+    toast.args([
+        "notification",
+        "show",
+        &format!("{label} needs attention"),
+        "--body",
+        body,
+        "--position",
+        "top-right",
+        "--sound",
+        "request",
+    ]);
+    let _ = toast.status();
+}
+
+/// Refuse to remove a workspace that still has uncommitted changes. Verified
+/// on jj 0.45.1: `jj workspace forget` silently discards a dirty working
+/// copy (exit 0, no protection), and the materialized files are deleted right
+/// after — the only real data-loss point of `remove`. Already-committed work
+/// and bookmarks survive (they live in the shared repo store). Fail-closed:
+/// a failed check is treated as dirty.
+fn check_remove_clean(jj: &ResolvedJj, workspace: &Path) -> Result<(), String> {
+    // Short name on the first line (toast-critical: herdr truncates long
+    // bodies); the full path follows on its own line for stderr and the log.
+    let name = workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace.display().to_string());
+    let mut command = Command::new(&jj.executable);
+    command
+        .current_dir(workspace)
+        .args(&jj.extra_args)
+        .args(["diff", "--summary", "-r", "@"]);
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(err) => {
+            return Err(format!(
+                "cannot check workspace '{name}' for uncommitted changes \
+                 (refusing to remove): {err}\n\
+                 workspace path: {}",
+                workspace.display()
+            ))
+        }
+    };
+    io::stderr().write_all(&output.stderr).ok();
+    if !output.status.success() {
+        return Err(format!(
+            "cannot check workspace '{name}' for uncommitted changes \
+             (jj diff exited {}): refusing to remove\n\
+             workspace path: {}",
+            output.status.code().unwrap_or(-1),
+            workspace.display()
+        ));
+    }
+    if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to remove workspace '{name}': it has uncommitted changes.\n\
+         workspace path: {}\n\
+         Already-committed work and bookmarks are safe in the repo store, but the \
+         materialized changes in this checkout would be deleted.\n\
+         Commit (`jj commit`) or undo (`jj restore`) them first, then run remove again.",
+        workspace.display()
+    ))
+}
+
 /// Action (headless): forget the current jj workspace, delete it, close its tab.
 fn cmd_remove() -> ! {
-    if which("jj").is_none() {
-        die("jj not found on PATH");
-    }
+    let config = load_config().unwrap_or_else(|err| die(&err.to_string()));
+    let jj = resolve_jj_command(&config.jj.command, &path_dirs())
+        .unwrap_or_else(|err| die(&err.to_string()));
     let ctx = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
     let tab = env::var("HERDR_TAB_ID")
         .ok()
@@ -574,9 +1331,14 @@ fn cmd_remove() -> ! {
             canon.display()
         ));
     }
+    // Refuse dirty workspaces before anything destructive happens.
+    check_remove_clean(&jj, &canon).unwrap_or_else(|message| die(&message));
 
-    let mut forget = Command::new("jj");
-    forget.current_dir(&canon).args(["workspace", "forget"]);
+    let mut forget = Command::new(&jj.executable);
+    forget
+        .current_dir(&canon)
+        .args(&jj.extra_args)
+        .args(["workspace", "forget"]);
     run_or(forget, "jj workspace forget", die);
 
     if let Err(err) = fs::remove_dir_all(&canon) {
@@ -624,12 +1386,16 @@ fn catppuccin() -> Palette {
     }
 }
 
-/// Returns the chosen source + name, or None when cancelled.
+/// Returns the chosen source + name + base revision, or None when cancelled.
+#[allow(clippy::too_many_arguments)]
 fn run_workspace_wizard(
     choices: &[WorkspaceChoice],
     initial_selection: usize,
     root: &Path,
+    config: &Config,
+    jj: &ResolvedJj,
     initial_name: String,
+    initial_base: String,
 ) -> io::Result<Option<WizardResult>> {
     enable_raw_mode()?;
     let mut out = io::stdout();
@@ -644,7 +1410,10 @@ fn run_workspace_wizard(
         .unwrap_or(0);
     let mut field = WizardField::WorkspaceSearch;
     let mut name = initial_name;
+    let mut base = initial_base;
     let mut replace_on_type = true;
+    let mut base_replace_on_type = true;
+    let mut base_dirty = false;
     let mut error: Option<String> = None;
 
     let outcome = loop {
@@ -658,6 +1427,7 @@ fn run_workspace_wizard(
                     field,
                     query: &query,
                     name: &name,
+                    base: &base,
                     root,
                     error: error.as_deref(),
                 },
@@ -668,10 +1438,7 @@ fn run_workspace_wizard(
                 KeyCode::Esc => break None,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
                 KeyCode::Tab | KeyCode::BackTab => {
-                    field = match field {
-                        WizardField::WorkspaceSearch => WizardField::Name,
-                        WizardField::Name => WizardField::WorkspaceSearch,
-                    };
+                    field = next_wizard_field(field);
                     error = None;
                 }
                 KeyCode::Up if field == WizardField::WorkspaceSearch => {
@@ -718,9 +1485,29 @@ fn run_workspace_wizard(
                             continue;
                         }
                     }
+                    let base_rev = if is_jj_workspace(&source.path) {
+                        match wizard_final_base_rev(
+                            config,
+                            jj,
+                            Path::new(&repo_root(&source.path)),
+                            &base,
+                            base_dirty,
+                        ) {
+                            Ok(value) => value,
+                            Err(message) => {
+                                error = Some(message);
+                                continue;
+                            }
+                        }
+                    } else {
+                        // Non-jj sources never create a workspace; the base
+                        // field is ignored (dimmed in the UI).
+                        base.clone()
+                    };
                     break Some(WizardResult {
                         source,
                         name: name.clone(),
+                        base_rev,
                     });
                 }
                 KeyCode::Backspace if field == WizardField::WorkspaceSearch => {
@@ -748,6 +1535,29 @@ fn run_workspace_wizard(
                         replace_on_type = false;
                     }
                     name.push(c);
+                    error = None;
+                }
+                KeyCode::Backspace if field == WizardField::Base => {
+                    if base_replace_on_type {
+                        base.clear();
+                        base_replace_on_type = false;
+                    } else {
+                        base.pop();
+                    }
+                    base_dirty = true;
+                    error = None;
+                }
+                KeyCode::Char(c)
+                    if field == WizardField::Base
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if base_replace_on_type {
+                        base.clear();
+                        base_replace_on_type = false;
+                    }
+                    base.push(c);
+                    base_dirty = true;
                     error = None;
                 }
                 KeyCode::Char(c)
@@ -866,6 +1676,7 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         field,
         query,
         name,
+        base,
         root,
         error,
     } = *view;
@@ -875,11 +1686,11 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
     let Some(inner) = render_modal_shell(frame, area, 86, 22, &p) else {
         return;
     };
-    if inner.height < 12 || choices.is_empty() {
+    if inner.height < 14 || choices.is_empty() {
         return;
     }
 
-    let list_height = usize::from(inner.height.saturating_sub(11).clamp(3, 8));
+    let list_height = usize::from(inner.height.saturating_sub(13).clamp(3, 8));
     let max_start = filtered.len().saturating_sub(list_height);
     let start = selected.saturating_sub(list_height / 2).min(max_start);
     let end = (start + list_height).min(filtered.len());
@@ -898,7 +1709,7 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         Style::default().fg(p.overlay0)
     };
     frame.render_widget(
-        Paragraph::new(" source workspace  type to filter · ↑/↓ navigate · tab edit name")
+        Paragraph::new(" source workspace  type to filter · ↑/↓ navigate · tab edit name/base")
             .style(source_style),
         Rect::new(inner.x, y, inner.width, 1),
     );
@@ -984,21 +1795,53 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
     y += 1;
 
     let choice = filtered.get(selected).map(|index| &choices[*index]);
+    let selected_is_jj = choice
+        .map(|choice| is_jj_workspace(&choice.path))
+        .unwrap_or(false);
     let (preview_label, preview, warning) = match choice {
         Some(choice) if is_jj_workspace(&choice.path) => (
             " checkout",
             workspace_destination(root, &choice.path, name)
                 .display()
                 .to_string(),
-            None,
+            source_warning(true),
         ),
         Some(choice) => (
             " folder",
             choice.path.clone(),
-            Some("not a jj workspace — the same folder will be opened"),
+            source_warning(false),
         ),
         None => (" workspace", "no matching workspace".into(), None),
     };
+
+    let base_style = if field == WizardField::Base {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else if !selected_is_jj {
+        // Dimmed: the base revision is ignored for non-jj sources.
+        Style::default().fg(p.surface_dim)
+    } else {
+        Style::default().fg(p.overlay0)
+    };
+    frame.render_widget(
+        Paragraph::new(" base  jj revset · tab to edit").style(base_style),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
+    let base_cursor = if field == WizardField::Base {
+        "█"
+    } else {
+        ""
+    };
+    let base_value_style = if selected_is_jj {
+        Style::default().fg(p.text).bg(p.surface0)
+    } else {
+        Style::default().fg(p.surface_dim).bg(p.surface0)
+    };
+    frame.render_widget(
+        Paragraph::new(format!(" {base}{base_cursor}")).style(base_value_style),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
     frame.render_widget(
         Paragraph::new(preview_label).style(Style::default().fg(p.overlay0)),
         Rect::new(inner.x, y, inner.width, 1),
@@ -1185,17 +2028,19 @@ fn seed() -> u64 {
         .unwrap_or(0)
 }
 
-/// Checkout root: $JJ_WORKSPACE_ROOT override, else ~/.herdr/workspaces.
-fn workspaces_root() -> PathBuf {
-    if let Some(root) = config_value("JJ_WORKSPACE_ROOT") {
-        return PathBuf::from(expand_tilde(root.trim_end_matches('/')));
-    }
-    PathBuf::from(expand_tilde("~/.herdr/workspaces"))
+/// Checkout root from `jj.workspace_root` (default ~/.herdr/workspaces), with
+/// a leading `~` expanded to the user's home.
+fn workspaces_root(config: &Config) -> PathBuf {
+    PathBuf::from(expand_tilde(config.jj.workspace_root.trim_end_matches('/')))
 }
 
 fn expand_tilde(path: &str) -> String {
+    expand_tilde_with_home(path, env::var("HOME").ok().as_deref())
+}
+
+fn expand_tilde_with_home(path: &str, home: Option<&str>) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
+        if let Some(home) = home {
             return format!("{home}/{rest}");
         }
     }
@@ -1268,38 +2113,6 @@ fn basename(path: &str) -> String {
         .to_string()
 }
 
-fn config_value(key: &str) -> Option<String> {
-    if let Ok(value) = env::var(key) {
-        if !value.is_empty() {
-            return Some(value);
-        }
-    }
-    let dir = env::var("HERDR_PLUGIN_CONFIG_DIR").ok()?;
-    let content = fs::read_to_string(Path::new(&dir).join(".env")).ok()?;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            if k.trim() == key {
-                let v = v.trim().trim_matches('"').trim_matches('\'');
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-fn which(cmd: &str) -> Option<()> {
-    let paths = env::var_os("PATH")?;
-    env::split_paths(&paths)
-        .find(|dir| dir.join(cmd).is_file())
-        .map(|_| ())
-}
-
 fn run_or(cmd: Command, what: &str, on_err: fn(&str) -> !) {
     let mut cmd = cmd;
     match cmd.status() {
@@ -1317,6 +2130,9 @@ fn run(mut cmd: Command) -> bool {
 }
 
 fn fail(message: &str) -> ! {
+    // Fatal errors must reach error.log even when their UI outlet (pane
+    // print + enter prompt) is transient or scrolled away.
+    log_error(message);
     eprintln!("error: {message}");
     print!("\npress enter to close...");
     let _ = io::stdout().flush();
@@ -1327,7 +2143,99 @@ fn fail(message: &str) -> ! {
 
 fn die(message: &str) -> ! {
     eprintln!("error: {message}");
+    // Herdr does not surface plugin action failures on its own — the action's
+    // stderr has no visible outlet. Show a toast ourselves so headless errors
+    // (bad config, unresolved jj, refused remove, …) reach the user.
+    //
+    // Toast limits (verified against herdr source): title ≤ 80 chars, body ≤
+    // 240 chars, single-line rendering, not copyable, ~3s display. So the
+    // toast carries only a one-line summary plus a pointer to the full
+    // message, which is appended to `<state dir>/error.log` (copyable,
+    // persistent, accumulates across runs).
+    let log_path = log_error(message);
+    let body = die_toast_body(message, log_path.as_deref());
+    let _ = Command::new(herdr_bin())
+        .args([
+            "notification",
+            "show",
+            "jj-workspace error",
+            "--body",
+            &body,
+            "--position",
+            "top-right",
+            "--sound",
+            "request",
+        ])
+        .status();
     process::exit(1);
+}
+
+/// Append the message to `<$HERDR_PLUGIN_STATE_DIR>/error.log` (single line
+/// per entry, UTC timestamp) and return the log path on success. Best-effort:
+/// a logging failure must not mask the original error.
+fn log_error(message: &str) -> Option<String> {
+    let dir = env::var_os("HERDR_PLUGIN_STATE_DIR")?;
+    let path = PathBuf::from(dir).join("error.log");
+    append_error_log(&path, message)
+        .then(|| path.display().to_string())
+}
+
+/// Append the message to `error.log` as ONE line: `[UTC timestamp] message`
+/// with newlines escaped to a literal `\n` so entries stay greppable and
+/// filterable by timestamp. Best-effort: failures return false.
+fn append_error_log(path: &Path, message: &str) -> bool {
+    let timestamp = format_utc_now();
+    let single_line = message.replace('\n', "\\n");
+    let entry = format!("[{timestamp}] {single_line}\n");
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(entry.as_bytes()))
+        .is_ok()
+}
+
+/// The toast body for a die() message: the first line, truncated, plus a
+/// pointer to the full log when one was written. herdr hard-caps bodies at
+/// 240 chars and collapses newlines, so this stays short and single-line.
+fn die_toast_body(message: &str, log_path: Option<&str>) -> String {
+    let first_line = message.lines().next().unwrap_or(message);
+    let mut summary: String = first_line.chars().take(120).collect();
+    if first_line.chars().count() > 120 {
+        summary.push('…');
+    }
+    match log_path {
+        Some(path) => format!("{summary} — full log: {path}"),
+        None => summary,
+    }
+}
+
+/// Format the current time as `YYYY-MM-DD HH:MM:SS UTC` without a chrono
+/// dependency (days-from-civil inverse, Howard Hinnant's algorithm).
+fn format_utc_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_unix_timestamp(secs)
+}
+
+fn format_unix_timestamp(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Civil-from-days: 1970-01-01 = day 0.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02} UTC")
 }
 
 fn json_string_field(json: &str, key: &str) -> Option<String> {
@@ -1422,24 +2330,1034 @@ mod tests {
     }
 
     #[test]
-    fn update_runs_fetch_before_rebase() {
+    fn setup_script_command_is_a_single_plain_call() {
+        // The right-pane command is one call to the shipped script: every
+        // argument individually quoted, no command sequences or subshell
+        // groups, no dependence on the pane shell's PATH. The leading
+        // arguments of an argv-form `jj.command` ride along as trailing
+        // script arguments (the script inserts them via `"$@"`).
+        let script = Path::new("/opt/plugin/scripts/setup-workspace.sh");
+        let jj = ResolvedJj {
+            executable: PathBuf::from("/usr/bin/jj"),
+            extra_args: vec!["--at-op".into(), "@-".into()],
+        };
+        let command =
+            setup_script_command(script, &jj, "trunk()", "workspace/fix-api", "w", "t", "p");
         assert_eq!(
-            JJ_UPDATE_COMMAND,
-            "jj git fetch && jj rebase -s @ -d 'trunk()'"
+            command,
+            "'/opt/plugin/scripts/setup-workspace.sh' '/usr/bin/jj' 'trunk()' \
+             'workspace/fix-api' 'w' 't' 'p' '--at-op' '@-'"
         );
     }
 
     #[test]
-    fn right_pane_materializes_then_bookmarks_then_updates() {
-        assert_eq!(
-            jj_setup_command("workspace/fix-api"),
-            "jj sparse set --clear --add . && (jj bookmark create 'workspace/fix-api' -r @ || printf '%s\\n' 'warning: could not create bookmark workspace/fix-api (workspace still created)' >&2) && jj git fetch && jj rebase -s @ -d 'trunk()'"
-        );
+    fn setup_script_parses_under_sh() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-workspace.sh");
+        let status = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
+            .expect("failed to run sh -n");
+        assert!(status.success(), "setup script must parse under sh");
     }
 
     #[test]
     fn shell_arguments_are_single_quoted() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("it's"), "'it'\"'\"'s'");
+    }
+
+    /// Unique per-test temp dir, removed on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> TempDir {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("jj-workspace-config-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            TempDir(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn write_config(&self, content: &str) -> std::path::PathBuf {
+            let path = self.0.join("config.toml");
+            std::fs::write(&path, content).expect("write config fixture");
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn config_missing_file_returns_defaults() {
+        let dir = TempDir::new();
+        let config =
+            load_config_from(&dir.path().join("config.toml")).expect("missing file = defaults");
+        assert_eq!(config, Config::default());
+        assert_eq!(config.jj.base_rev, "trunk()");
+        assert_eq!(config.jj.workspace_root, "~/.herdr/workspaces");
+        assert_eq!(config.agent.command, "codex");
+        assert_eq!(
+            config.agent.bootstrap_paths,
+            vec!["AGENTS.md", "AGENTS.override.md", ".codex", ".agents"]
+        );
+    }
+
+    #[test]
+    fn config_parses_all_sections() {
+        let dir = TempDir::new();
+        let path = dir.write_config(
+            "[jj]\n\
+             base_rev = \"dev\"\n\
+             workspace_root = \"~/code/workspaces\"\n\n\
+             [agent]\n\
+             command = \"opencode\"\n\
+             bootstrap_paths = [\"AGENTS.md\", \"CLAUDE.md\"]\n",
+        );
+        let config = load_config_from(&path).expect("valid config");
+        assert_eq!(config.jj.base_rev, "dev");
+        assert_eq!(config.jj.workspace_root, "~/code/workspaces");
+        assert_eq!(config.agent.command, "opencode");
+        assert_eq!(config.agent.bootstrap_paths, vec!["AGENTS.md", "CLAUDE.md"]);
+    }
+
+    #[test]
+    fn config_missing_sections_default_missing_keys() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[agent]\ncommand = \"opencode\"\n");
+        let config = load_config_from(&path).expect("partial config");
+        assert_eq!(config.jj, JjConfig::default());
+        assert_eq!(config.agent.command, "opencode");
+        assert_eq!(config.agent.bootstrap_paths, AgentConfig::default().bootstrap_paths);
+    }
+
+    #[test]
+    fn config_syntax_error_is_rejected() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[jj]\nbase_rev = \"trunk()\n");
+        let err = load_config_from(&path).expect_err("unterminated string");
+        assert!(err.to_string().starts_with("invalid config"), "{}", err);
+    }
+
+    #[test]
+    fn config_type_error_names_the_key() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[jj]\nbase_rev = 123\n");
+        let err = load_config_from(&path).expect_err("type error");
+        let message = err.to_string();
+        assert!(message.contains("base_rev"), "{message}");
+    }
+
+    #[test]
+    fn config_unknown_key_is_rejected() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[agent]\nstart_command = \"codex\"\n");
+        let err = load_config_from(&path).expect_err("unknown key");
+        let message = err.to_string();
+        assert!(message.contains("start_command"), "{message}");
+    }
+
+    #[test]
+    fn config_empty_string_is_rejected() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[agent]\ncommand = \"\"\n");
+        let err = load_config_from(&path).expect_err("empty command");
+        let message = err.to_string();
+        assert!(message.contains("agent.command") && message.contains("empty"), "{message}");
+    }
+
+    #[test]
+    fn config_empty_bootstrap_entry_is_rejected() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[agent]\nbootstrap_paths = [\"AGENTS.md\", \"\"]\n");
+        let err = load_config_from(&path).expect_err("empty bootstrap path");
+        assert!(err.to_string().contains("bootstrap_paths"), "{}", err);
+    }
+
+    #[test]
+    fn workspace_root_expands_leading_tilde() {
+        assert_eq!(
+            expand_tilde_with_home("~/code/workspaces", Some("/home/nathan")),
+            "/home/nathan/code/workspaces"
+        );
+        assert_eq!(expand_tilde_with_home("/abs/path", Some("/home/nathan")), "/abs/path");
+        assert_eq!(expand_tilde_with_home("~/x", None), "~/x");
+    }
+
+    // --- jj.command resolution -------------------------------------------------
+
+    /// Creates a file with the given permissions (executable or not).
+    fn make_file(dir: &std::path::Path, name: &str, executable: bool) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").expect("write file");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if executable { 0o755 } else { 0o644 };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("set permissions");
+        path
+    }
+
+    #[test]
+    fn default_jj_command_is_bare_jj() {
+        assert_eq!(
+            JjCommandValue::default(),
+            JjCommandValue::Single("jj".into())
+        );
+    }
+
+    #[test]
+    fn resolves_bare_name_across_path_dirs_in_order() {
+        let dir1 = TempDir::new();
+        let dir2 = TempDir::new();
+        let found = make_file(dir2.path(), "jj", true);
+        // dir1 exists but has no jj; the lookup continues to dir2.
+        let resolved = resolve_jj_command(
+            &JjCommandValue::Single("jj".into()),
+            &[dir1.path().to_path_buf(), dir2.path().to_path_buf()],
+        )
+        .expect("resolved from the second dir");
+        assert_eq!(resolved.executable, found);
+        assert!(resolved.extra_args.is_empty());
+    }
+
+    #[test]
+    fn bare_name_skips_non_executable_entries() {
+        let dir1 = TempDir::new();
+        let dir2 = TempDir::new();
+        make_file(dir1.path(), "jj", false);
+        let found = make_file(dir2.path(), "jj", true);
+        let resolved = resolve_jj_command(
+            &JjCommandValue::Single("jj".into()),
+            &[dir1.path().to_path_buf(), dir2.path().to_path_buf()],
+        )
+        .expect("skips the non-executable entry");
+        assert_eq!(resolved.executable, found);
+    }
+
+    #[test]
+    fn bare_name_not_found_reports_searched_dirs_and_fix() {
+        let dir = TempDir::new();
+        let err = resolve_jj_command(
+            &JjCommandValue::Single("jj".into()),
+            &[dir.path().to_path_buf()],
+        )
+        .expect_err("not on path");
+        let message = err.to_string();
+        assert!(message.contains("jj.command"), "{message}");
+        assert!(message.contains(dir.path().to_str().unwrap()), "{message}");
+        assert!(message.contains("which jj"), "{message}");
+    }
+
+    #[test]
+    fn absolute_path_is_used_as_is() {
+        let dir = TempDir::new();
+        let path = make_file(dir.path(), "jj", true);
+        let resolved = resolve_jj_command(
+            &JjCommandValue::Single(path.display().to_string()),
+            &[],
+        )
+        .expect("absolute path is validated and used as-is");
+        assert_eq!(resolved.executable, path);
+    }
+
+    #[test]
+    fn absolute_path_must_be_an_executable_file() {
+        let dir = TempDir::new();
+        let non_exec = make_file(dir.path(), "jj", false);
+        let err = resolve_jj_command(
+            &JjCommandValue::Single(non_exec.display().to_string()),
+            &[],
+        )
+        .expect_err("exists but is not executable");
+        assert!(err.to_string().contains("not an executable file"), "{}", err);
+
+        let missing = dir.path().join("nope");
+        let err = resolve_jj_command(
+            &JjCommandValue::Single(missing.display().to_string()),
+            &[],
+        )
+        .expect_err("missing file");
+        assert!(err.to_string().contains("does not exist"), "{}", err);
+    }
+
+    #[test]
+    fn relative_path_with_slash_is_rejected() {
+        let err = resolve_jj_command(&JjCommandValue::Single("bin/jj".into()), &[])
+            .expect_err("relative path");
+        let message = err.to_string();
+        assert!(message.contains("relative path"), "{message}");
+        assert!(message.contains("jj.command"), "{message}");
+    }
+
+    #[test]
+    fn tilde_expands_before_classification() {
+        let home = TempDir::new();
+        let bin = home.path().join(".local").join("bin");
+        std::fs::create_dir_all(&bin).expect("create bin");
+        let expected = make_file(&bin, "jj", true);
+        let resolved = resolve_jj_head(
+            "~/.local/bin/jj",
+            Vec::new(),
+            "jj.command",
+            Some(home.path().to_str().unwrap()),
+            &[],
+        )
+        .expect("tilde-expanded to an absolute path");
+        assert_eq!(resolved.executable, expected);
+    }
+
+    #[test]
+    fn argv_form_resolves_only_the_head() {
+        let dir = TempDir::new();
+        let found = make_file(dir.path(), "jj", true);
+        let resolved = resolve_jj_command(
+            &JjCommandValue::Argv(vec!["jj".into(), "--at-op".into(), "@-".into()]),
+            &[dir.path().to_path_buf()],
+        )
+        .expect("argv form resolves argv[0] only");
+        assert_eq!(resolved.executable, found);
+        assert_eq!(resolved.extra_args, vec!["--at-op", "@-"]);
+
+        let err = resolve_jj_command(
+            &JjCommandValue::Argv(vec!["nope".into()]),
+            &[dir.path().to_path_buf()],
+        )
+        .expect_err("argv head not found");
+        assert!(err.to_string().contains("argv[0]"), "{}", err);
+    }
+
+    #[test]
+    fn config_jj_command_accepts_string_and_argv() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[jj]\ncommand = \"/opt/jj/bin/jj\"\n");
+        let config = load_config_from(&path).expect("string form");
+        assert_eq!(
+            config.jj.command,
+            JjCommandValue::Single("/opt/jj/bin/jj".into())
+        );
+
+        let path = dir.write_config("[jj]\ncommand = [\"/opt/jj\", \"--at-op\", \"@-\"]\n");
+        let config = load_config_from(&path).expect("argv form");
+        assert_eq!(
+            config.jj.command,
+            JjCommandValue::Argv(vec!["/opt/jj".into(), "--at-op".into(), "@-".into()])
+        );
+    }
+
+    #[test]
+    fn config_jj_command_type_error_names_the_key() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[jj]\ncommand = 123\n");
+        let err = load_config_from(&path).expect_err("type error");
+        assert!(err.to_string().contains("jj.command"), "{}", err);
+    }
+
+    #[test]
+    fn config_empty_jj_command_is_rejected() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[jj]\ncommand = \"\"\n");
+        let err = load_config_from(&path).expect_err("empty string");
+        assert!(err.to_string().contains("jj.command"), "{}", err);
+
+        let path = dir.write_config("[jj]\ncommand = []\n");
+        let err = load_config_from(&path).expect_err("empty argv");
+        assert!(err.to_string().contains("jj.command"), "{}", err);
+    }
+
+    #[test]
+    fn start_command_defaults_to_codex_when_unset() {
+        assert_eq!(resolve_start_command(&AgentConfig::default()), "codex");
+    }
+
+    #[test]
+    fn start_command_uses_configured_value() {
+        let agent = AgentConfig {
+            command: "opencode".into(),
+            ..AgentConfig::default()
+        };
+        assert_eq!(resolve_start_command(&agent), "opencode");
+    }
+
+    #[test]
+    fn start_command_passes_arguments_through_verbatim() {
+        let agent = AgentConfig {
+            command: "codex --full-auto".into(),
+            ..AgentConfig::default()
+        };
+        assert_eq!(resolve_start_command(&agent), "codex --full-auto");
+    }
+
+    /// Runs the shipped setup script inside a fake plugin layout
+    /// (`<root>/scripts/setup-workspace.sh` + `<root>/target/release/jj-workspace`
+    /// + a fake `jj` on PATH) so both the script's self-located plugin exe and
+    /// its jj invocations are asserted against real execution.
+    #[cfg(unix)]
+    fn run_setup_script(
+        bookmark_name: &str,
+        base_rev: &str,
+        fail_on: &str,
+        leading_args: &[&str],
+    ) -> (std::process::Output, Vec<String>, Vec<String>) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir()
+            .join(format!("jj-workspace-setup-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(root.join("scripts")).expect("create scripts dir");
+        std::fs::create_dir_all(root.join("target/release")).expect("create target dir");
+        std::fs::create_dir_all(root.join("bin")).expect("create bin dir");
+
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-workspace.sh"),
+            root.join("scripts/setup-workspace.sh"),
+        )
+        .expect("copy setup script");
+
+        // Fake plugin exe: logs its argv and exits 0. Proves the script
+        // located it via `$0`'s layout (`<root>/target/release/jj-workspace`).
+        let finish_log = root.join("finish.log");
+        let plugin_exe = root.join("target/release/jj-workspace");
+        std::fs::write(&plugin_exe, "#!/bin/sh\necho \"$@\" >> \"$FINISH_LOG\"\n")
+            .expect("write fake plugin exe");
+        std::fs::set_permissions(&plugin_exe, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake plugin exe executable");
+
+        // Fake jj: logs argv, fails on a chosen subcommand.
+        let jj_log = root.join("jj.log");
+        let jj = root.join("bin/jj");
+        std::fs::write(
+            &jj,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$@\" >> \"$JJ_FAKE_LOG\"\n\
+                 case \"$1\" in\n\
+                   {fail_on}) exit 1 ;;\n\
+                   sparse|bookmark|fetch|rebase) exit 0 ;;\n\
+                   *) exit 0 ;;\n\
+                 esac\n"
+            ),
+        )
+        .expect("write fake jj");
+        std::fs::set_permissions(&jj, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake jj executable");
+
+        let script = root.join("scripts/setup-workspace.sh");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg(&script)
+            .arg(&jj)
+            .arg(base_rev)
+            .arg(bookmark_name)
+            .arg("w")
+            .arg("t")
+            .arg("p");
+        for arg in leading_args {
+            command.arg(arg);
+        }
+        let output = command
+            .env("JJ_FAKE_LOG", &jj_log)
+            .env("FINISH_LOG", &finish_log)
+            .output()
+            .expect("run setup script");
+
+        let jj_lines = std::fs::read_to_string(&jj_log)
+            .map(|content| content.lines().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default();
+        // The finish-tab watcher is launched asynchronously; poll briefly for
+        // its log line before asserting (the fake exe writes near-instantly).
+        let finish_lines = (0..40)
+            .find_map(|_| {
+                std::fs::read_to_string(&finish_log)
+                    .ok()
+                    .filter(|c| !c.is_empty())
+                    .map(|c| c.lines().map(str::to_string).collect::<Vec<_>>())
+            })
+            .unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
+        (output, jj_lines, finish_lines)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_runs_materialize_bookmark_fetch_rebase_in_order() {
+        let (output, log, finish) = run_setup_script("plain-name", "trunk()", "__never__", &[]);
+        assert!(output.status.success());
+        assert_eq!(
+            log,
+            vec![
+                "sparse set --clear --add .",
+                "bookmark create plain-name -r @",
+                "git fetch",
+                "rebase -s @ -d trunk()",
+            ]
+        );
+        // The plugin exe was self-located via the script's `$0` layout.
+        assert_eq!(finish, vec!["finish-tab w t p"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_materialization_failure_stops_the_chain() {
+        let (output, log, _) = run_setup_script("workspace/x", "trunk()", "sparse", &[]);
+        assert!(!output.status.success());
+        assert_eq!(log, vec!["sparse set --clear --add ."]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_bookmark_failure_warns_and_keeps_updating() {
+        let (output, log, _) = run_setup_script("workspace/fix-api", "trunk()", "bookmark", &[]);
+        // The `|| printf` fallback makes the bookmark step succeed, so
+        // fetch/rebase still run and the whole script exits 0.
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(
+                "warning: could not create bookmark workspace/fix-api (workspace still created)"
+            ),
+            "stderr should carry the bookmark warning: {stderr}"
+        );
+        assert_eq!(
+            log,
+            vec![
+                "sparse set --clear --add .",
+                "bookmark create workspace/fix-api -r @",
+                "git fetch",
+                "rebase -s @ -d trunk()",
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_preserves_single_quotes_in_bookmark_names() {
+        let (output, log, _) = run_setup_script("it's-final", "trunk()", "__never__", &[]);
+        assert!(output.status.success());
+        assert_eq!(
+            log,
+            vec![
+                "sparse set --clear --add .",
+                "bookmark create it's-final -r @",
+                "git fetch",
+                "rebase -s @ -d trunk()",
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_propagates_leading_args_before_each_subcommand() {
+        // argv-form `jj.command` leading arguments ride as trailing script
+        // arguments and must be inserted before every jj subcommand.
+        let (output, log, _) =
+            run_setup_script("plain-name", "trunk()", "__never__", &["--at-op", "@-"]);
+        assert!(output.status.success());
+        assert_eq!(
+            log,
+            vec![
+                "--at-op @- sparse set --clear --add .",
+                "--at-op @- bookmark create plain-name -r @",
+                "--at-op @- git fetch",
+                "--at-op @- rebase -s @ -d trunk()",
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_passes_base_rev_to_rebase() {
+        // The base-rev argument flows through to the rebase destination
+        // (parameterized by per-repo-base-rev; here it is whatever was passed).
+        let (output, log, _) = run_setup_script("w", "dev@origin", "__never__", &[]);
+        assert!(output.status.success());
+        assert!(
+            log.iter().any(|line| line == "rebase -s @ -d dev@origin"),
+            "rebase should target the passed base-rev: {log:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_passes_revsets_with_spaces_and_quotes() {
+        // Revsets are shell-quoted per argument by the wizard, so spaces and
+        // single quotes survive the pane shell and arrive as one argv word.
+        let (output, log, _) =
+            run_setup_script("w", "trunk() | remote_bookmark(dev)", "__never__", &[]);
+        assert!(output.status.success());
+        assert!(
+            log.iter()
+                .any(|line| line == "rebase -s @ -d trunk() | remote_bookmark(dev)"),
+            "space-containing revset must survive: {log:?}"
+        );
+
+        let (output, log, _) = run_setup_script("w", "description(\"fix'it\")", "__never__", &[]);
+        assert!(output.status.success());
+        assert!(
+            log.iter()
+                .any(|line| line == "rebase -s @ -d description(\"fix'it\")"),
+            "quote-containing revset must survive: {log:?}"
+        );
+    }
+
+    #[test]
+    fn wizard_fields_cycle_through_three_fields() {
+        assert_eq!(
+            next_wizard_field(WizardField::WorkspaceSearch),
+            WizardField::Name
+        );
+        assert_eq!(next_wizard_field(WizardField::Name), WizardField::Base);
+        assert_eq!(
+            next_wizard_field(WizardField::Base),
+            WizardField::WorkspaceSearch
+        );
+    }
+
+    #[test]
+    fn non_jj_sources_warn_that_base_rev_is_ignored() {
+        assert!(source_warning(false).unwrap().contains("base-rev is ignored"));
+        assert!(source_warning(true).is_none());
+    }
+
+    /// Writes a fake jj executable that runs `body` and returns a ResolvedJj
+    /// pointing at it, for exercising the base-rev resolution chain without
+    /// touching process env.
+    #[cfg(unix)]
+    fn make_fake_jj(dir: &Path, name: &str, body: &str) -> ResolvedJj {
+        use std::os::unix::fs::PermissionsExt;
+
+        let jj = dir.join(name);
+        std::fs::write(&jj, format!("#!/bin/sh\n{body}")).expect("write fake jj");
+        std::fs::set_permissions(&jj, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake jj executable");
+        ResolvedJj {
+            executable: jj,
+            extra_args: Vec::new(),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn base_rev_resolves_from_repo_config() {
+        let dir = TempDir::new();
+        let jj = make_fake_jj(dir.path(), "jj", "echo dev@origin\n");
+        let config = Config::default();
+        assert_eq!(
+            resolve_base_rev(&config, &jj, dir.path()).expect("repo config value"),
+            "dev@origin"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn base_rev_falls_back_to_config_when_unset() {
+        let dir = TempDir::new();
+        let jj = make_fake_jj(dir.path(), "jj", "exit 1\n");
+        let config = Config::default();
+        assert_eq!(
+            resolve_base_rev(&config, &jj, dir.path()).expect("fallback value"),
+            "trunk()"
+        );
+
+        let mut configured = Config::default();
+        configured.jj.base_rev = "main@origin".into();
+        assert_eq!(
+            resolve_base_rev(&configured, &jj, dir.path()).expect("config value"),
+            "main@origin"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn base_rev_empty_repo_value_fails_fast() {
+        // `jj config get` succeeding with empty output = explicitly empty
+        // repo-level value → invalid config, not a silent fallback.
+        let dir = TempDir::new();
+        let jj = make_fake_jj(dir.path(), "jj", "exit 0\n");
+        let config = Config::default();
+        let err = resolve_base_rev(&config, &jj, dir.path())
+            .expect_err("empty repo-level value must fail fast");
+        assert!(err.contains("herdr.base-rev"), "{err}");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wizard_final_base_rev_uses_chain_when_untouched() {
+        let dir = TempDir::new();
+        let jj = make_fake_jj(dir.path(), "jj", "echo repo-value\n");
+        let config = Config::default();
+        assert_eq!(
+            wizard_final_base_rev(&config, &jj, dir.path(), "trunk()", false)
+                .expect("untouched field resolves lazily"),
+            "repo-value"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wizard_final_base_rev_validates_edited_values() {
+        let dir = TempDir::new();
+        let ok = make_fake_jj(dir.path(), "ok-jj", "exit 0\n");
+        let bad = make_fake_jj(
+            dir.path(),
+            "bad-jj",
+            "echo \"Error: Revision 'dev@origin' doesn't exist\" >&2\nexit 1\n",
+        );
+        let config = Config::default();
+        assert_eq!(
+            wizard_final_base_rev(&config, &ok, dir.path(), "dev@origin", true)
+                .expect("valid revset passes"),
+            "dev@origin"
+        );
+        let err = wizard_final_base_rev(&config, &bad, dir.path(), "dev@origin", true)
+            .expect_err("invalid revset must fail");
+        assert!(err.contains("doesn't exist"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wizard_final_base_rev_validates_chain_values_too() {
+        // Regression guard: a repo-level `herdr.base-rev` referencing a
+        // nonexistent revision must fail at submit (inside the wizard, where
+        // the user can edit the base field), not later at `jj workspace add`.
+        let dir = TempDir::new();
+        let jj = make_fake_jj(
+            dir.path(),
+            "jj",
+            "if [ \"$1\" = \"config\" ]; then echo fwggowngggw\n\
+             else echo \"Error: Revision 'fwggowngggw' doesn't exist\" >&2\n\
+             exit 1\n\
+             fi\n",
+        );
+        let config = Config::default();
+        let err = wizard_final_base_rev(&config, &jj, dir.path(), "trunk()", false)
+            .expect_err("invalid chain value must surface at submit");
+        assert!(err.contains("doesn't exist"), "{err}");
+    }
+
+    /// Creates a fake herdr executable that answers `agent list` from a
+    /// schedule file — one `"<status> <label>"` line per poll (`missing` =
+    /// empty agents list; label defaults to codex; exhausted schedule keeps
+    /// answering `missing`) — and logs `pane send-keys` calls to keys.log.
+    #[cfg(unix)]
+    fn make_fake_herdr(dir: &Path, schedule: &[&str]) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = r#"#!/bin/sh
+D=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+case "$1 $2" in
+  "agent list")
+    N=$(($(cat "$D/count" 2>/dev/null || echo 0) + 1))
+    echo "$N" > "$D/count"
+    LINE=$(sed -n "${N}p" "$D/schedule")
+    STATUS=$(echo "$LINE" | awk '{print $1}')
+    LABEL=$(echo "$LINE" | awk '{print $2}')
+    [ -z "$LABEL" ] && LABEL=codex
+    if [ "$STATUS" = "missing" ] || [ -z "$STATUS" ]; then
+      echo '{"result":{"agents":[]}}'
+    else
+      printf '{"result":{"agents":[{"pane_id":"p1","agent":"%s","agent_status":"%s"}]}}\n' "$LABEL" "$STATUS"
+    fi
+    ;;
+  "pane send-keys")
+    echo "$3 $4" >> "$D/keys.log"
+    ;;
+esac
+"#;
+        let bin = dir.join("herdr");
+        std::fs::write(&bin, script).expect("write fake herdr");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake herdr executable");
+        std::fs::write(dir.join("schedule"), schedule.join("\n")).expect("write schedule");
+        bin.display().to_string()
+    }
+
+    /// Runs `wait_for_agent_ready` against a fake herdr with the given
+    /// schedule and agent config; returns the outcome and the send-keys log.
+    #[cfg(unix)]
+    fn run_wait(
+        schedule: &[&str],
+        auto_trust: bool,
+        trust_window_secs: u64,
+        timeout_secs: u64,
+        poll_ms: u64,
+    ) -> (AgentWaitOutcome, Vec<String>) {
+        let dir = TempDir::new();
+        let herdr = make_fake_herdr(dir.path(), schedule);
+        let mut agent = AgentConfig::default();
+        agent.auto_trust = auto_trust;
+        agent.trust_window_secs = trust_window_secs;
+        agent.startup_timeout_secs = timeout_secs;
+        agent.poll_interval_ms = poll_ms;
+        let outcome = wait_for_agent_ready(&agent, &herdr, "p1");
+        let keys = std::fs::read_to_string(dir.path().join("keys.log"))
+            .map(|content| content.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+        (outcome, keys)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_entry_ready_immediately() {
+        // The entry itself is readiness: no stable-period wait, no specific
+        // status required, no keys sent.
+        let (outcome, keys) = run_wait(&["working"], false, 10, 1, 10);
+        assert!(matches!(outcome, AgentWaitOutcome::Ready), "{outcome:?}");
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_not_detected_times_out() {
+        let (outcome, keys) = run_wait(&["missing"], false, 10, 1, 10);
+        assert!(matches!(outcome, AgentWaitOutcome::NotDetected), "{outcome:?}");
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn transient_blocked_does_not_fail() {
+        // A single blocked poll inside the grace window recovers on its own.
+        let (outcome, keys) = run_wait(&["blocked", "working"], false, 10, 2, 10);
+        assert!(matches!(outcome, AgentWaitOutcome::Ready), "{outcome:?}");
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stable_blocked_fails_with_runtime_label() {
+        let (outcome, keys) =
+            run_wait(&["blocked claude"; 200], false, 10, 3, 10);
+        assert!(
+            matches!(outcome, AgentWaitOutcome::NeedsAttention { ref label } if label == "claude"),
+            "{outcome:?}"
+        );
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn auto_trust_off_never_enters() {
+        let (outcome, keys) =
+            run_wait(&["blocked codex"; 200], false, 10, 3, 10);
+        assert!(
+            matches!(outcome, AgentWaitOutcome::NeedsAttention { ref label } if label == "codex"),
+            "{outcome:?}"
+        );
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn auto_trust_non_codex_never_enters() {
+        let (outcome, keys) =
+            run_wait(&["blocked claude"; 200], true, 10, 3, 10);
+        assert!(
+            matches!(outcome, AgentWaitOutcome::NeedsAttention { ref label } if label == "claude"),
+            "{outcome:?}"
+        );
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn auto_trust_codex_enters_and_confirms_by_transition() {
+        let (outcome, keys) = run_wait(&["blocked codex", "working codex"], true, 10, 2, 10);
+        assert!(matches!(outcome, AgentWaitOutcome::Ready), "{outcome:?}");
+        assert_eq!(keys, vec!["p1 enter"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn auto_trust_retries_up_to_internal_cap() {
+        let (outcome, keys) =
+            run_wait(&["blocked codex"; 200], true, 10, 3, 10);
+        assert!(
+            matches!(outcome, AgentWaitOutcome::NeedsAttention { ref label } if label == "codex"),
+            "{outcome:?}"
+        );
+        assert_eq!(keys.len(), 5, "{keys:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn auto_trust_outside_window_does_not_enter() {
+        // The blocked status only appears after the trust window has passed.
+        let mut schedule = vec!["missing"; 20];
+        schedule.extend(std::iter::repeat("blocked codex").take(100));
+        let (outcome, keys) = run_wait(&schedule, true, 1, 4, 100);
+        assert!(
+            matches!(outcome, AgentWaitOutcome::NeedsAttention { ref label } if label == "codex"),
+            "{outcome:?}"
+        );
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    #[test]
+    fn agent_ready_defaults() {
+        let agent = AgentConfig::default();
+        assert!(!agent.auto_trust);
+        assert_eq!(agent.trust_window_secs, 10);
+        assert_eq!(agent.startup_timeout_secs, 20);
+        assert_eq!(agent.poll_interval_ms, 200);
+    }
+
+    #[test]
+    fn agent_ready_keys_parse() {
+        let dir = TempDir::new();
+        let path = dir.write_config(
+            "[agent]\nauto_trust = true\ntrust_window_secs = 5\nstartup_timeout_secs = 30\npoll_interval_ms = 100\n",
+        );
+        let config = load_config_from(&path).expect("parse agent readiness keys");
+        assert!(config.agent.auto_trust);
+        assert_eq!(config.agent.trust_window_secs, 5);
+        assert_eq!(config.agent.startup_timeout_secs, 30);
+        assert_eq!(config.agent.poll_interval_ms, 100);
+    }
+
+    #[test]
+    fn agent_timing_zero_rejected() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[agent]\npoll_interval_ms = 0\n");
+        let err = load_config_from(&path).expect_err("zero poll interval");
+        assert!(err.to_string().contains("agent.poll_interval_ms"), "{err}");
+
+        let path = dir.write_config("[agent]\ntrust_window_secs = 0\n");
+        let err = load_config_from(&path).expect_err("zero trust window");
+        assert!(err.to_string().contains("agent.trust_window_secs"), "{err}");
+
+        let path = dir.write_config("[agent]\nstartup_timeout_secs = 0\n");
+        let err = load_config_from(&path).expect_err("zero timeout");
+        assert!(err.to_string().contains("agent.startup_timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn agent_auto_trust_type_error_names_key() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[agent]\nauto_trust = \"yes\"\n");
+        let err = load_config_from(&path).expect_err("type error");
+        assert!(err.to_string().contains("auto_trust"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_dirty_workspace_is_refused_with_guidance() {
+        let dir = TempDir::new();
+        let jj = make_fake_jj(dir.path(), "jj", "echo 'A new-file.txt'\n");
+        let err = check_remove_clean(&jj, dir.path())
+            .expect_err("dirty workspace must be refused");
+        assert!(err.contains("uncommitted changes"), "{err}");
+        assert!(err.contains("bookmarks are safe"), "{err}");
+        assert!(err.contains("`jj commit`"), "{err}");
+        assert!(err.contains("`jj restore`"), "{err}");
+        assert!(err.contains("refusing to remove"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_clean_workspace_is_allowed() {
+        let dir = TempDir::new();
+        let jj = make_fake_jj(dir.path(), "jj", "");
+        assert!(
+            check_remove_clean(&jj, dir.path()).is_ok(),
+            "clean workspace must pass the check"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_check_failure_is_fail_closed() {
+        let dir = TempDir::new();
+        let jj = make_fake_jj(dir.path(), "jj", "exit 3\n");
+        let err = check_remove_clean(&jj, dir.path())
+            .expect_err("a failed check must refuse, not pass");
+        assert!(err.contains("cannot check"), "{err}");
+        assert!(err.contains("refusing to remove"), "{err}");
+    }
+
+    #[test]
+    fn die_toast_body_first_line_only_with_log_pointer() {
+        let message = "refusing to remove workspace 'ws': it has uncommitted changes.\n\
+                       workspace path: /long/path/to/ws\n\
+                       Already-committed work is safe.";
+        let body = die_toast_body(message, Some("/state/error.log"));
+        assert_eq!(
+            body,
+            "refusing to remove workspace 'ws': it has uncommitted changes. \
+             — full log: /state/error.log"
+        );
+    }
+
+    #[test]
+    fn die_toast_body_truncates_long_first_lines() {
+        let message = "x".repeat(300);
+        let body = die_toast_body(&message, None);
+        assert!(body.chars().count() <= 121, "{}", body.chars().count());
+        assert!(body.ends_with('…'), "{body}");
+    }
+
+    #[test]
+    fn die_toast_body_without_log_falls_back_to_summary() {
+        let body = die_toast_body("short error", None);
+        assert_eq!(body, "short error");
+    }
+
+    #[test]
+    fn error_log_appends_entries_with_timestamps() {
+        let dir = TempDir::new();
+        let log = dir.path().join("error.log");
+        assert!(append_error_log(&log, "first failure"));
+        assert!(append_error_log(&log, "second failure"));
+        let content = fs::read_to_string(&log).expect("read log");
+        let lines: Vec<&str> = content.lines().collect();
+        // One line per entry: [timestamp] message.
+        assert_eq!(lines.len(), 2, "{content}");
+        assert!(lines[0].starts_with('[') && lines[0].contains("UTC"), "{content}");
+        assert!(lines[0].ends_with("first failure"), "{content}");
+        assert!(lines[1].starts_with('[') && lines[1].contains("UTC"), "{content}");
+        assert!(lines[1].ends_with("second failure"), "{content}");
+    }
+
+    #[test]
+    fn error_log_escapes_multiline_messages_to_single_lines() {
+        let dir = TempDir::new();
+        let log = dir.path().join("error.log");
+        assert!(append_error_log(
+            &log,
+            "refusing to remove workspace 'ws': it has uncommitted changes.\n\
+             workspace path: /long/path/to/ws\n\
+             Commit (`jj commit`) or undo (`jj restore`) first."
+        ));
+        let content = fs::read_to_string(&log).expect("read log");
+        let lines: Vec<&str> = content.lines().collect();
+        // The multi-line message collapses to ONE log line with literal \n.
+        assert_eq!(lines.len(), 1, "{content}");
+        assert!(lines[0].contains("\\n"), "{content}");
+        assert!(lines[0].contains("refusing to remove"), "{content}");
+        assert!(!content.contains("\n\n"), "{content}");
+    }
+
+    #[test]
+    fn unix_timestamp_formatting_matches_known_dates() {
+        assert_eq!(format_unix_timestamp(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(format_unix_timestamp(86_400), "1970-01-02 00:00:00 UTC");
+        // 2026-09-09 00:00:00 UTC = 1788912000.
+        assert_eq!(format_unix_timestamp(1_788_912_000), "2026-09-09 00:00:00 UTC");
+        // Leap-year day: 2024-02-29 12:34:56 UTC = 1709210096.
+        assert_eq!(format_unix_timestamp(1_709_210_096), "2024-02-29 12:34:56 UTC");
     }
 }
