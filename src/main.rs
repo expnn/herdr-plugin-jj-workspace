@@ -81,6 +81,69 @@ fn next_wizard_field(field: WizardField) -> WizardField {
     }
 }
 
+/// Name-field edit state: component-level operations apply only at anchor
+/// states. `Fresh` means the name is still the auto-generated default
+/// `workspace/<slug>`; `Prefixed` means the slug was dropped and only the
+/// prefix remains; `Free` is per-character editing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NameEditState {
+    Fresh,
+    Prefixed,
+    Free,
+}
+
+/// A name-field keypress reducible through `apply_name_key`.
+enum NameKey {
+    Char(char),
+    Backspace,
+}
+
+/// Apply a keypress to the name field (component-level state machine):
+/// - Fresh + Char    → keep prefix, replace slug, then Free
+/// - Fresh + Bksp    → drop slug, keep prefix (→ Prefixed)
+/// - Prefixed + Char → append after prefix (→ Free)
+/// - Prefixed + Bksp → clear whole name (→ Free)
+/// - Free + Char     → append
+/// - Free + Bksp     → pop one char
+///
+/// The prefix is derived from the current name via the last `/`, never
+/// hardcoded, so user-typed multi-segment names edit per-character.
+fn apply_name_key(name: &mut String, state: &mut NameEditState, key: NameKey) {
+    match key {
+        NameKey::Char(c) => {
+            if *state == NameEditState::Fresh {
+                // Replace the slug part, keep the prefix (everything up to
+                // and including the last '/').
+                match name.rfind('/') {
+                    Some(slash) => name.truncate(slash + 1),
+                    None => name.clear(),
+                }
+            }
+            name.push(c);
+            *state = NameEditState::Free;
+        }
+        NameKey::Backspace => match *state {
+            NameEditState::Fresh => match name.rfind('/') {
+                Some(slash) => {
+                    name.truncate(slash + 1);
+                    *state = NameEditState::Prefixed;
+                }
+                None => {
+                    name.clear();
+                    *state = NameEditState::Free;
+                }
+            },
+            NameEditState::Prefixed => {
+                name.clear();
+                *state = NameEditState::Free;
+            }
+            NameEditState::Free => {
+                name.pop();
+            }
+        },
+    }
+}
+
 const DEFAULT_BOOTSTRAP_PATHS: [&str; 4] = ["AGENTS.md", "AGENTS.override.md", ".codex", ".agents"];
 
 // --- plugin config ---------------------------------------------------------
@@ -1353,7 +1416,7 @@ fn run_workspace_wizard(
     let mut field = WizardField::WorkspaceSearch;
     let mut name = initial_name;
     let mut base = initial_base;
-    let mut replace_on_type = true;
+    let mut name_edit_state = NameEditState::Fresh;
     let mut base_replace_on_type = true;
     let mut base_dirty = false;
     let mut error: Option<String> = None;
@@ -1466,12 +1529,7 @@ fn run_workspace_wizard(
                     error = None;
                 }
                 KeyCode::Backspace if field == WizardField::Name => {
-                    if replace_on_type {
-                        name.clear();
-                        replace_on_type = false;
-                    } else {
-                        name.pop();
-                    }
+                    apply_name_key(&mut name, &mut name_edit_state, NameKey::Backspace);
                     error = None;
                 }
                 KeyCode::Char(c)
@@ -1479,11 +1537,7 @@ fn run_workspace_wizard(
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                         && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
-                    if replace_on_type {
-                        name.clear();
-                        replace_on_type = false;
-                    }
-                    name.push(c);
+                    apply_name_key(&mut name, &mut name_edit_state, NameKey::Char(c));
                     error = None;
                 }
                 KeyCode::Backspace if field == WizardField::Base => {
@@ -1617,6 +1671,29 @@ fn workspace_destination(root: &Path, source: &str, name: &str) -> PathBuf {
         .join(branch_to_path_slug(name))
 }
 
+/// Content column indent shared by every section: the leading area is 3
+/// columns wide (2 spaces + 1 marker slot for the source list; the same
+/// gutter stays blank for name/base/checkout so their values align with the
+/// list labels).
+const SECTION_CONTENT_INDENT: u16 = 3;
+
+/// Section title grammar: always bold; focus is expressed by color only —
+/// accent (blue) when the field is focused, subtext0 otherwise. Read-only
+/// sections (checkout) never focus and use the subtext0 form.
+fn section_title_style(focused: bool, p: &Palette) -> Style {
+    let color = if focused { p.accent } else { p.subtext0 };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn render_section_title(frame: &mut Frame, area: Rect, title: &str, focused: bool, p: &Palette) {
+    frame.render_widget(Paragraph::new(title).style(section_title_style(focused, p)), area);
+}
+
+/// Top-of-modal static hint line shown in the normal state. The zero-candidate
+/// collapse replaces it with an esc-only hint.
+const WIZARD_HINT: &str =
+    "type to filter or edit · ↑/↓ select · tab switch · ↵ create · esc cancel";
+
 fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
     let WizardView {
         choices,
@@ -1632,54 +1709,95 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
     let p = catppuccin();
     let area = frame.area();
     dim_background(frame, area);
-    let Some(inner) = render_modal_shell(frame, area, 86, 22, &p) else {
+    let Some(inner) = render_modal_shell(frame, area, 86, 26, &p) else {
         return;
     };
     if inner.height < 14 {
         return;
     }
 
-    let list_height = usize::from(inner.height.saturating_sub(13).clamp(3, 8));
-    let max_start = filtered.len().saturating_sub(list_height);
-    let start = selected.saturating_sub(list_height / 2).min(max_start);
-    let end = (start + list_height).min(filtered.len());
+    let indent = usize::from(SECTION_CONTENT_INDENT);
+    let pad = " ".repeat(indent);
     let mut y = inner.y;
 
     render_modal_header(
         frame,
         Rect::new(inner.x, y, inner.width, 1),
-        "new workspace",
+        "New Workspace",
         &p,
     );
     y += 1;
-    let source_style = if field == WizardField::WorkspaceSearch {
-        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(p.overlay0)
-    };
+
+    // Zero-candidate collapse: only the source section + esc affordance.
+    // The run loop already ignores Tab/Enter here, so nothing below is
+    // reachable — render source title, the query bar, the empty message and
+    // an esc hint, then stop.
+    if choices.is_empty() {
+        render_section_title(
+            frame,
+            Rect::new(inner.x, y, inner.width, 1),
+            "Source Workspace",
+            field == WizardField::WorkspaceSearch,
+            &p,
+        );
+        y += 1;
+        frame.render_widget(
+            Paragraph::new(format!("{pad}no jj workspaces — open herdr's project picker instead"))
+                .style(Style::default().fg(p.overlay0)),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+        frame.render_widget(
+            Paragraph::new(format!("{pad}press esc to close")).style(Style::default().fg(p.overlay0)),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        return;
+    }
+
+    // Static hint line: one place for all operation hints, before any section.
     frame.render_widget(
-        Paragraph::new(" source workspace  type to filter · ↑/↓ navigate · tab edit name/base")
-            .style(source_style),
+        Paragraph::new(WIZARD_HINT).style(Style::default().fg(p.overlay0)),
         Rect::new(inner.x, y, inner.width, 1),
     );
     y += 1;
-    let query_cursor = if field == WizardField::WorkspaceSearch {
-        "█"
+    y += 1; // blank separator after the hint block
+
+    // --- source workspace -------------------------------------------------
+    render_section_title(
+        frame,
+        Rect::new(inner.x, y, inner.width, 1),
+        "Source Workspace",
+        field == WizardField::WorkspaceSearch,
+        &p,
+    );
+    y += 1;
+    let query_focused = field == WizardField::WorkspaceSearch;
+    let query_span = if query.is_empty() && query_focused {
+        Span::styled(format!("{pad}filter…"), Style::default().fg(p.overlay0))
     } else {
-        ""
+        let cursor = if query_focused { "█" } else { "" };
+        Span::styled(format!("{pad}{query}{cursor}"), Style::default().fg(p.text))
     };
     frame.render_widget(
-        Paragraph::new(format!(" {query}{query_cursor}"))
-            .style(Style::default().fg(p.text).bg(p.surface0)),
+        Paragraph::new(Line::from(query_span)).style(Style::default().bg(p.surface0)),
         Rect::new(inner.x, y, inner.width, 1),
     );
     y += 1;
 
+    // List area: fixed block budget (header+hint+2 blanks+source title+query
+    // +4 section blocks+3 separators+error+buttons) leaves the rest to the
+    // list, clamped so tiny panes still fit.
+    let list_height = usize::from(inner.height.saturating_sub(17).clamp(3, 8));
+    let max_start = filtered.len().saturating_sub(list_height);
+    let start = selected.saturating_sub(list_height / 2).min(max_start);
+    let end = (start + list_height).min(filtered.len());
     for (visible_index, choice_index) in filtered[start..end].iter().enumerate() {
         let absolute_index = start + visible_index;
         let choice = &choices[*choice_index];
         let active = absolute_index == selected;
-        let marker = if active { " ▸ " } else { "   " };
+        // Marker slot occupies the first column of the shared 3-wide gutter;
+        // the label always starts at the same column as other section content.
+        let marker = if active { "▸  " } else { "   " };
         let line = Line::from(vec![
             Span::styled(
                 format!("{marker}{} ", choice.label),
@@ -1702,102 +1820,80 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         );
         y += 1;
     }
-    // Empty state: no herdr workspace is a jj repo. The wizard collapses to
-    // the source section plus an esc hint — nothing else is reachable (the
-    // run loop ignores Tab/Enter here), so name/base/checkout/buttons are not
-    // rendered at all.
-    if choices.is_empty() {
-        frame.render_widget(
-            Paragraph::new("   no jj workspaces — open herdr's project picker instead")
-                .style(Style::default().fg(p.overlay0)),
-            Rect::new(inner.x, y, inner.width, 1),
-        );
-        y += 1;
-        frame.render_widget(
-            Paragraph::new("   press esc to close")
-                .style(Style::default().fg(p.overlay0)),
-            Rect::new(inner.x, y, inner.width, 1),
-        );
-        return;
-    }
     if filtered.is_empty() {
         frame.render_widget(
-            Paragraph::new("   no matching workspaces").style(Style::default().fg(p.overlay0)),
+            Paragraph::new(format!("{pad}no matching workspaces"))
+                .style(Style::default().fg(p.overlay0)),
             Rect::new(inner.x, y, inner.width, 1),
         );
-        y += 1;
-    }
-    while y < inner.y + 3 + list_height as u16 {
         y += 1;
     }
 
-    let name_style = if field == WizardField::Name {
-        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(p.overlay0)
-    };
-    frame.render_widget(
-        Paragraph::new(" name  tab to edit").style(name_style),
+    // --- new workspace name -----------------------------------------------
+    y += 1;
+    render_section_title(
+        frame,
         Rect::new(inner.x, y, inner.width, 1),
+        "New Workspace Name",
+        field == WizardField::Name,
+        &p,
     );
     y += 1;
-    let cursor = if field == WizardField::Name {
-        "█"
-    } else {
-        ""
-    };
+    let name_cursor = if field == WizardField::Name { "█" } else { "" };
     frame.render_widget(
-        Paragraph::new(format!(" {name}{cursor}"))
+        Paragraph::new(format!("{pad}{name}{name_cursor}"))
             .style(Style::default().fg(p.text).bg(p.surface0)),
         Rect::new(inner.x, y, inner.width, 1),
     );
     y += 1;
 
-    // Every candidate is a jj workspace, so the preview is always the jj
-    // checkout destination — no `folder`/`workspace` variants, no warning.
-    // (choices.is_empty() already returned in the collapsed empty state.)
-    let preview_label = " checkout";
+    // --- base · jj revset --------------------------------------------------
+    y += 1;
+    render_section_title(
+        frame,
+        Rect::new(inner.x, y, inner.width, 1),
+        "Base · jj revset",
+        field == WizardField::Base,
+        &p,
+    );
+    y += 1;
+    let base_cursor = if field == WizardField::Base { "█" } else { "" };
+    frame.render_widget(
+        Paragraph::new(format!("{pad}{base}{base_cursor}"))
+            .style(Style::default().fg(p.text).bg(p.surface0)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
+
+    // --- checkout (read-only preview) -------------------------------------
+    y += 1;
+    render_section_title(
+        frame,
+        Rect::new(inner.x, y, inner.width, 1),
+        "Checkout",
+        false,
+        &p,
+    );
+    y += 1;
+    // Every candidate is a jj workspace, so the preview is the derived
+    // destination; a filter with no match has no selected source to derive
+    // from and shows a placeholder instead.
     let preview = match filtered.get(selected).map(|index| &choices[*index]) {
         Some(choice) => workspace_destination(root, &choice.path, name)
             .display()
             .to_string(),
         None => "no matching workspace".into(),
     };
+    frame.render_widget(
+        Paragraph::new(format!("{pad}{preview}")).style(Style::default().fg(p.subtext0)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
 
-    let base_style = if field == WizardField::Base {
-        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(p.overlay0)
-    };
-    frame.render_widget(
-        Paragraph::new(" base  jj revset · tab to edit").style(base_style),
-        Rect::new(inner.x, y, inner.width, 1),
-    );
-    y += 1;
-    let base_cursor = if field == WizardField::Base {
-        "█"
-    } else {
-        ""
-    };
-    let base_value_style = Style::default().fg(p.text).bg(p.surface0);
-    frame.render_widget(
-        Paragraph::new(format!(" {base}{base_cursor}")).style(base_value_style),
-        Rect::new(inner.x, y, inner.width, 1),
-    );
-    y += 1;
-    frame.render_widget(
-        Paragraph::new(preview_label).style(Style::default().fg(p.overlay0)),
-        Rect::new(inner.x, y, inner.width, 1),
-    );
-    y += 1;
-    frame.render_widget(
-        Paragraph::new(format!(" {preview}")).style(Style::default().fg(p.subtext0)),
-        Rect::new(inner.x, y, inner.width, 1),
-    );
-    y += 1;
     if let Some(message) = error {
+        y += 1;
         frame.render_widget(
-            Paragraph::new(format!(" {message}")).style(Style::default().fg(p.red)),
+            Paragraph::new(format!("{pad}{message}")).style(Style::default().fg(p.red)),
             Rect::new(inner.x, y, inner.width, 1),
         );
     }
@@ -2897,6 +2993,89 @@ mod tests {
         );
     }
 
+    // --- name field component-level editing (workspace-wizard: name 字段组件级编辑)
+
+    fn name_char(name: &str, state: NameEditState, c: char) -> (String, NameEditState) {
+        let mut n = name.to_string();
+        let mut s = state;
+        apply_name_key(&mut n, &mut s, NameKey::Char(c));
+        (n, s)
+    }
+
+    fn name_backspace(name: &str, state: NameEditState) -> (String, NameEditState) {
+        let mut n = name.to_string();
+        let mut s = state;
+        apply_name_key(&mut n, &mut s, NameKey::Backspace);
+        (n, s)
+    }
+
+    #[test]
+    fn name_fresh_char_keeps_prefix_and_replaces_slug() {
+        let (n, s) = name_char("workspace/brave-river-0000", NameEditState::Fresh, 'f');
+        assert_eq!(n, "workspace/f");
+        assert_eq!(s, NameEditState::Free);
+    }
+
+    #[test]
+    fn name_free_chars_append_after_first_keystroke() {
+        let (n, s) = name_char("workspace/f", NameEditState::Free, 'i');
+        assert_eq!(n, "workspace/fi");
+        assert_eq!(s, NameEditState::Free);
+        let (n, s) = name_char(&n, s, 'x');
+        assert_eq!(n, "workspace/fix");
+        assert_eq!(s, NameEditState::Free);
+    }
+
+    #[test]
+    fn name_fresh_backspace_drops_slug_keeps_prefix() {
+        let (n, s) = name_backspace("workspace/brave-river-0000", NameEditState::Fresh);
+        assert_eq!(n, "workspace/");
+        assert_eq!(s, NameEditState::Prefixed);
+    }
+
+    #[test]
+    fn name_prefixed_backspace_clears_prefix() {
+        let (n, s) = name_backspace("workspace/", NameEditState::Prefixed);
+        assert_eq!(n, "");
+        assert_eq!(s, NameEditState::Free);
+    }
+
+    #[test]
+    fn name_free_backspace_pops_one_char() {
+        // Typo-fix case: a per-char delete must not wipe the whole slug.
+        let (n, s) = name_backspace("workspace/fix-ap1", NameEditState::Free);
+        assert_eq!(n, "workspace/fix-ap");
+        assert_eq!(s, NameEditState::Free);
+    }
+
+    #[test]
+    fn name_double_backspace_then_free_typed_unprefixed_name() {
+        let (n1, s1) = name_backspace("workspace/brave-river-0000", NameEditState::Fresh);
+        assert_eq!((n1.as_str(), s1), ("workspace/", NameEditState::Prefixed));
+        let (n2, s2) = name_backspace(&n1, s1);
+        assert_eq!((n2.as_str(), s2), ("", NameEditState::Free));
+        let (n3, s3) = name_char(&n2, s2, 'f');
+        assert_eq!((n3.as_str(), s3), ("f", NameEditState::Free));
+    }
+
+    #[test]
+    fn name_multi_segment_user_name_edits_per_char() {
+        // User-typed names never get component-level deletion.
+        let (n, s) = name_backspace("feature/foo", NameEditState::Free);
+        assert_eq!(n, "feature/fo");
+        assert_eq!(s, NameEditState::Free);
+    }
+
+    #[test]
+    fn name_fresh_without_slash_degrades_to_clear() {
+        // Defensive: Fresh only arises from the auto-generated default, which
+        // always contains a '/'; without one, behavior matches the old
+        // replace-on-type semantics.
+        let (n, s) = name_backspace("default", NameEditState::Fresh);
+        assert_eq!(n, "");
+        assert_eq!(s, NameEditState::Free);
+    }
+
     #[test]
     fn jj_root_returns_the_root_when_it_carries_jj() {
         let dir = TempDir::new();
@@ -3470,5 +3649,259 @@ esac
         assert_eq!(format_unix_timestamp(1_788_912_000), "2026-09-09 00:00:00 UTC");
         // Leap-year day: 2024-02-29 12:34:56 UTC = 1709210096.
         assert_eq!(format_unix_timestamp(1_709_210_096), "2024-02-29 12:34:56 UTC");
+    }
+
+    // --- wizard render tests --------------------------------------------
+    //
+    // draw_workspace_wizard is a pure function over a Frame; a TestBackend
+    // captures the frame buffer so the section layout, title grammar, shared
+    // content indent, hint line and the three state branches are assertable
+    // without a TTY.
+
+    use ratatui::backend::TestBackend;
+
+    fn wizard_choice(id: &str, label: &str, path: &str) -> WorkspaceChoice {
+        WorkspaceChoice {
+            id: id.into(),
+            label: label.into(),
+            path: path.into(),
+        }
+    }
+
+    fn wizard_view<'a>(
+        choices: &'a [WorkspaceChoice],
+        filtered: &'a [usize],
+        selected: usize,
+        field: WizardField,
+        query: &'a str,
+        name: &'a str,
+        base: &'a str,
+        error: Option<&'a str>,
+    ) -> WizardView<'a> {
+        WizardView {
+            choices,
+            filtered,
+            selected,
+            field,
+            query,
+            name,
+            base,
+            root: Path::new("/tmp/wizard-root"),
+            error,
+        }
+    }
+
+    /// Renders the wizard at 90x30 into a buffer and returns it.
+    fn render_wizard(view: WizardView<'_>) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(90, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_workspace_wizard(frame, &view))
+            .expect("draw wizard");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Extracts one line of the buffer as a plain string (trailing spaces trimmed).
+    fn line_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        let mut text = String::new();
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, y)];
+            text.push_str(cell.symbol());
+        }
+        text.trim_end().to_string()
+    }
+
+    fn lines_containing(buffer: &ratatui::buffer::Buffer, needle: &str) -> Vec<u16> {
+        (0..buffer.area.height)
+            .filter(|&y| line_text(buffer, y).contains(needle))
+            .collect()
+    }
+
+    #[test]
+    fn wizard_renders_sectioned_layout_with_unified_titles_and_indent() {
+        let choices = vec![
+            wizard_choice("w1", "alpha", "/tmp/alpha"),
+            wizard_choice("w2", "beta", "/tmp/beta"),
+        ];
+        let filtered: Vec<usize> = vec![0, 1];
+        let buffer = render_wizard(wizard_view(
+            &choices,
+            &filtered,
+            0,
+            WizardField::WorkspaceSearch,
+            "",
+            "ws/alpha",
+            "trunk()",
+            None,
+        ));
+
+        // Modal header + single static hint line at the top.
+        let hint = lines_containing(&buffer, "type to filter or edit · ↑/↓ select · tab switch");
+        assert_eq!(hint.len(), 1, "hint must appear exactly once: {hint:?}");
+        assert!(hint[0] > 0, "hint sits below the modal header");
+
+        // Section titles each on their own line, no operation-hint suffixes.
+        let source = lines_containing(&buffer, "Source Workspace");
+        assert_eq!(source.len(), 1, "{source:?}");
+        let name = lines_containing(&buffer, "New Workspace Name");
+        assert_eq!(name.len(), 1, "{name:?}");
+        let base = lines_containing(&buffer, "Base · jj revset");
+        assert_eq!(base.len(), 1, "{base:?}");
+        let checkout = lines_containing(&buffer, "Checkout");
+        assert_eq!(checkout.len(), 1, "{checkout:?}");
+        // No stray per-section hints remain on the title lines.
+        assert!(lines_containing(&buffer, "tab to edit").is_empty());
+        assert!(lines_containing(&buffer, "tab edit name/base").is_empty());
+
+        // Titles render bold: assert on the first glyph column of each title line.
+        for (y, title_text) in [
+            (source[0], "Source Workspace"),
+            (name[0], "New Workspace Name"),
+            (base[0], "Base · jj revset"),
+            (checkout[0], "Checkout"),
+        ] {
+            let title_start = line_text(&buffer, y).find(title_text).unwrap_or(0) as u16;
+            let cell = &buffer[(title_start, y)];
+            assert!(
+                cell.style().add_modifier.contains(Modifier::BOLD),
+                "title line {y} ({title_text:?}) must be bold"
+            );
+        }
+
+        // Content lines share the 3-column indent: query bar, name/base values
+        // and checkout path all start at the same column as the list label.
+        let source_y = source[0];
+        let query_y = source_y + 1;
+        let query_line = line_text(&buffer, query_y);
+        assert!(query_line.contains("   filter…"), "placeholder: {query_line:?}");
+        let list_y = query_y + 1;
+        let list_line = line_text(&buffer, list_y);
+        assert!(list_line.contains("▸  alpha "), "active row: {list_line:?}");
+        assert!(
+            line_text(&buffer, list_y + 1).contains("   beta "),
+            "inactive row keeps label column"
+        );
+        // name value, base value, checkout path all start with the 3-space pad.
+        let name_value_y = name[0] + 1;
+        assert!(line_text(&buffer, name_value_y).contains("   ws/alpha"), "name value indent");
+        let base_value_y = base[0] + 1;
+        assert!(line_text(&buffer, base_value_y).contains("   trunk()"), "base value indent");
+        let checkout_value_y = checkout[0] + 1;
+        assert!(
+            line_text(&buffer, checkout_value_y).contains("   "),
+            "checkout value indent: {:?}",
+            line_text(&buffer, checkout_value_y)
+        );
+    }
+
+    #[test]
+    fn wizard_focus_switches_title_color_only() {
+        let choices = vec![wizard_choice("w1", "alpha", "/tmp/alpha")];
+        let filtered: Vec<usize> = vec![0];
+
+        let focused_name = render_wizard(wizard_view(
+            &choices,
+            &filtered,
+            0,
+            WizardField::Name,
+            "",
+            "ws/alpha",
+            "trunk()",
+            None,
+        ));
+        let name_y = lines_containing(&focused_name, "New Workspace Name")[0];
+        let source_y = lines_containing(&focused_name, "Source Workspace")[0];
+
+        // Focused title is accent; unfocused is subtext0; both bold.
+        let name_x = line_text(&focused_name, name_y)
+            .find("New Workspace Name")
+            .unwrap_or(0) as u16;
+        let source_x = line_text(&focused_name, source_y)
+            .find("Source Workspace")
+            .unwrap_or(0) as u16;
+        let name_cell = &focused_name[(name_x, name_y)];
+        let source_cell = &focused_name[(source_x, source_y)];
+        assert_eq!(name_cell.style().fg, Some(palette_accent()));
+        assert_eq!(source_cell.style().fg, Some(palette_subtext0()));
+        assert!(name_cell.style().add_modifier.contains(Modifier::BOLD));
+        assert!(source_cell.style().add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn wizard_zero_candidate_collapses_to_source_and_esc_only() {
+        let choices: Vec<WorkspaceChoice> = vec![];
+        let filtered: Vec<usize> = vec![];
+        let buffer = render_wizard(wizard_view(
+            &choices,
+            &filtered,
+            0,
+            WizardField::WorkspaceSearch,
+            "",
+            "ws/alpha",
+            "trunk()",
+            None,
+        ));
+
+        assert_eq!(lines_containing(&buffer, "Source Workspace").len(), 1);
+        assert!(
+            lines_containing(&buffer, "no jj workspaces — open herdr's project picker instead")
+                .len()
+                == 1
+        );
+        assert!(lines_containing(&buffer, "New Workspace Name").is_empty());
+        assert!(lines_containing(&buffer, "Base · jj revset").is_empty());
+        assert!(lines_containing(&buffer, "create and open").is_empty());
+        // No full hint line in the collapsed state (create/tab would lie).
+        assert!(lines_containing(&buffer, "tab switch").is_empty());
+        assert!(lines_containing(&buffer, "press esc to close").len() == 1);
+    }
+
+    #[test]
+    fn wizard_query_no_match_keeps_sections_with_placeholder_preview() {
+        let choices = vec![wizard_choice("w1", "alpha", "/tmp/alpha")];
+        let filtered: Vec<usize> = vec![];
+        let buffer = render_wizard(wizard_view(
+            &choices,
+            &filtered,
+            0,
+            WizardField::WorkspaceSearch,
+            "zzz",
+            "ws/alpha",
+            "trunk()",
+            None,
+        ));
+
+        assert!(lines_containing(&buffer, "no matching workspaces").len() == 1);
+        assert_eq!(lines_containing(&buffer, "New Workspace Name").len(), 1);
+        assert_eq!(lines_containing(&buffer, "Base · jj revset").len(), 1);
+        assert_eq!(lines_containing(&buffer, "Checkout").len(), 1);
+        // Checkout preview shows the placeholder, not a fabricated path.
+        let checkout_y = lines_containing(&buffer, "Checkout")[0];
+        assert!(line_text(&buffer, checkout_y + 1).contains("no matching workspace"));
+    }
+
+    #[test]
+    fn wizard_query_empty_unfocused_shows_no_placeholder() {
+        let choices = vec![wizard_choice("w1", "alpha", "/tmp/alpha")];
+        let filtered: Vec<usize> = vec![0];
+        let buffer = render_wizard(wizard_view(
+            &choices,
+            &filtered,
+            0,
+            WizardField::Name,
+            "",
+            "ws/alpha",
+            "trunk()",
+            None,
+        ));
+        assert!(lines_containing(&buffer, "filter…").is_empty());
+    }
+
+    /// Palette probes for render assertions (mirrors `catppuccin`).
+    fn palette_accent() -> Color {
+        Color::Rgb(137, 180, 250)
+    }
+    fn palette_subtext0() -> Color {
+        Color::Rgb(166, 173, 200)
     }
 }
