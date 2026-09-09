@@ -49,15 +49,20 @@ The source selector starts on the current workspace with fuzzy search focused.
 Type to filter by workspace label or path, use `↑`/`↓` (including
 `Ctrl+↑`/`Ctrl+↓`) to navigate the matches, and press `Tab` to edit the name.
 
-For a jj source, the plugin creates an empty sparse checkout from local
-`trunk()`, materializes only Codex's startup instructions, and opens its tab.
-The right terminal then runs `scripts/setup-workspace.sh` (a plain POSIX shell
-script shipped with the plugin — `cat` it any time to see exactly what it
-does): it materializes the full checkout, creates the bookmark, runs
-`jj git fetch`, and rebases the new working-copy commit onto `trunk()` while
-Codex starts on the left. If the selected folder is not a jj workspace, the
-plugin opens the same folder and shows a warning instead of creating a
-checkout.
+Candidates are **jj workspaces only**: a Herdr workspace is listed when its
+path — the workspace root, or the active pane's directory normalized up to
+the nearest `.jj` — is inside a jj repository. New tabs are always created at
+the workspace root, so launching from a pane in a subdirectory still checks
+out at the root. When no workspace is a jj repository, the wizard opens with
+an empty state instead of a list.
+
+The plugin creates an empty sparse checkout from the resolved base revision
+(`trunk()` by default), materializes only Codex's startup instructions, and
+opens its tab. The right terminal then runs `scripts/setup-workspace.sh` (a
+plain POSIX shell script shipped with the plugin — `cat` it any time to see
+exactly what it does): it materializes the full checkout, creates the
+bookmark, runs `jj git fetch`, and rebases the new working-copy commit onto
+the base revision while Codex starts on the left.
 
 The setup script runs under `/bin/sh`, so it works no matter which interactive
 shell your Herdr panes use (fish, bash, zsh, and other POSIX shells).
@@ -144,8 +149,7 @@ validated against the source repository before the workspace is created
 (`jj log -r <expr> --no-graph --limit 0`), and an invalid expression keeps the
 wizard open with jj's own error message. The same resolved revision is used
 as the right-pane rebase destination, so `workspace add -r` and the setup
-script's `rebase -d` always agree. The base field is dimmed and ignored when
-the selected source is not a jj workspace.
+script's `rebase -d` always agree.
 
 ### Agent startup handling
 

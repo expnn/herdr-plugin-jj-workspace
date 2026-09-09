@@ -48,7 +48,7 @@ struct WizardResult {
     name: String,
     /// The base revision for workspace creation: the resolution-chain value
     /// evaluated for the finally selected source, or the user-edited revset
-    /// (validated) when the base field was touched. Unused for non-jj sources.
+    /// (validated) when the base field was touched.
     base_rev: String,
 }
 
@@ -78,16 +78,6 @@ fn next_wizard_field(field: WizardField) -> WizardField {
         WizardField::WorkspaceSearch => WizardField::Name,
         WizardField::Name => WizardField::Base,
         WizardField::Base => WizardField::WorkspaceSearch,
-    }
-}
-
-/// The yellow warning shown for non-jj sources. The base-rev field only
-/// applies to jj workspaces, so the warning also says it is ignored.
-fn source_warning(is_jj: bool) -> Option<&'static str> {
-    if is_jj {
-        None
-    } else {
-        Some("not a jj workspace — the same folder will be opened; base-rev is ignored")
     }
 }
 
@@ -593,9 +583,6 @@ fn cmd_open(_mode: &str) -> ! {
         die(&err.to_string());
     }
     let ctx = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
-    let cwd = json_string_field(&ctx, "focused_pane_cwd")
-        .or_else(|| json_string_field(&ctx, "workspace_cwd"))
-        .unwrap_or_default();
     let workspace_id = env::var("HERDR_WORKSPACE_ID")
         .ok()
         .filter(|value| !value.is_empty())
@@ -613,9 +600,7 @@ fn cmd_open(_mode: &str) -> ! {
         "wizard",
     ])
     .arg("--env")
-    .arg(format!("JJ_CURRENT_CWD={cwd}"))
-    .arg("--env")
-    .arg(format!("JJ_CURRENT_WORKSPACE={workspace_id}"))
+    .arg(format!("CURRENT_HERDR_WORKSPACE_ID={workspace_id}"))
     .arg("--focus");
     match cmd.status() {
         Ok(status) => process::exit(status.code().unwrap_or(0)),
@@ -640,11 +625,9 @@ fn cmd_wizard() -> ! {
         Ok(jj) => jj,
         Err(err) => show_config_error_and_exit(&err.to_string()),
     };
-    let current_cwd = env::var("JJ_CURRENT_CWD").unwrap_or_default();
-    let current_workspace = env::var("JJ_CURRENT_WORKSPACE").unwrap_or_default();
-    let choices = match load_workspace_choices(&current_workspace, &current_cwd) {
-        Ok(choices) if !choices.is_empty() => choices,
-        Ok(_) => fail("Herdr has no workspaces to select"),
+    let current_workspace = env::var("CURRENT_HERDR_WORKSPACE_ID").unwrap_or_default();
+    let choices = match load_workspace_choices() {
+        Ok(choices) => choices,
         Err(err) => fail(&err),
     };
     let selected = choices
@@ -656,19 +639,20 @@ fn cmd_wizard() -> ! {
     // Prefill the wizard's base field from the initially selected source. The
     // value shown is display-only: at submit, an untouched field is
     // re-evaluated from the resolution chain so the finally selected source
-    // wins (see `wizard_final_base_rev`).
-    let initial_choice = &choices[selected];
-    let initial_base = if is_jj_workspace(&initial_choice.path) {
-        // Display-only prefill: a repo-level resolution error (e.g. an
-        // explicit empty `herdr.base-rev` in jj repo config) must NOT kill
-        // the wizard at entry — fall back to the global default here. The
-        // real resolution happens at submit (wizard_final_base_rev), where
-        // errors surface as the wizard's own error line and the user can
-        // edit the base field to proceed.
-        resolve_base_rev(&config, &jj, Path::new(&repo_root(&initial_choice.path)))
-            .unwrap_or_else(|_| config.jj.base_rev.clone())
-    } else {
-        config.jj.base_rev.clone()
+    // wins (see `wizard_final_base_rev`). With no jj candidates the field
+    // simply shows the config default.
+    let initial_base = match choices.get(selected) {
+        Some(initial_choice) => {
+            // Display-only prefill: a repo-level resolution error (e.g. an
+            // explicit empty `herdr.base-rev` in jj repo config) must NOT kill
+            // the wizard at entry — fall back to the global default here. The
+            // real resolution happens at submit (wizard_final_base_rev), where
+            // errors surface as the wizard's own error line and the user can
+            // edit the base field to proceed.
+            resolve_base_rev(&config, &jj, Path::new(&repo_root(&initial_choice.path)))
+                .unwrap_or_else(|_| config.jj.base_rev.clone())
+        }
+        None => config.jj.base_rev.clone(),
     };
 
     let selection = match run_workspace_wizard(
@@ -689,74 +673,67 @@ fn cmd_wizard() -> ! {
         fail(&format!("workspace folder does not exist: {source}"));
     }
 
-    let is_jj = is_jj_workspace(&source);
-    let destination = if is_jj {
-        // `jj.command` was already resolved and validated at wizard entry.
-        // Resolve secondary workspaces to the main repo so sibling checkouts
-        // remain grouped under a stable directory.
-        let repo = repo_root(&source);
-        let dest_path = root
-            .join(basename(&repo))
-            .join(branch_to_path_slug(&selection.name));
-        if dest_path.exists() {
-            fail(&format!("checkout already exists: {}", dest_path.display()));
+    // `jj.command` was already resolved and validated at wizard entry.
+    // Resolve secondary workspaces to the main repo so sibling checkouts
+    // remain grouped under a stable directory.
+    let repo = repo_root(&source);
+    let dest_path = root
+        .join(basename(&repo))
+        .join(branch_to_path_slug(&selection.name));
+    if dest_path.exists() {
+        fail(&format!("checkout already exists: {}", dest_path.display()));
+    }
+    if let Some(parent) = dest_path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            fail(&format!("could not create {}: {err}", parent.display()));
         }
-        if let Some(parent) = dest_path.parent() {
-            if let Err(err) = fs::create_dir_all(parent) {
-                fail(&format!("could not create {}: {err}", parent.display()));
-            }
-        }
-        let dest = dest_path.display().to_string();
+    }
+    let dest = dest_path.display().to_string();
 
-        // Create only the metadata and bootstrap startup files synchronously.
-        // The full checkout, bookmark, fetch, and rebase run in the right pane.
-        // The base revision comes from the wizard (resolution chain evaluated
-        // for this source, or the validated user input) so `workspace add -r`
-        // and the right-pane rebase destination always agree.
-        let base = &selection.base_rev;
-        eprintln!(
-            "+ {} workspace add --name {} -r {base} --sparse-patterns empty {dest}",
-            jj.executable.display(),
-            selection.name
-        );
-        let mut add = Command::new(&jj.executable);
-        add.current_dir(&repo)
-            .args(&jj.extra_args)
-            .args([
-                "workspace",
-                "add",
-                "--name",
-                &selection.name,
-                "-r",
-                base,
-                "--sparse-patterns",
-                "empty",
-                &dest,
-            ]);
-        run_or(add, "jj workspace add", fail);
+    // Create only the metadata and bootstrap startup files synchronously.
+    // The full checkout, bookmark, fetch, and rebase run in the right pane.
+    // The base revision comes from the wizard (resolution chain evaluated
+    // for this source, or the validated user input) so `workspace add -r`
+    // and the right-pane rebase destination always agree.
+    let base = &selection.base_rev;
+    eprintln!(
+        "+ {} workspace add --name {} -r {base} --sparse-patterns empty {dest}",
+        jj.executable.display(),
+        selection.name
+    );
+    let mut add = Command::new(&jj.executable);
+    add.current_dir(&repo)
+        .args(&jj.extra_args)
+        .args([
+            "workspace",
+            "add",
+            "--name",
+            &selection.name,
+            "-r",
+            base,
+            "--sparse-patterns",
+            "empty",
+            &dest,
+        ]);
+    run_or(add, "jj workspace add", fail);
 
-        let mut bootstrap = Command::new(&jj.executable);
-        bootstrap
-            .current_dir(&dest)
-            .args(&jj.extra_args)
-            .args(["sparse", "set", "--clear"]);
-        for path in &config.agent.bootstrap_paths {
-            bootstrap.args(["--add", path]);
-        }
-        run_or(bootstrap, "materialize agent bootstrap files", fail);
-        dest
-    } else {
-        source
-    };
+    let mut bootstrap = Command::new(&jj.executable);
+    bootstrap
+        .current_dir(&dest)
+        .args(&jj.extra_args)
+        .args(["sparse", "set", "--clear"]);
+    for path in &config.agent.bootstrap_paths {
+        bootstrap.args(["--add", path]);
+    }
+    run_or(bootstrap, "materialize agent bootstrap files", fail);
 
     open_tab_layout(
         &config,
         &jj,
         &selection.source.id,
-        &destination,
+        &dest,
         &selection.name,
         &selection.base_rev,
-        is_jj,
     );
     process::exit(0);
 }
@@ -814,12 +791,19 @@ fn show_config_error_and_exit(message: &str) -> ! {
     process::exit(1);
 }
 
-fn load_workspace_choices(
-    current_workspace: &str,
-    current_cwd: &str,
-) -> Result<Vec<WorkspaceChoice>, String> {
-    let workspaces = herdr_json(&["workspace", "list"])?;
-    let panes = herdr_json(&["pane", "list"])?;
+fn load_workspace_choices() -> Result<Vec<WorkspaceChoice>, String> {
+    load_workspace_choices_with(&herdr_bin())
+}
+
+/// Like `load_workspace_choices`, with an injectable herdr executable (tests
+/// pass a fake). Candidate paths are jj workspace roots only: herdr's
+/// `checkout_path` already names the workspace root, while the pane-cwd
+/// fallback may sit anywhere inside the repository and is normalized upward
+/// by `jj_root`; a workspace with no `.jj` marker on any ancestor is not a
+/// jj workspace and is filtered out.
+fn load_workspace_choices_with(bin: &str) -> Result<Vec<WorkspaceChoice>, String> {
+    let workspaces = herdr_json_with(bin, &["workspace", "list"])?;
+    let panes = herdr_json_with(bin, &["pane", "list"])?;
     let workspace_values = workspaces
         .pointer("/result/workspaces")
         .and_then(Value::as_array)
@@ -844,11 +828,10 @@ fn load_workspace_choices(
             .and_then(Value::as_str)
             .unwrap_or_default();
 
-        let path = if id == current_workspace && !current_cwd.is_empty() {
-            Some(current_cwd.to_string())
-        } else if let Some(path) = workspace
+        let path = if let Some(path) = workspace
             .pointer("/worktree/checkout_path")
             .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
         {
             Some(path.to_string())
         } else {
@@ -867,7 +850,12 @@ fn load_workspace_choices(
                 .and_then(pane_path)
         };
 
-        if let Some(path) = path.filter(|path| !path.is_empty()) {
+        // jj-only filter + ancestor normalization: keep the candidate only
+        // when the path itself or one of its ancestors is a jj workspace
+        // root, and replace the path by that root. A pane cwd deep inside the
+        // repository therefore still resolves to the workspace root the new
+        // tab is created on; non-jj projects never appear as candidates.
+        if let Some(path) = path.and_then(|path| jj_root(&path)) {
             choices.push(WorkspaceChoice {
                 id: id.into(),
                 label,
@@ -886,11 +874,6 @@ fn pane_path(pane: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn herdr_json(args: &[&str]) -> Result<Value, String> {
-    herdr_json_with(&herdr_bin(), args)
-}
-
-/// Like `herdr_json`, with an injectable herdr executable (tests pass a fake).
 fn herdr_json_with(bin: &str, args: &[&str]) -> Result<Value, String> {
     let output = Command::new(bin)
         .args(args)
@@ -922,7 +905,6 @@ fn open_tab_layout(
     cwd: &str,
     label: &str,
     base_rev: &str,
-    is_jj: bool,
 ) {
     let herdr = herdr_bin();
     eprintln!("+ herdr tab create --workspace {workspace_id} --cwd {cwd}");
@@ -960,19 +942,15 @@ fn open_tab_layout(
         "herdr pane split",
     );
     let right_pane = required_json_string(&split, "/result/pane/pane_id");
-    let right_command = if is_jj {
-        setup_script_command(
-            &setup_script_path(),
-            jj,
-            base_rev,
-            label,
-            workspace_id,
-            &tab_id,
-            &left_pane,
-        )
-    } else {
-        finish_tab_shell_command(workspace_id, &tab_id, &left_pane)
-    };
+    let right_command = setup_script_command(
+        &setup_script_path(),
+        jj,
+        base_rev,
+        label,
+        workspace_id,
+        &tab_id,
+        &left_pane,
+    );
     let mut run_right = Command::new(&herdr);
     run_right.args(["pane", "run", &right_pane, &right_command]);
     run_or(run_right, "start right-pane setup", fail);
@@ -986,28 +964,6 @@ fn open_tab_layout(
     let mut start_codex = Command::new(&herdr);
     start_codex.args(["pane", "run", &left_pane, &start_command]);
     run_or(start_codex, "start agent in left pane", fail);
-
-    if !is_jj {
-        let body = format!(
-            "{} is not a jj workspace; opened the same folder without creating a checkout.",
-            cwd
-        );
-        let mut toast = Command::new(&herdr);
-        toast.args([
-            "notification",
-            "show",
-            "No jj workspace created",
-            "--body",
-            &body,
-            "--position",
-            "top-right",
-            "--sound",
-            "none",
-        ]);
-        if !run(toast) {
-            eprintln!("warning: could not show the non-jj workspace notification");
-        }
-    }
 }
 
 /// Plugin root directory: `HERDR_PLUGIN_ROOT` when injected, else derived from
@@ -1170,18 +1126,6 @@ fn wait_for_agent_ready(config: &AgentConfig, herdr: &str, pane_id: &str) -> Age
         thread::sleep(poll);
     }
     AgentWaitOutcome::NotDetected
-}
-
-fn finish_tab_shell_command(workspace_id: &str, tab_id: &str, left_pane: &str) -> String {
-    let executable = env::current_exe()
-        .unwrap_or_else(|err| fail(&format!("cannot resolve jj-workspace executable: {err}")));
-    format!(
-        "{} finish-tab {} {} {}",
-        shell_quote(&executable.display().to_string()),
-        shell_quote(workspace_id),
-        shell_quote(tab_id),
-        shell_quote(left_pane),
-    )
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1369,7 +1313,6 @@ struct Palette {
     text: Color,
     subtext0: Color,
     red: Color,
-    yellow: Color,
 }
 
 fn catppuccin() -> Palette {
@@ -1382,7 +1325,6 @@ fn catppuccin() -> Palette {
         text: Color::Rgb(205, 214, 244),
         subtext0: Color::Rgb(166, 173, 200),
         red: Color::Rgb(243, 139, 168),
-        yellow: Color::Rgb(249, 226, 175),
     }
 }
 
@@ -1438,8 +1380,13 @@ fn run_workspace_wizard(
                 KeyCode::Esc => break None,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
                 KeyCode::Tab | KeyCode::BackTab => {
-                    field = next_wizard_field(field);
-                    error = None;
+                    // Zero-candidate collapse: no other field is reachable
+                    // (the UI renders source + esc only), so Tab must not
+                    // move focus to a hidden section.
+                    if !choices.is_empty() {
+                        field = next_wizard_field(field);
+                        error = None;
+                    }
                 }
                 KeyCode::Up if field == WizardField::WorkspaceSearch => {
                     selected = previous_index(selected, filtered.len());
@@ -1464,6 +1411,12 @@ fn run_workspace_wizard(
                     error = None;
                 }
                 KeyCode::Enter => {
+                    // Zero-candidate collapse: Enter has nothing to submit
+                    // and must not surface the generic "no matching
+                    // workspace" error — the empty state is the message.
+                    if choices.is_empty() {
+                        continue;
+                    }
                     let Some(choice_index) = filtered.get(selected).copied() else {
                         error = Some("no matching workspace".into());
                         continue;
@@ -1477,32 +1430,28 @@ fn run_workspace_wizard(
                         error = Some(format!("folder does not exist: {}", source.path));
                         continue;
                     }
-                    if is_jj_workspace(&source.path) {
-                        let checkout = workspace_destination(root, &source.path, &name);
-                        if checkout.exists() {
-                            error =
-                                Some(format!("checkout already exists: {}", checkout.display()));
+                    let checkout = workspace_destination(root, &source.path, &name);
+                    if checkout.exists() {
+                        error =
+                            Some(format!("checkout already exists: {}", checkout.display()));
+                        continue;
+                    }
+                    // Candidates are guaranteed jj workspaces (jj-only filter
+                    // in `load_workspace_choices`), so the final base is
+                    // always solved from the resolution chain — or validated
+                    // when the user edited the field.
+                    let base_rev = match wizard_final_base_rev(
+                        config,
+                        jj,
+                        Path::new(&repo_root(&source.path)),
+                        &base,
+                        base_dirty,
+                    ) {
+                        Ok(value) => value,
+                        Err(message) => {
+                            error = Some(message);
                             continue;
                         }
-                    }
-                    let base_rev = if is_jj_workspace(&source.path) {
-                        match wizard_final_base_rev(
-                            config,
-                            jj,
-                            Path::new(&repo_root(&source.path)),
-                            &base,
-                            base_dirty,
-                        ) {
-                            Ok(value) => value,
-                            Err(message) => {
-                                error = Some(message);
-                                continue;
-                            }
-                        }
-                    } else {
-                        // Non-jj sources never create a workspace; the base
-                        // field is ignored (dimmed in the UI).
-                        base.clone()
                     };
                     break Some(WizardResult {
                         source,
@@ -1686,7 +1635,7 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
     let Some(inner) = render_modal_shell(frame, area, 86, 22, &p) else {
         return;
     };
-    if inner.height < 14 || choices.is_empty() {
+    if inner.height < 14 {
         return;
     }
 
@@ -1731,11 +1680,6 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         let choice = &choices[*choice_index];
         let active = absolute_index == selected;
         let marker = if active { " ▸ " } else { "   " };
-        let kind = if is_jj_workspace(&choice.path) {
-            "jj"
-        } else {
-            "dir"
-        };
         let line = Line::from(vec![
             Span::styled(
                 format!("{marker}{} ", choice.label),
@@ -1745,10 +1689,7 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
                     Modifier::empty()
                 }),
             ),
-            Span::styled(
-                format!("[{kind}] {}", choice.path),
-                Style::default().fg(p.subtext0),
-            ),
+            Span::styled(choice.path.clone(), Style::default().fg(p.subtext0)),
         ]);
         let style = if active {
             Style::default().fg(p.text).bg(p.surface0)
@@ -1760,6 +1701,24 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
             Rect::new(inner.x, y, inner.width, 1),
         );
         y += 1;
+    }
+    // Empty state: no herdr workspace is a jj repo. The wizard collapses to
+    // the source section plus an esc hint — nothing else is reachable (the
+    // run loop ignores Tab/Enter here), so name/base/checkout/buttons are not
+    // rendered at all.
+    if choices.is_empty() {
+        frame.render_widget(
+            Paragraph::new("   no jj workspaces — open herdr's project picker instead")
+                .style(Style::default().fg(p.overlay0)),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+        frame.render_widget(
+            Paragraph::new("   press esc to close")
+                .style(Style::default().fg(p.overlay0)),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        return;
     }
     if filtered.is_empty() {
         frame.render_widget(
@@ -1794,31 +1753,19 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
     );
     y += 1;
 
-    let choice = filtered.get(selected).map(|index| &choices[*index]);
-    let selected_is_jj = choice
-        .map(|choice| is_jj_workspace(&choice.path))
-        .unwrap_or(false);
-    let (preview_label, preview, warning) = match choice {
-        Some(choice) if is_jj_workspace(&choice.path) => (
-            " checkout",
-            workspace_destination(root, &choice.path, name)
-                .display()
-                .to_string(),
-            source_warning(true),
-        ),
-        Some(choice) => (
-            " folder",
-            choice.path.clone(),
-            source_warning(false),
-        ),
-        None => (" workspace", "no matching workspace".into(), None),
+    // Every candidate is a jj workspace, so the preview is always the jj
+    // checkout destination — no `folder`/`workspace` variants, no warning.
+    // (choices.is_empty() already returned in the collapsed empty state.)
+    let preview_label = " checkout";
+    let preview = match filtered.get(selected).map(|index| &choices[*index]) {
+        Some(choice) => workspace_destination(root, &choice.path, name)
+            .display()
+            .to_string(),
+        None => "no matching workspace".into(),
     };
 
     let base_style = if field == WizardField::Base {
         Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
-    } else if !selected_is_jj {
-        // Dimmed: the base revision is ignored for non-jj sources.
-        Style::default().fg(p.surface_dim)
     } else {
         Style::default().fg(p.overlay0)
     };
@@ -1832,11 +1779,7 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
     } else {
         ""
     };
-    let base_value_style = if selected_is_jj {
-        Style::default().fg(p.text).bg(p.surface0)
-    } else {
-        Style::default().fg(p.surface_dim).bg(p.surface0)
-    };
+    let base_value_style = Style::default().fg(p.text).bg(p.surface0);
     frame.render_widget(
         Paragraph::new(format!(" {base}{base_cursor}")).style(base_value_style),
         Rect::new(inner.x, y, inner.width, 1),
@@ -1852,10 +1795,9 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         Rect::new(inner.x, y, inner.width, 1),
     );
     y += 1;
-    if let Some(message) = error.or(warning) {
-        let color = if error.is_some() { p.red } else { p.yellow };
+    if let Some(message) = error {
         frame.render_widget(
-            Paragraph::new(format!(" {message}")).style(Style::default().fg(color)),
+            Paragraph::new(format!(" {message}")).style(Style::default().fg(p.red)),
             Rect::new(inner.x, y, inner.width, 1),
         );
     }
@@ -2063,8 +2005,20 @@ fn plugin_id() -> String {
         .unwrap_or_else(|| "nathanflurry.jj-workspace".into())
 }
 
-fn is_jj_workspace(repo: &str) -> bool {
-    !repo.is_empty() && Path::new(repo).join(".jj").exists()
+/// Walk `path` and its ancestors for a `.jj` marker (file or directory) and
+/// return the directory containing it — the jj workspace root. A workspace
+/// root carrying its own `.jj` returns itself unchanged (no extra scanning);
+/// a path inside a repository is normalized upward to the root; a path with
+/// no `.jj` on any ancestor is not a jj workspace and yields `None` (the
+/// caller filters such candidates out).
+fn jj_root(path: &str) -> Option<String> {
+    let mut dir = Path::new(path);
+    loop {
+        if dir.join(".jj").exists() {
+            return Some(dir.display().to_string());
+        }
+        dir = dir.parent()?;
+    }
 }
 
 /// Resolve any jj workspace path to its MAIN workspace root.
@@ -2372,12 +2326,20 @@ mod tests {
 
     impl TempDir {
         fn new() -> TempDir {
+            // Tests run concurrently in one process, so a nanosecond
+            // timestamp alone is not unique: two threads creating a TempDir
+            // in the same clock tick collide and tear each other down.
+            // A per-process sequence counter keeps the path unique.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock before epoch")
                 .as_nanos();
-            let dir = std::env::temp_dir()
-                .join(format!("jj-workspace-config-{}-{nanos}", std::process::id()));
+            let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "jj-workspace-config-{}-{nanos}-{seq}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&dir).expect("create temp dir");
             TempDir(dir)
         }
@@ -2733,6 +2695,12 @@ mod tests {
         let plugin_exe = root.join("target/release/jj-workspace");
         std::fs::write(&plugin_exe, "#!/bin/sh\necho \"$@\" >> \"$FINISH_LOG\"\n")
             .expect("write fake plugin exe");
+        // Sync before the script spawns the fakes: exec'ing a freshly written
+        // script can race the kernel's write-open tracking and fail with
+        // ETXTBSY ("Text file busy", rust-lang/rust #114554).
+        std::fs::File::open(&plugin_exe)
+            .and_then(|file| file.sync_all())
+            .expect("sync fake plugin exe");
         std::fs::set_permissions(&plugin_exe, std::fs::Permissions::from_mode(0o755))
             .expect("make fake plugin exe executable");
 
@@ -2752,6 +2720,9 @@ mod tests {
             ),
         )
         .expect("write fake jj");
+        std::fs::File::open(&jj)
+            .and_then(|file| file.sync_all())
+            .expect("sync fake jj");
         std::fs::set_permissions(&jj, std::fs::Permissions::from_mode(0o755))
             .expect("make fake jj executable");
 
@@ -2927,20 +2898,154 @@ mod tests {
     }
 
     #[test]
-    fn non_jj_sources_warn_that_base_rev_is_ignored() {
-        assert!(source_warning(false).unwrap().contains("base-rev is ignored"));
-        assert!(source_warning(true).is_none());
+    fn jj_root_returns_the_root_when_it_carries_jj() {
+        let dir = TempDir::new();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".jj")).expect("create .jj");
+        assert_eq!(
+            jj_root(repo.to_str().unwrap()),
+            Some(repo.display().to_string())
+        );
+    }
+
+    #[test]
+    fn jj_root_normalizes_subdirectories_up_to_the_jj_root() {
+        let dir = TempDir::new();
+        let repo = dir.path().join("repo");
+        let nested = repo.join("a/b/c");
+        fs::create_dir_all(&nested).expect("create nested dirs");
+        fs::create_dir_all(repo.join(".jj")).expect("create .jj");
+        // A pane sitting deep inside the repository resolves to the root.
+        assert_eq!(
+            jj_root(nested.to_str().unwrap()),
+            Some(repo.display().to_string())
+        );
+    }
+
+    #[test]
+    fn jj_root_returns_none_without_a_jj_ancestor() {
+        let dir = TempDir::new();
+        let deep = dir.path().join("x/y/z");
+        fs::create_dir_all(&deep).expect("create dirs");
+        assert_eq!(jj_root(deep.to_str().unwrap()), None);
+    }
+
+    /// Fake herdr that answers `workspace list` / `pane list` from two JSON
+    /// fixture files, for exercising candidate loading and jj filtering.
+    #[cfg(unix)]
+    fn make_fake_herdr_listing(dir: &Path, workspaces: &str, panes: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(dir.join("workspaces.json"), workspaces).expect("write workspaces fixture");
+        fs::write(dir.join("panes.json"), panes).expect("write panes fixture");
+        let bin = dir.join("herdr");
+        fs::write(
+            &bin,
+            "#!/bin/sh\n\
+             D=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n\
+             case \"$1 $2\" in\n\
+               \"workspace list\") cat \"$D/workspaces.json\" ;;\n\
+               \"pane list\") cat \"$D/panes.json\" ;;\n\
+               *) exit 1 ;;\n\
+             esac\n",
+        )
+        .expect("write fake herdr");
+        fs::File::open(&bin)
+            .and_then(|file| file.sync_all())
+            .expect("sync fake herdr");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))
+            .expect("make fake herdr executable");
+        bin.display().to_string()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_choices_keep_jj_roots_and_filter_everything_else() {
+        let dir = TempDir::new();
+        // jj repo whose checkout_path is present (the root carries `.jj`).
+        let repo_a = dir.path().join("alpha");
+        fs::create_dir_all(repo_a.join(".jj")).expect("create alpha .jj");
+        // jj repo WITHOUT a checkout_path: falls back to the active pane's
+        // cwd, which sits deep inside the repo — normalized up to the root.
+        let repo_b = dir.path().join("beta");
+        let pane_cwd_b = repo_b.join("sub/deep");
+        fs::create_dir_all(&pane_cwd_b).expect("create beta pane dirs");
+        fs::create_dir_all(repo_b.join(".jj")).expect("create beta .jj");
+        // Plain directory with a checkout_path but no `.jj` on any ancestor.
+        let repo_c = dir.path().join("gamma");
+        fs::create_dir_all(&repo_c).expect("create gamma dir");
+
+        let workspaces = format!(
+            r#"{{"result":{{"workspaces":[
+                {{"workspace_id":"w1","label":"alpha","active_tab_id":"w1:t1",
+                  "worktree":{{"checkout_path":"{a}"}}}},
+                {{"workspace_id":"w2","label":"beta","active_tab_id":"w2:t1",
+                  "worktree":{{}}}},
+                {{"workspace_id":"w3","label":"gamma","active_tab_id":"w3:t1",
+                  "worktree":{{"checkout_path":"{c}"}}}}
+            ]}}}}"#,
+            a = repo_a.display(),
+            c = repo_c.display(),
+        );
+        let panes = format!(
+            r#"{{"result":{{"panes":[
+                {{"workspace_id":"w2","tab_id":"w2:t1","focused":true,
+                  "foreground_cwd":"{deep}"}}
+            ]}}}}"#,
+            deep = pane_cwd_b.display(),
+        );
+        let herdr = make_fake_herdr_listing(dir.path(), &workspaces, &panes);
+        let choices = load_workspace_choices_with(&herdr).expect("choices load");
+        // w1 keeps its checkout path; w2's pane subdirectory is normalized to
+        // the beta root; w3 (no `.jj` anywhere) is filtered out entirely.
+        let got: Vec<(String, String, String)> = choices
+            .iter()
+            .map(|c| (c.id.clone(), c.label.clone(), c.path.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("w1".into(), "alpha".into(), repo_a.display().to_string()),
+                ("w2".into(), "beta".into(), repo_b.display().to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_choices_are_empty_when_no_workspace_is_a_jj_repo() {
+        let dir = TempDir::new();
+        let plain = dir.path().join("plain");
+        fs::create_dir_all(&plain).expect("create plain dir");
+        let workspaces = format!(
+            r#"{{"result":{{"workspaces":[
+                {{"workspace_id":"w1","label":"plain","active_tab_id":"w1:t1",
+                  "worktree":{{"checkout_path":"{p}"}}}}
+            ]}}}}"#,
+            p = plain.display(),
+        );
+        let herdr = make_fake_herdr_listing(dir.path(), &workspaces, r#"{"result":{"panes":[]}}"#);
+        assert!(
+            load_workspace_choices_with(&herdr)
+                .expect("an all-non-jj herd resolves to an empty choice list")
+                .is_empty()
+        );
     }
 
     /// Writes a fake jj executable that runs `body` and returns a ResolvedJj
     /// pointing at it, for exercising the base-rev resolution chain without
-    /// touching process env.
+    /// touching process env. The file is synced before the spawn: executing a
+    /// freshly written script can otherwise race the kernel's write-open
+    /// tracking and fail with ETXTBSY ("Text file busy", rust-lang/rust
+    /// #114554), especially with concurrent spawns in one test process.
     #[cfg(unix)]
     fn make_fake_jj(dir: &Path, name: &str, body: &str) -> ResolvedJj {
         use std::os::unix::fs::PermissionsExt;
 
         let jj = dir.join(name);
         std::fs::write(&jj, format!("#!/bin/sh\n{body}")).expect("write fake jj");
+        std::fs::File::open(&jj)
+            .and_then(|file| file.sync_all())
+            .expect("sync fake jj");
         std::fs::set_permissions(&jj, std::fs::Permissions::from_mode(0o755))
             .expect("make fake jj executable");
         ResolvedJj {
@@ -3080,6 +3185,12 @@ esac
 "#;
         let bin = dir.join("herdr");
         std::fs::write(&bin, script).expect("write fake herdr");
+        // Sync before spawn: executing a freshly written script can race the
+        // kernel's write-open tracking and fail with ETXTBSY ("Text file
+        // busy", rust-lang/rust #114554).
+        std::fs::File::open(&bin)
+            .and_then(|file| file.sync_all())
+            .expect("sync fake herdr");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
             .expect("make fake herdr executable");
         std::fs::write(dir.join("schedule"), schedule.join("\n")).expect("write schedule");
