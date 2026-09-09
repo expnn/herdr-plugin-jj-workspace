@@ -47,7 +47,8 @@ A [Herdr](https://herdr.dev) plugin to create and remove [Jujutsu](https://jj-vc
 
 The source selector starts on the current workspace with fuzzy search focused.
 Type to filter by workspace label or path, use `↑`/`↓` (including
-`Ctrl+↑`/`Ctrl+↓`) to navigate the matches, and press `Tab` to edit the name.
+`Ctrl+↑`/`Ctrl+↓`) to navigate the matches, and press `Tab` to cycle the
+editable fields (source list → new workspace name → base revision).
 
 Candidates are **jj workspaces only**: a Herdr workspace is listed when its
 path — the workspace root, or the active pane's directory normalized up to
@@ -143,8 +144,8 @@ repository in this order:
 3. **Plugin default** — `[jj] base_rev` in config.toml
 4. Built-in default — `trunk()`
 
-The wizard shows the resolved value in the **base** field (tab to edit) and
-lets you override it per run with any jj revset expression. Typed values are
+The wizard shows the resolved value in the **base** field (press `Tab` to
+reach it) and lets you override it per run with any jj revset expression. Typed values are
 validated against the source repository before the workspace is created
 (`jj log -r <expr> --no-graph --limit 0`), and an invalid expression keeps the
 wizard open with jj's own error message. The same resolved revision is used
