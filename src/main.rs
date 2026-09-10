@@ -276,6 +276,11 @@ impl<'de> Deserialize<'de> for JjCommandValue {
 struct AgentConfig {
     command: String,
     bootstrap_paths: Vec<String>,
+    /// Additive extension to `bootstrap_paths`: entries are appended to the
+    /// resolved base list (explicit value, or the 34-item built-in default),
+    /// order-preserving deduplicated. Absent key = empty vec, so old configs
+    /// keep parsing byte-for-byte identically.
+    extend_bootstrap_paths: Vec<String>,
     /// `false` (default): never auto-answer any agent prompt; a blocked agent
     /// is surfaced as a toast. `true`: auto-press Enter ONLY for a codex
     /// trust prompt inside the startup window (see `trust_window_secs`).
@@ -316,11 +321,35 @@ impl Default for AgentConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            extend_bootstrap_paths: Vec::new(),
             auto_trust: false,
             trust_window_secs: 10,
             startup_timeout_secs: 20,
             poll_interval_ms: 200,
         }
+    }
+}
+
+impl AgentConfig {
+    /// The effective materialization list: the resolved `bootstrap_paths`
+    /// (explicit value, or the 34-item built-in default) followed by
+    /// `extend_bootstrap_paths` entries, deduplicated order-preserving —
+    /// base items keep their position, already-present extend entries are
+    /// skipped, and the remaining extend entries append in order.
+    fn effective_bootstrap_paths(&self) -> Vec<String> {
+        let mut effective = Vec::with_capacity(
+            self.bootstrap_paths.len() + self.extend_bootstrap_paths.len(),
+        );
+        for path in self
+            .bootstrap_paths
+            .iter()
+            .chain(self.extend_bootstrap_paths.iter())
+        {
+            if !effective.contains(path) {
+                effective.push(path.clone());
+            }
+        }
+        effective
     }
 }
 
@@ -410,6 +439,13 @@ impl Config {
         for (index, path) in self.agent.bootstrap_paths.iter().enumerate() {
             if path.is_empty() {
                 return Err(ConfigError::Empty(format!("agent.bootstrap_paths[{index}]")));
+            }
+        }
+        for (index, path) in self.agent.extend_bootstrap_paths.iter().enumerate() {
+            if path.is_empty() {
+                return Err(ConfigError::Empty(format!(
+                    "agent.extend_bootstrap_paths[{index}]"
+                )));
             }
         }
         for (key, value, minimum) in [
@@ -831,8 +867,8 @@ fn cmd_wizard() -> ! {
         .current_dir(&dest)
         .args(&jj.extra_args)
         .args(["sparse", "set", "--clear"]);
-    for path in &config.agent.bootstrap_paths {
-        bootstrap.args(["--add", path]);
+    for path in config.agent.effective_bootstrap_paths() {
+        bootstrap.arg("--add").arg(path);
     }
     run_or(bootstrap, "materialize agent bootstrap files", fail);
 
@@ -2624,6 +2660,68 @@ mod tests {
         let path = dir.write_config("[agent]\nbootstrap_paths = [\"AGENTS.md\", \"\"]\n");
         let err = load_config_from(&path).expect_err("empty bootstrap path");
         assert!(err.to_string().contains("bootstrap_paths"), "{}", err);
+    }
+
+    #[test]
+    fn config_explicit_empty_bootstrap_paths_is_an_empty_baseline() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[agent]\nbootstrap_paths = []\n");
+        let config = load_config_from(&path).expect("explicit empty list");
+        assert!(config.agent.bootstrap_paths.is_empty());
+        assert!(config.agent.effective_bootstrap_paths().is_empty());
+    }
+
+    #[test]
+    fn config_extend_on_default_appends_to_builtin_list() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[agent]\nextend_bootstrap_paths = [\"docs/AGENTS.md\"]\n");
+        let config = load_config_from(&path).expect("extend on default");
+        let effective = config.agent.effective_bootstrap_paths();
+        assert_eq!(effective.len(), 34 + 1);
+        assert_eq!(effective[..34], AgentConfig::default().bootstrap_paths[..]);
+        assert_eq!(effective[34], "docs/AGENTS.md");
+    }
+
+    #[test]
+    fn config_extend_on_custom_is_a_union() {
+        let dir = TempDir::new();
+        let path = dir.write_config(
+            "[agent]\n\
+             bootstrap_paths = [\"AGENTS.md\", \"CLAUDE.md\"]\n\
+             extend_bootstrap_paths = [\"docs/X.md\"]\n",
+        );
+        let config = load_config_from(&path).expect("extend on custom");
+        assert_eq!(
+            config.agent.effective_bootstrap_paths(),
+            vec!["AGENTS.md", "CLAUDE.md", "docs/X.md"]
+        );
+    }
+
+    #[test]
+    fn config_empty_extend_entry_is_rejected() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[agent]\nextend_bootstrap_paths = [\"AGENTS.md\", \"\"]\n");
+        let err = load_config_from(&path).expect_err("empty extend path");
+        let message = err.to_string();
+        assert!(
+            message.contains("agent.extend_bootstrap_paths[1]") && message.contains("empty"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn config_extend_deduplicates_order_preserving() {
+        let dir = TempDir::new();
+        let path = dir.write_config(
+            "[agent]\n\
+             bootstrap_paths = [\"AGENTS.md\", \"CLAUDE.md\"]\n\
+             extend_bootstrap_paths = [\"CLAUDE.md\", \"docs/X.md\", \"AGENTS.md\"]\n",
+        );
+        let config = load_config_from(&path).expect("dedup extend");
+        assert_eq!(
+            config.agent.effective_bootstrap_paths(),
+            vec!["AGENTS.md", "CLAUDE.md", "docs/X.md"]
+        );
     }
 
     #[test]

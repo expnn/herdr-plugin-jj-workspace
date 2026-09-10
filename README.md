@@ -94,7 +94,8 @@ workspace_root = "~/.herdr/workspaces"    # where new workspaces are checked out
 
 [agent]
 command = "codex"                         # command typed into the left pane to start the agent
-# bootstrap_paths = [...]                 # files materialized at startup (34-entry cross-agent default; see below)
+extend_bootstrap_paths = ["docs/AGENTS.md"]  # your own startup files, appended to the default list
+# bootstrap_paths = [...]                 # full takeover of the startup list (34-entry cross-agent default; see below)
 auto_trust = false                        # auto-press Enter for the codex trust prompt during startup (see below)
 # trust_window_secs = 10                  # window (seconds) in which auto_trust may answer the trust prompt
 # startup_timeout_secs = 20               # wait budget (seconds) for the agent to be detected
@@ -146,7 +147,20 @@ Keys:
   (nested `AGENTS.md`, glob-triggered rules) are already materialized by the
   right pane's full checkout seconds later. The evidence matrix and exclusion
   rationale live in
-  design.md of the `agent-agnostic-bootstrap-paths` openspec change.
+  design.md of the `agent-agnostic-bootstrap-paths` openspec change. 95% of
+  users only need `agent.extend_bootstrap_paths` below — write this key by
+  hand only when you need to **fully take over** the list (for example to
+  exclude default entries); it stays the supported escape hatch.
+- `agent.extend_bootstrap_paths` — your own startup files, appended to the
+  resolved `bootstrap_paths` (your explicit value, or the 34-entry default)
+  via the same `jj sparse set --add ...` mechanism. Paths are repo-relative,
+  same rules as `bootstrap_paths`. Already-present entries are skipped with
+  the base list's order preserved, so the effective list stays clean even if
+  a future default gains one of your entries — the default keeps evolving and
+  your additions ride along. Defaults to `[]` (no additions). To materialize
+  **only** your own files, combine `bootstrap_paths = []` with this key: the
+  explicit empty list clears the baseline, so the startup step materializes
+  just what you listed (whitelist mode).
 
 ### Choosing the base revision
 
