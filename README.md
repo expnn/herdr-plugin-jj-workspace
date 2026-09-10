@@ -58,12 +58,14 @@ out at the root. When no workspace is a jj repository, the wizard opens with
 an empty state instead of a list.
 
 The plugin creates an empty sparse checkout from the resolved base revision
-(`trunk()` by default), materializes only Codex's startup instructions, and
-opens its tab. The right terminal then runs `scripts/setup-workspace.sh` (a
-plain POSIX shell script shipped with the plugin — `cat` it any time to see
-exactly what it does): it materializes the full checkout, creates the
-bookmark, runs `jj git fetch`, and rebases the new working-copy commit onto
-the base revision while Codex starts on the left.
+(`trunk()` by default), materializes the coding agent's startup files (a
+cross-agent default covering 15 mainstream agents — see
+`agent.bootstrap_paths` below), and opens its tab. The right terminal then
+runs `scripts/setup-workspace.sh` (a plain POSIX shell script shipped with
+the plugin — `cat` it any time to see exactly what it does): it materializes
+the full checkout, creates the bookmark, runs `jj git fetch`, and rebases the
+new working-copy commit onto the base revision while the agent starts on the
+left.
 
 The setup script runs under `/bin/sh`, so it works no matter which interactive
 shell your Herdr panes use (fish, bash, zsh, and other POSIX shells).
@@ -92,7 +94,7 @@ workspace_root = "~/.herdr/workspaces"    # where new workspaces are checked out
 
 [agent]
 command = "codex"                         # command typed into the left pane to start the agent
-bootstrap_paths = ["AGENTS.md", "AGENTS.override.md", ".codex", ".agents"]
+# bootstrap_paths = [...]                 # files materialized at startup (34-entry cross-agent default; see below)
 auto_trust = false                        # auto-press Enter for the codex trust prompt during startup (see below)
 # trust_window_secs = 10                  # window (seconds) in which auto_trust may answer the trust prompt
 # startup_timeout_secs = 20               # wait budget (seconds) for the agent to be detected
@@ -129,7 +131,22 @@ Keys:
   `jj sparse set --clear --add ...`. Paths are repo-relative (no `~`
   expansion) and shared across all agent types. Nonexistent paths are silently
   skipped by jj; they persist in the sparse pattern list, so if the repository
-  later gains a file matching one, it is materialized automatically.
+  later gains a file matching one, it is materialized automatically. The
+  built-in default is a 34-entry cross-agent union — the startup files and
+  directories (per official docs) of 15 mainstream coding agents: root
+  instruction files (`AGENTS.md`, `AGENT.md`, `AGENTS.override.md`,
+  `CLAUDE.md`, `CLAUDE.local.md`, `GEMINI.md`, `QWEN.md`, `CRUSH.md`), root
+  tool-specific files (`.mcp.json`, `opencode.json`, `opencode.jsonc`,
+  `.cursorrules`, `.windsurfrules`, `.goosehints`, `.augment-guidelines`,
+  `.github/copilot-instructions.md`), and directories (`.agents`, `.claude`,
+  `.codex`, `.cursor`, `.gemini`, `.qwen`, `.opencode`, `.windsurf`,
+  `.devin`, `.clinerules`, `.cline`, `.kilo`, `.kilocode`, `.augment`,
+  `.continue`, `.github/instructions`, `.crush`, `.goose`). It covers only
+  startup-time synchronous reads: files agents load lazily during a session
+  (nested `AGENTS.md`, glob-triggered rules) are already materialized by the
+  right pane's full checkout seconds later. The evidence matrix and exclusion
+  rationale live in
+  design.md of the `agent-agnostic-bootstrap-paths` openspec change.
 
 ### Choosing the base revision
 

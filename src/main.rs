@@ -144,7 +144,53 @@ fn apply_name_key(name: &mut String, state: &mut NameEditState, key: NameKey) {
     }
 }
 
-const DEFAULT_BOOTSTRAP_PATHS: [&str; 4] = ["AGENTS.md", "AGENTS.override.md", ".codex", ".agents"];
+// Default repo-relative paths materialized in each new sparse checkout so
+// the coding agent finds its startup instructions before the right pane's
+// full materialization lands seconds later. Union of the startup-time
+// (synchronous) reads of 15 mainstream coding agents, per official docs —
+// evidence matrix and exclusion list in design.md of the
+// agent-agnostic-bootstrap-paths openspec change.
+// Paths missing from a repo are silently skipped by jj sparse and stay in
+// the pattern list (auto-materialized if the repo later gains a match).
+const DEFAULT_BOOTSTRAP_PATHS: [&str; 34] = [
+    // Root instruction files.
+    "AGENTS.md",
+    "AGENT.md",
+    "AGENTS.override.md",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "GEMINI.md",
+    "QWEN.md",
+    "CRUSH.md",
+    // Root tool-specific files.
+    ".mcp.json",
+    "opencode.json",
+    "opencode.jsonc",
+    ".cursorrules",
+    ".windsurfrules",
+    ".goosehints",
+    ".augment-guidelines",
+    ".github/copilot-instructions.md",
+    // Directories.
+    ".agents",
+    ".claude",
+    ".codex",
+    ".cursor",
+    ".gemini",
+    ".qwen",
+    ".opencode",
+    ".windsurf",
+    ".devin",
+    ".clinerules",
+    ".cline",
+    ".kilo",
+    ".kilocode",
+    ".augment",
+    ".continue",
+    ".github/instructions",
+    ".crush",
+    ".goose",
+];
 
 // --- plugin config ---------------------------------------------------------
 //
@@ -2466,9 +2512,46 @@ mod tests {
         assert_eq!(config.jj.base_rev, "trunk()");
         assert_eq!(config.jj.workspace_root, "~/.herdr/workspaces");
         assert_eq!(config.agent.command, "codex");
+        // Pin the full 34-item default: any change to the default bootstrap
+        // list must consciously update this literal (and the [..; 34] count).
         assert_eq!(
             config.agent.bootstrap_paths,
-            vec!["AGENTS.md", "AGENTS.override.md", ".codex", ".agents"]
+            vec![
+                "AGENTS.md",
+                "AGENT.md",
+                "AGENTS.override.md",
+                "CLAUDE.md",
+                "CLAUDE.local.md",
+                "GEMINI.md",
+                "QWEN.md",
+                "CRUSH.md",
+                ".mcp.json",
+                "opencode.json",
+                "opencode.jsonc",
+                ".cursorrules",
+                ".windsurfrules",
+                ".goosehints",
+                ".augment-guidelines",
+                ".github/copilot-instructions.md",
+                ".agents",
+                ".claude",
+                ".codex",
+                ".cursor",
+                ".gemini",
+                ".qwen",
+                ".opencode",
+                ".windsurf",
+                ".devin",
+                ".clinerules",
+                ".cline",
+                ".kilo",
+                ".kilocode",
+                ".augment",
+                ".continue",
+                ".github/instructions",
+                ".crush",
+                ".goose",
+            ]
         );
     }
 
