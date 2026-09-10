@@ -7,8 +7,10 @@
 #
 # Run from the new workspace directory (the pane's cwd). Steps:
 #   1. launch the finish-tab watcher in the background: it waits for the
-#      coding agent in the left pane, accepts Codex's trust prompt, and pulls
-#      focus to the new workspace. Failure here does not affect the checkout.
+#      coding agent in the left pane, optionally auto-answers the codex trust
+#      prompt (only when agent.auto_trust is enabled in config.toml, codex
+#      only, within the startup window), and pulls focus to the new workspace.
+#      Failure here does not affect the checkout.
 #   2. materialize the full checkout:  jj sparse set --clear --add .
 #   3. create the workspace bookmark:  jj bookmark create <name> -r @
 #      (failure is a warning only — the workspace still exists)

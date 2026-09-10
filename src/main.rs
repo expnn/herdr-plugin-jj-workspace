@@ -316,7 +316,7 @@ impl Default for JjConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         AgentConfig {
-            command: "codex".into(),
+            command: "opencode".into(),
             bootstrap_paths: DEFAULT_BOOTSTRAP_PATHS
                 .iter()
                 .map(|s| s.to_string())
@@ -757,7 +757,7 @@ fn cmd_open(_mode: &str) -> ! {
 }
 
 /// Pane (interactive TTY): select a source workspace and name, then create the
-/// Codex-left / terminal-right Herdr workspace.
+/// agent-left / terminal-right Herdr workspace.
 fn cmd_wizard() -> ! {
     let config = match load_config() {
         Ok(config) => config,
@@ -1102,13 +1102,13 @@ fn open_tab_layout(
 
     // Give checkout materialization a head start, then launch the coding
     // agent without changing focus away from the left pane. The start command
-    // comes from `agent.command` (default "codex"): panes run the user's
+    // comes from `agent.command` (default "opencode"): panes run the user's
     // shell, where agent launch aliases vary between setups and cannot be
     // assumed.
     let start_command = resolve_start_command(&config.agent);
-    let mut start_codex = Command::new(&herdr);
-    start_codex.args(["pane", "run", &left_pane, &start_command]);
-    run_or(start_codex, "start agent in left pane", fail);
+    let mut start_agent = Command::new(&herdr);
+    start_agent.args(["pane", "run", &left_pane, &start_command]);
+    run_or(start_agent, "start agent in left pane", fail);
 }
 
 /// Plugin root directory: `HERDR_PLUGIN_ROOT` when injected, else derived from
@@ -2180,7 +2180,7 @@ fn plugin_id() -> String {
     env::var("HERDR_PLUGIN_ID")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "nathanflurry.jj-workspace".into())
+        .unwrap_or_else(|| "expnn.jj-workspace".into())
 }
 
 /// Walk `path` and its ancestors for a `.jj` marker (file or directory) and
@@ -2547,7 +2547,7 @@ mod tests {
         assert_eq!(config, Config::default());
         assert_eq!(config.jj.base_rev, "trunk()");
         assert_eq!(config.jj.workspace_root, "~/.herdr/workspaces");
-        assert_eq!(config.agent.command, "codex");
+        assert_eq!(config.agent.command, "opencode");
         // Pin the full 34-item default: any change to the default bootstrap
         // list must consciously update this literal (and the [..; 34] count).
         assert_eq!(
@@ -2915,8 +2915,8 @@ mod tests {
     }
 
     #[test]
-    fn start_command_defaults_to_codex_when_unset() {
-        assert_eq!(resolve_start_command(&AgentConfig::default()), "codex");
+    fn command_defaults_to_opencode_when_unset() {
+        assert_eq!(resolve_start_command(&AgentConfig::default()), "opencode");
     }
 
     #[test]

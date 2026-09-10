@@ -1,6 +1,6 @@
 # jj workspaces
 
-A [Herdr](https://herdr.dev) plugin to create and remove [Jujutsu](https://jj-vcs.github.io/jj/) (`jj`) workspaces with one keypress. New tabs open with Codex on the left and an interactive terminal on the right.
+A [Herdr](https://herdr.dev) plugin to create and remove [Jujutsu](https://jj-vcs.github.io/jj/) (`jj`) workspaces with one keypress. New tabs open with your coding agent on the left and an interactive terminal on the right.
 
 ## Install
 
@@ -24,19 +24,19 @@ A [Herdr](https://herdr.dev) plugin to create and remove [Jujutsu](https://jj-vc
    [[keys.command]]
    key = "prefix+a"
    type = "plugin_action"
-   command = "nathanflurry.jj-workspace.new-tab"
+   command = "expnn.jj-workspace.new-tab"
    description = "new jj workspace"
 
    [[keys.command]]
    key = "prefix+shift+a"
    type = "plugin_action"
-   command = "nathanflurry.jj-workspace.new"
+   command = "expnn.jj-workspace.new"
    description = "new jj workspace"
 
    [[keys.command]]
    key = "prefix+d"
    type = "plugin_action"
-   command = "nathanflurry.jj-workspace.remove"
+   command = "expnn.jj-workspace.remove"
    description = "remove jj workspace"
    ```
 
@@ -75,7 +75,7 @@ shell your Herdr panes use (fish, bash, zsh, and other POSIX shells).
 Optional plugin settings live in `config.toml` in the plugin config directory:
 
 ```sh
-herdr plugin config-dir nathanflurry.jj-workspace
+herdr plugin config-dir expnn.jj-workspace
 ```
 
 The plugin reads **only** `config.toml` from that directory — process
@@ -93,7 +93,7 @@ workspace_root = "~/.herdr/workspaces"    # where new workspaces are checked out
 # command = "jj"                          # jj executable: bare name (PATH lookup), absolute path, or argv list
 
 [agent]
-command = "codex"                         # command typed into the left pane to start the agent
+command = "opencode"                      # command typed into the left pane to start the agent
 extend_bootstrap_paths = ["docs/AGENTS.md"]  # your own startup files, appended to the default list
 # bootstrap_paths = [...]                 # full takeover of the startup list (34-entry cross-agent default; see below)
 auto_trust = false                        # auto-press Enter for the codex trust prompt during startup (see below)
@@ -123,10 +123,10 @@ Keys:
   If resolution fails the plugin refuses to run, listing the searched `PATH`
   directories.
 - `agent.command` — command typed into the left pane to start the coding agent.
-  Defaults to `codex`. The value is injected into the pane's **interactive
+  Defaults to `opencode`. The value is injected into the pane's **interactive
   shell** via `herdr pane run`, so shell aliases, functions, and `$VAR`
   expansion all work — set it to whatever your shell resolves (for example
-  `"opencode"` or `"codex --full-auto"`). It is a single string; array form is
+  `"codex"` or `"codex --full-auto"`). It is a single string; array form is
   not supported.
 - `agent.bootstrap_paths` — files materialized in each new sparse checkout via
   `jj sparse set --clear --add ...`. Paths are repo-relative (no `~`
@@ -254,7 +254,7 @@ could find `jj` just fine.
 
 **`permission denied: scripts/setup-workspace.sh`** — the shipped setup script
 lost its executable bit (uncommon install). Re-apply it:
-`chmod +x "$(herdr plugin config-dir nathanflurry.jj-workspace)/../scripts/setup-workspace.sh"`
+`chmod +x "$(herdr plugin config-dir expnn.jj-workspace)/../scripts/setup-workspace.sh"`
 or run `herdr plugin install` again. The pane command also works if invoked as
 `sh <script> …` as a fallback.
 
@@ -267,7 +267,7 @@ again.
 **Where to find full error details** — toasts are short-lived and truncated
 by Herdr (240 chars, single line, a few seconds). Every plugin error is also
 appended with a UTC timestamp to
-`~/.local/state/herdr/plugins/nathanflurry.jj-workspace/error.log`
+`~/.local/state/herdr/plugins/expnn.jj-workspace/error.log`
 (`$HERDR_PLUGIN_STATE_DIR/error.log`; `$XDG_STATE_HOME` overrides the
 `~/.local/state` prefix). `cat` that file to copy and inspect the full
 message.

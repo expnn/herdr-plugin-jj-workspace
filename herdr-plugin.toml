@@ -2,7 +2,7 @@ id = "expnn.jj-workspace"
 name = "jj workspaces"
 version = "0.5.0"
 min_herdr_version = "0.7.0"
-description = "Create jj workspaces with Codex on the left and a terminal on the right."
+description = "Create jj workspaces with your coding agent on the left and a terminal on the right."
 platforms = ["linux", "macos"]
 
 # Built at install time (needs cargo). `plugin link` does not build, so local
