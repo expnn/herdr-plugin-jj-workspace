@@ -221,6 +221,19 @@ file pointer into the main workspace's store, so:
   with uncommitted changes is refused: commits and bookmarks are safe in the
   shared store, but materialized uncommitted changes would be lost.
 
+### Removing a workspace and opencode sessions
+
+Before deleting anything, `remove` migrates opencode sessions bound to the
+workspace (its root and subdirectories) back to the main repo, so their
+conversation history stays visible and resumable there. The migration is
+fail-closed: if opencode's database cannot be read, its schema changed in an
+unexpected way, or the main repo's opencode project id cannot be resolved,
+the plugin refuses to remove the workspace — nothing is forgotten, deleted or
+closed, and the message says what to fix (typically: open opencode in the
+main repo once, then retry). When opencode is not installed, or no session is
+bound to the workspace, the step is silently skipped and removal proceeds as
+usual.
+
 ### Migrating from `.env`
 
 | `.env` key          | `config.toml` key      |

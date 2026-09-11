@@ -11,6 +11,9 @@ crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Bundled sqlite3: the migration must not depend on system libsqlite3/dev
+# headers being installed on the machine running the plugin.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [profile.release]
 opt-level = "z"

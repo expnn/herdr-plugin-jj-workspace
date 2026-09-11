@@ -36,6 +36,8 @@ use ratatui::{
 use serde::Deserialize;
 use serde_json::Value;
 
+mod opencode_migration;
+
 #[derive(Clone, Debug)]
 struct WorkspaceChoice {
     id: String,
@@ -337,9 +339,8 @@ impl AgentConfig {
     /// base items keep their position, already-present extend entries are
     /// skipped, and the remaining extend entries append in order.
     fn effective_bootstrap_paths(&self) -> Vec<String> {
-        let mut effective = Vec::with_capacity(
-            self.bootstrap_paths.len() + self.extend_bootstrap_paths.len(),
-        );
+        let mut effective =
+            Vec::with_capacity(self.bootstrap_paths.len() + self.extend_bootstrap_paths.len());
         for path in self
             .bootstrap_paths
             .iter()
@@ -405,8 +406,8 @@ fn load_config_from(path: &Path) -> Result<Config, ConfigError> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(err) => return Err(ConfigError::Io(err.to_string())),
     };
-    let config: Config = toml::from_str(&content)
-        .map_err(|err| ConfigError::Parse(err.to_string()))?;
+    let config: Config =
+        toml::from_str(&content).map_err(|err| ConfigError::Parse(err.to_string()))?;
     config.validate()
 }
 
@@ -438,7 +439,9 @@ impl Config {
         }
         for (index, path) in self.agent.bootstrap_paths.iter().enumerate() {
             if path.is_empty() {
-                return Err(ConfigError::Empty(format!("agent.bootstrap_paths[{index}]")));
+                return Err(ConfigError::Empty(format!(
+                    "agent.bootstrap_paths[{index}]"
+                )));
             }
         }
         for (index, path) in self.agent.extend_bootstrap_paths.iter().enumerate() {
@@ -523,7 +526,11 @@ impl std::fmt::Display for ResolveError {
                      Run `which jj` in your shell and write the result into `jj.command` in config.toml"
                 )
             }
-            ResolveError::BadAbsolutePath { origin, path, reason } => {
+            ResolveError::BadAbsolutePath {
+                origin,
+                path,
+                reason,
+            } => {
                 write!(f, "{origin}: {path} {reason} (expected an executable file)")
             }
             ResolveError::RelativePath { origin, value } => write!(
@@ -556,7 +563,9 @@ fn resolve_jj_command(
 ) -> Result<ResolvedJj, ResolveError> {
     let (head, extra_args, origin) = match value {
         JjCommandValue::Single(value) => (value.clone(), Vec::new(), "jj.command"),
-        JjCommandValue::Argv(items) => (items[0].clone(), items[1..].to_vec(), "jj.command argv[0]"),
+        JjCommandValue::Argv(items) => {
+            (items[0].clone(), items[1..].to_vec(), "jj.command argv[0]")
+        }
     };
     let home = env::var("HOME").ok();
     resolve_jj_head(&head, extra_args, origin, home.as_deref(), path_dirs)
@@ -701,10 +710,15 @@ fn wizard_final_base_rev(
 /// jj's native message into the wizard error line.
 fn validate_revset(jj: &ResolvedJj, repo: &Path, value: &str) -> Result<(), String> {
     let mut validate = Command::new(&jj.executable);
-    validate
-        .current_dir(repo)
-        .args(&jj.extra_args)
-        .args(["log", "-r", value, "--no-graph", "--limit", "0", "--no-pager"]);
+    validate.current_dir(repo).args(&jj.extra_args).args([
+        "log",
+        "-r",
+        value,
+        "--no-graph",
+        "--limit",
+        "0",
+        "--no-pager",
+    ]);
     match validate.output() {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => {
@@ -847,19 +861,17 @@ fn cmd_wizard() -> ! {
         selection.name
     );
     let mut add = Command::new(&jj.executable);
-    add.current_dir(&repo)
-        .args(&jj.extra_args)
-        .args([
-            "workspace",
-            "add",
-            "--name",
-            &selection.name,
-            "-r",
-            base,
-            "--sparse-patterns",
-            "empty",
-            &dest,
-        ]);
+    add.current_dir(&repo).args(&jj.extra_args).args([
+        "workspace",
+        "add",
+        "--name",
+        &selection.name,
+        "-r",
+        base,
+        "--sparse-patterns",
+        "empty",
+        &dest,
+    ]);
     run_or(add, "jj workspace add", fail);
 
     let mut bootstrap = Command::new(&jj.executable);
@@ -1290,7 +1302,11 @@ fn cmd_finish_tab(args: &[String]) -> ! {
     match wait_for_agent_ready(&config.agent, &herdr, left_pane) {
         AgentWaitOutcome::Ready { .. } => {}
         AgentWaitOutcome::NeedsAttention { label } => {
-            agent_attention_toast(&herdr, &label, &format!("{label} is waiting for your input."));
+            agent_attention_toast(
+                &herdr,
+                &label,
+                &format!("{label} is waiting for your input."),
+            );
             process::exit(1);
         }
         AgentWaitOutcome::NotDetected => {
@@ -1308,7 +1324,9 @@ fn cmd_finish_tab(args: &[String]) -> ! {
             .args(["workspace", "focus", workspace_id])
             .status();
         let _ = Command::new(&herdr).args(["tab", "focus", tab_id]).status();
-        let _ = Command::new(&herdr).args(["agent", "focus", left_pane]).status();
+        let _ = Command::new(&herdr)
+            .args(["agent", "focus", left_pane])
+            .status();
         thread::sleep(Duration::from_millis(200));
     }
     process::exit(0);
@@ -1330,6 +1348,32 @@ fn agent_attention_toast(herdr: &str, label: &str, body: &str) {
         "request",
     ]);
     let _ = toast.status();
+}
+
+/// Positive counterpart to `die`'s toast: report a completed opencode
+/// session migration. Herdr caps titles at 80 and bodies at 240 chars, so
+/// the body is truncated with an ellipsis when the main repo path is long.
+fn migrated_toast(count: usize, main_repo: &Path) {
+    let text = format!(
+        "migrated {count} opencode session(s) to {}",
+        main_repo.display()
+    );
+    let body = if text.chars().count() > 240 {
+        text.chars().take(239).collect::<String>() + "…"
+    } else {
+        text
+    };
+    let _ = Command::new(herdr_bin())
+        .args([
+            "notification",
+            "show",
+            "opencode sessions migrated",
+            "--body",
+            &body,
+            "--position",
+            "top-right",
+        ])
+        .status();
 }
 
 /// Refuse to remove a workspace that still has uncommitted changes. Verified
@@ -1422,6 +1466,27 @@ fn cmd_remove() -> ! {
     }
     // Refuse dirty workspaces before anything destructive happens.
     check_remove_clean(&jj, &canon).unwrap_or_else(|message| die(&message));
+
+    // Migrate opencode sessions bound to this workspace (root or
+    // subdirectories) to the main repo before the directory disappears —
+    // opencode keys sessions by directory. Fail-closed like the clean check:
+    // a refused migration aborts the whole removal with nothing forgotten,
+    // deleted or closed (design D9).
+    let main_repo = opencode_migration::resolve_main_repo(&canon).unwrap_or_else(|| {
+        die(&format!(
+            "cannot resolve the main repo for this workspace (refusing to remove)\n\
+             the .jj/repo pointer is missing, unreadable, or points at the workspace itself\n\
+             workspace path: {}",
+            canon.display()
+        ))
+    });
+    match opencode_migration::migrate_opencode_sessions(&canon, &main_repo) {
+        opencode_migration::Outcome::Skipped(_reason) => {}
+        opencode_migration::Outcome::Refused(message) => die(&message),
+        opencode_migration::Outcome::Migrated { count, main_repo } => {
+            migrated_toast(count, &main_repo);
+        }
+    }
 
     let mut forget = Command::new(&jj.executable);
     forget
@@ -1577,8 +1642,7 @@ fn run_workspace_wizard(
                     }
                     let checkout = workspace_destination(root, &source.path, &name);
                     if checkout.exists() {
-                        error =
-                            Some(format!("checkout already exists: {}", checkout.display()));
+                        error = Some(format!("checkout already exists: {}", checkout.display()));
                         continue;
                     }
                     // Candidates are guaranteed jj workspaces (jj-only filter
@@ -1768,7 +1832,10 @@ fn section_title_style(focused: bool, p: &Palette) -> Style {
 }
 
 fn render_section_title(frame: &mut Frame, area: Rect, title: &str, focused: bool, p: &Palette) {
-    frame.render_widget(Paragraph::new(title).style(section_title_style(focused, p)), area);
+    frame.render_widget(
+        Paragraph::new(title).style(section_title_style(focused, p)),
+        area,
+    );
 }
 
 /// Top-of-modal static hint line shown in the normal state. The zero-candidate
@@ -1824,13 +1891,16 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         );
         y += 1;
         frame.render_widget(
-            Paragraph::new(format!("{pad}no jj workspaces — open herdr's project picker instead"))
-                .style(Style::default().fg(p.overlay0)),
+            Paragraph::new(format!(
+                "{pad}no jj workspaces — open herdr's project picker instead"
+            ))
+            .style(Style::default().fg(p.overlay0)),
             Rect::new(inner.x, y, inner.width, 1),
         );
         y += 1;
         frame.render_widget(
-            Paragraph::new(format!("{pad}press esc to close")).style(Style::default().fg(p.overlay0)),
+            Paragraph::new(format!("{pad}press esc to close"))
+                .style(Style::default().fg(p.overlay0)),
             Rect::new(inner.x, y, inner.width, 1),
         );
         return;
@@ -1921,7 +1991,11 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         &p,
     );
     y += 1;
-    let name_cursor = if field == WizardField::Name { "█" } else { "" };
+    let name_cursor = if field == WizardField::Name {
+        "█"
+    } else {
+        ""
+    };
     frame.render_widget(
         Paragraph::new(format!("{pad}{name}{name_cursor}"))
             .style(Style::default().fg(p.text).bg(p.surface0)),
@@ -1939,7 +2013,11 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         &p,
     );
     y += 1;
-    let base_cursor = if field == WizardField::Base { "█" } else { "" };
+    let base_cursor = if field == WizardField::Base {
+        "█"
+    } else {
+        ""
+    };
     frame.render_widget(
         Paragraph::new(format!("{pad}{base}{base_cursor}"))
             .style(Style::default().fg(p.text).bg(p.surface0)),
@@ -2308,8 +2386,7 @@ fn die(message: &str) -> ! {
 fn log_error(message: &str) -> Option<String> {
     let dir = env::var_os("HERDR_PLUGIN_STATE_DIR")?;
     let path = PathBuf::from(dir).join("error.log");
-    append_error_log(&path, message)
-        .then(|| path.display().to_string())
+    append_error_log(&path, message).then(|| path.display().to_string())
 }
 
 /// Append the message to `error.log` as ONE line: `[UTC timestamp] message`
@@ -2616,7 +2693,10 @@ mod tests {
         let config = load_config_from(&path).expect("partial config");
         assert_eq!(config.jj, JjConfig::default());
         assert_eq!(config.agent.command, "opencode");
-        assert_eq!(config.agent.bootstrap_paths, AgentConfig::default().bootstrap_paths);
+        assert_eq!(
+            config.agent.bootstrap_paths,
+            AgentConfig::default().bootstrap_paths
+        );
     }
 
     #[test]
@@ -2651,7 +2731,10 @@ mod tests {
         let path = dir.write_config("[agent]\ncommand = \"\"\n");
         let err = load_config_from(&path).expect_err("empty command");
         let message = err.to_string();
-        assert!(message.contains("agent.command") && message.contains("empty"), "{message}");
+        assert!(
+            message.contains("agent.command") && message.contains("empty"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -2730,7 +2813,10 @@ mod tests {
             expand_tilde_with_home("~/code/workspaces", Some("/home/nathan")),
             "/home/nathan/code/workspaces"
         );
-        assert_eq!(expand_tilde_with_home("/abs/path", Some("/home/nathan")), "/abs/path");
+        assert_eq!(
+            expand_tilde_with_home("/abs/path", Some("/home/nathan")),
+            "/abs/path"
+        );
         assert_eq!(expand_tilde_with_home("~/x", None), "~/x");
     }
 
@@ -2802,11 +2888,8 @@ mod tests {
     fn absolute_path_is_used_as_is() {
         let dir = TempDir::new();
         let path = make_file(dir.path(), "jj", true);
-        let resolved = resolve_jj_command(
-            &JjCommandValue::Single(path.display().to_string()),
-            &[],
-        )
-        .expect("absolute path is validated and used as-is");
+        let resolved = resolve_jj_command(&JjCommandValue::Single(path.display().to_string()), &[])
+            .expect("absolute path is validated and used as-is");
         assert_eq!(resolved.executable, path);
     }
 
@@ -2814,19 +2897,17 @@ mod tests {
     fn absolute_path_must_be_an_executable_file() {
         let dir = TempDir::new();
         let non_exec = make_file(dir.path(), "jj", false);
-        let err = resolve_jj_command(
-            &JjCommandValue::Single(non_exec.display().to_string()),
-            &[],
-        )
-        .expect_err("exists but is not executable");
-        assert!(err.to_string().contains("not an executable file"), "{}", err);
+        let err = resolve_jj_command(&JjCommandValue::Single(non_exec.display().to_string()), &[])
+            .expect_err("exists but is not executable");
+        assert!(
+            err.to_string().contains("not an executable file"),
+            "{}",
+            err
+        );
 
         let missing = dir.path().join("nope");
-        let err = resolve_jj_command(
-            &JjCommandValue::Single(missing.display().to_string()),
-            &[],
-        )
-        .expect_err("missing file");
+        let err = resolve_jj_command(&JjCommandValue::Single(missing.display().to_string()), &[])
+            .expect_err("missing file");
         assert!(err.to_string().contains("does not exist"), "{}", err);
     }
 
@@ -2954,8 +3035,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock before epoch")
             .as_nanos();
-        let root = std::env::temp_dir()
-            .join(format!("jj-workspace-setup-{}-{nanos}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("jj-workspace-setup-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(root.join("scripts")).expect("create scripts dir");
         std::fs::create_dir_all(root.join("target/release")).expect("create target dir");
         std::fs::create_dir_all(root.join("bin")).expect("create bin dir");
@@ -3384,11 +3465,9 @@ mod tests {
             p = plain.display(),
         );
         let herdr = make_fake_herdr_listing(dir.path(), &workspaces, r#"{"result":{"panes":[]}}"#);
-        assert!(
-            load_workspace_choices_with(&herdr)
-                .expect("an all-non-jj herd resolves to an empty choice list")
-                .is_empty()
-        );
+        assert!(load_workspace_choices_with(&herdr)
+            .expect("an all-non-jj herd resolves to an empty choice list")
+            .is_empty());
     }
 
     /// Writes a fake jj executable that runs `body` and returns a ResolvedJj
@@ -3595,7 +3674,10 @@ esac
     #[cfg(unix)]
     fn agent_not_detected_times_out() {
         let (outcome, keys) = run_wait(&["missing"], false, 10, 1, 10);
-        assert!(matches!(outcome, AgentWaitOutcome::NotDetected), "{outcome:?}");
+        assert!(
+            matches!(outcome, AgentWaitOutcome::NotDetected),
+            "{outcome:?}"
+        );
         assert!(keys.is_empty(), "{keys:?}");
     }
 
@@ -3611,8 +3693,7 @@ esac
     #[test]
     #[cfg(unix)]
     fn stable_blocked_fails_with_runtime_label() {
-        let (outcome, keys) =
-            run_wait(&["blocked claude"; 200], false, 10, 3, 10);
+        let (outcome, keys) = run_wait(&["blocked claude"; 200], false, 10, 3, 10);
         assert!(
             matches!(outcome, AgentWaitOutcome::NeedsAttention { ref label } if label == "claude"),
             "{outcome:?}"
@@ -3623,8 +3704,7 @@ esac
     #[test]
     #[cfg(unix)]
     fn auto_trust_off_never_enters() {
-        let (outcome, keys) =
-            run_wait(&["blocked codex"; 200], false, 10, 3, 10);
+        let (outcome, keys) = run_wait(&["blocked codex"; 200], false, 10, 3, 10);
         assert!(
             matches!(outcome, AgentWaitOutcome::NeedsAttention { ref label } if label == "codex"),
             "{outcome:?}"
@@ -3635,8 +3715,7 @@ esac
     #[test]
     #[cfg(unix)]
     fn auto_trust_non_codex_never_enters() {
-        let (outcome, keys) =
-            run_wait(&["blocked claude"; 200], true, 10, 3, 10);
+        let (outcome, keys) = run_wait(&["blocked claude"; 200], true, 10, 3, 10);
         assert!(
             matches!(outcome, AgentWaitOutcome::NeedsAttention { ref label } if label == "claude"),
             "{outcome:?}"
@@ -3655,8 +3734,7 @@ esac
     #[test]
     #[cfg(unix)]
     fn auto_trust_retries_up_to_internal_cap() {
-        let (outcome, keys) =
-            run_wait(&["blocked codex"; 200], true, 10, 3, 10);
+        let (outcome, keys) = run_wait(&["blocked codex"; 200], true, 10, 3, 10);
         assert!(
             matches!(outcome, AgentWaitOutcome::NeedsAttention { ref label } if label == "codex"),
             "{outcome:?}"
@@ -3713,7 +3791,10 @@ esac
 
         let path = dir.write_config("[agent]\nstartup_timeout_secs = 0\n");
         let err = load_config_from(&path).expect_err("zero timeout");
-        assert!(err.to_string().contains("agent.startup_timeout_secs"), "{err}");
+        assert!(
+            err.to_string().contains("agent.startup_timeout_secs"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3729,8 +3810,7 @@ esac
     fn remove_dirty_workspace_is_refused_with_guidance() {
         let dir = TempDir::new();
         let jj = make_fake_jj(dir.path(), "jj", "echo 'A new-file.txt'\n");
-        let err = check_remove_clean(&jj, dir.path())
-            .expect_err("dirty workspace must be refused");
+        let err = check_remove_clean(&jj, dir.path()).expect_err("dirty workspace must be refused");
         assert!(err.contains("uncommitted changes"), "{err}");
         assert!(err.contains("bookmarks are safe"), "{err}");
         assert!(err.contains("`jj commit`"), "{err}");
@@ -3754,8 +3834,8 @@ esac
     fn remove_check_failure_is_fail_closed() {
         let dir = TempDir::new();
         let jj = make_fake_jj(dir.path(), "jj", "exit 3\n");
-        let err = check_remove_clean(&jj, dir.path())
-            .expect_err("a failed check must refuse, not pass");
+        let err =
+            check_remove_clean(&jj, dir.path()).expect_err("a failed check must refuse, not pass");
         assert!(err.contains("cannot check"), "{err}");
         assert!(err.contains("refusing to remove"), "{err}");
     }
@@ -3797,9 +3877,15 @@ esac
         let lines: Vec<&str> = content.lines().collect();
         // One line per entry: [timestamp] message.
         assert_eq!(lines.len(), 2, "{content}");
-        assert!(lines[0].starts_with('[') && lines[0].contains("UTC"), "{content}");
+        assert!(
+            lines[0].starts_with('[') && lines[0].contains("UTC"),
+            "{content}"
+        );
         assert!(lines[0].ends_with("first failure"), "{content}");
-        assert!(lines[1].starts_with('[') && lines[1].contains("UTC"), "{content}");
+        assert!(
+            lines[1].starts_with('[') && lines[1].contains("UTC"),
+            "{content}"
+        );
         assert!(lines[1].ends_with("second failure"), "{content}");
     }
 
@@ -3827,9 +3913,15 @@ esac
         assert_eq!(format_unix_timestamp(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(format_unix_timestamp(86_400), "1970-01-02 00:00:00 UTC");
         // 2026-09-09 00:00:00 UTC = 1788912000.
-        assert_eq!(format_unix_timestamp(1_788_912_000), "2026-09-09 00:00:00 UTC");
+        assert_eq!(
+            format_unix_timestamp(1_788_912_000),
+            "2026-09-09 00:00:00 UTC"
+        );
         // Leap-year day: 2024-02-29 12:34:56 UTC = 1709210096.
-        assert_eq!(format_unix_timestamp(1_709_210_096), "2024-02-29 12:34:56 UTC");
+        assert_eq!(
+            format_unix_timestamp(1_709_210_096),
+            "2024-02-29 12:34:56 UTC"
+        );
     }
 
     // --- wizard render tests --------------------------------------------
@@ -3954,7 +4046,10 @@ esac
         let source_y = source[0];
         let query_y = source_y + 1;
         let query_line = line_text(&buffer, query_y);
-        assert!(query_line.contains("   filter…"), "placeholder: {query_line:?}");
+        assert!(
+            query_line.contains("   filter…"),
+            "placeholder: {query_line:?}"
+        );
         let list_y = query_y + 1;
         let list_line = line_text(&buffer, list_y);
         assert!(list_line.contains("▸  alpha "), "active row: {list_line:?}");
@@ -3964,9 +4059,15 @@ esac
         );
         // name value, base value, checkout path all start with the 3-space pad.
         let name_value_y = name[0] + 1;
-        assert!(line_text(&buffer, name_value_y).contains("   ws/alpha"), "name value indent");
+        assert!(
+            line_text(&buffer, name_value_y).contains("   ws/alpha"),
+            "name value indent"
+        );
         let base_value_y = base[0] + 1;
-        assert!(line_text(&buffer, base_value_y).contains("   trunk()"), "base value indent");
+        assert!(
+            line_text(&buffer, base_value_y).contains("   trunk()"),
+            "base value indent"
+        );
         let checkout_value_y = checkout[0] + 1;
         assert!(
             line_text(&buffer, checkout_value_y).contains("   "),
@@ -4025,8 +4126,11 @@ esac
 
         assert_eq!(lines_containing(&buffer, "Source Workspace").len(), 1);
         assert!(
-            lines_containing(&buffer, "no jj workspaces — open herdr's project picker instead")
-                .len()
+            lines_containing(
+                &buffer,
+                "no jj workspaces — open herdr's project picker instead"
+            )
+            .len()
                 == 1
         );
         assert!(lines_containing(&buffer, "New Workspace Name").is_empty());
