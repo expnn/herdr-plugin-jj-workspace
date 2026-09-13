@@ -38,29 +38,28 @@ use serde_json::Value;
 
 mod opencode_migration;
 
+/// The wizard's single resolved source: the caller's focused pane directory
+/// normalized to the main repository root, plus the caller's workspace id
+/// (the landing workspace of the new tab).
 #[derive(Clone, Debug)]
-struct WorkspaceChoice {
+struct WorkspaceSource {
     id: String,
-    label: String,
     path: String,
 }
 
 struct WizardResult {
-    source: WorkspaceChoice,
+    source: WorkspaceSource,
     name: String,
     /// The base revision for workspace creation: the resolution-chain value
-    /// evaluated for the finally selected source, or the user-edited revset
-    /// (validated) when the base field was touched.
+    /// evaluated for the single source, or the user-edited revset (validated)
+    /// when the base field was touched.
     base_rev: String,
 }
 
 #[derive(Clone, Copy)]
 struct WizardView<'a> {
-    choices: &'a [WorkspaceChoice],
-    filtered: &'a [usize],
-    selected: usize,
+    source: &'a str,
     field: WizardField,
-    query: &'a str,
     name: &'a str,
     base: &'a str,
     root: &'a Path,
@@ -69,17 +68,15 @@ struct WizardView<'a> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WizardField {
-    WorkspaceSearch,
     Name,
     Base,
 }
 
-/// Tab/BackTab cycle order of the wizard's editable fields.
+/// Tab/BackTab cycle order of the wizard's editable fields: Name ↔ Base.
 fn next_wizard_field(field: WizardField) -> WizardField {
     match field {
-        WizardField::WorkspaceSearch => WizardField::Name,
         WizardField::Name => WizardField::Base,
-        WizardField::Base => WizardField::WorkspaceSearch,
+        WizardField::Base => WizardField::Name,
     }
 }
 
@@ -677,12 +674,12 @@ fn resolve_base_rev(config: &Config, jj: &ResolvedJj, repo: &Path) -> Result<Str
     Ok(config.jj.base_rev.clone())
 }
 
-/// Determine the final base revision at wizard submit time for a jj source:
-/// an untouched base field (dirty = false) is re-evaluated from the
-/// resolution chain so the *finally selected* source wins; a user-edited
-/// value (dirty = true) is validated against the repo with
-/// `jj log -r <expr>` (a cheap parse-only check with zero output). Failure
-/// keeps the wizard open with jj's own error message.
+/// Determine the final base revision at wizard submit time for the single jj
+/// source: an untouched base field (dirty = false) is re-evaluated from the
+/// resolution chain for that source; a user-edited value (dirty = true) is
+/// validated against the repo with `jj log -r <expr>` (a cheap parse-only
+/// check with zero output). Failure keeps the wizard open with jj's own
+/// error message.
 fn wizard_final_base_rev(
     config: &Config,
     jj: &ResolvedJj,
@@ -733,7 +730,7 @@ fn validate_revset(jj: &ResolvedJj, repo: &Path, value: &str) -> Result<(), Stri
     }
 }
 
-/// Action (headless): capture the calling workspace, then open the wizard pane.
+/// Action (headless): precheck the caller's source, then open the wizard pane.
 fn cmd_open(_mode: &str) -> ! {
     let config = load_config().unwrap_or_else(|err| die(&err.to_string()));
     // Resolve eagerly so a broken `jj.command` fails the action (and surfaces
@@ -741,12 +738,13 @@ fn cmd_open(_mode: &str) -> ! {
     if let Err(err) = resolve_jj_command(&config.jj.command, &path_dirs()) {
         die(&err.to_string());
     }
+    // Precheck the source before opening the pane: a missing or non-jj
+    // focused pane directory fails the action with a toast (the action's
+    // stderr has no visible outlet) and the wizard pane never opens. The
+    // pane itself re-resolves from its own injected context; the wizard's
+    // fail-fast modal covers any divergence.
     let ctx = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
-    let workspace_id = env::var("HERDR_WORKSPACE_ID")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| json_string_field(&ctx, "workspace_id"))
-        .unwrap_or_default();
+    let _source = resolve_source_from_ctx(&ctx).unwrap_or_else(|err| die(&err));
 
     let mut cmd = Command::new(herdr_bin());
     cmd.args([
@@ -758,8 +756,6 @@ fn cmd_open(_mode: &str) -> ! {
         "--entrypoint",
         "wizard",
     ])
-    .arg("--env")
-    .arg(format!("CURRENT_HERDR_WORKSPACE_ID={workspace_id}"))
     .arg("--focus");
     match cmd.status() {
         Ok(status) => process::exit(status.code().unwrap_or(0)),
@@ -770,8 +766,8 @@ fn cmd_open(_mode: &str) -> ! {
     }
 }
 
-/// Pane (interactive TTY): select a source workspace and name, then create the
-/// agent-left / terminal-right Herdr workspace.
+/// Pane (interactive TTY): resolve the single source, name the workspace, then
+/// create the agent-left / terminal-right Herdr workspace.
 fn cmd_wizard() -> ! {
     let config = match load_config() {
         Ok(config) => config,
@@ -784,39 +780,34 @@ fn cmd_wizard() -> ! {
         Ok(jj) => jj,
         Err(err) => show_config_error_and_exit(&err.to_string()),
     };
-    let current_workspace = env::var("CURRENT_HERDR_WORKSPACE_ID").unwrap_or_default();
-    let choices = match load_workspace_choices() {
-        Ok(choices) => choices,
-        Err(err) => fail(&err),
+    // Single source from our own injected context (no `--env` forwarding from
+    // the action): the focused pane's cwd normalized to the main repo root,
+    // plus the caller's workspace id for the new tab. Failure renders a
+    // fail-fast modal instead of the wizard (covers direct pane entrypoint
+    // opens that bypass the action's toast precheck).
+    let ctx = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
+    let source = match resolve_source_from_ctx(&ctx) {
+        Ok(source) => source,
+        Err(err) => show_source_error_and_exit(&err),
     };
-    let selected = choices
-        .iter()
-        .position(|choice| choice.id == current_workspace)
-        .unwrap_or(0);
     let root = workspaces_root(&config);
 
-    // Prefill the wizard's base field from the initially selected source. The
-    // value shown is display-only: at submit, an untouched field is
-    // re-evaluated from the resolution chain so the finally selected source
-    // wins (see `wizard_final_base_rev`). With no jj candidates the field
-    // simply shows the config default.
-    let initial_base = match choices.get(selected) {
-        Some(initial_choice) => {
-            // Display-only prefill: a repo-level resolution error (e.g. an
-            // explicit empty `herdr.base-rev` in jj repo config) must NOT kill
-            // the wizard at entry — fall back to the global default here. The
-            // real resolution happens at submit (wizard_final_base_rev), where
-            // errors surface as the wizard's own error line and the user can
-            // edit the base field to proceed.
-            resolve_base_rev(&config, &jj, Path::new(&repo_root(&initial_choice.path)))
-                .unwrap_or_else(|_| config.jj.base_rev.clone())
-        }
-        None => config.jj.base_rev.clone(),
+    // Prefill the wizard's base field from the single source. The value shown
+    // is display-only: at submit, an untouched field is re-evaluated from the
+    // resolution chain for this source (see `wizard_final_base_rev`).
+    let initial_base = {
+        // Display-only prefill: a repo-level resolution error (e.g. an
+        // explicit empty `herdr.base-rev` in jj repo config) must NOT kill
+        // the wizard at entry — fall back to the global default here. The
+        // real resolution happens at submit (wizard_final_base_rev), where
+        // errors surface as the wizard's own error line and the user can
+        // edit the base field to proceed.
+        resolve_base_rev(&config, &jj, Path::new(&source.path))
+            .unwrap_or_else(|_| config.jj.base_rev.clone())
     };
 
     let selection = match run_workspace_wizard(
-        &choices,
-        selected,
+        &source,
         &root,
         &config,
         &jj,
@@ -832,9 +823,10 @@ fn cmd_wizard() -> ! {
         fail(&format!("workspace folder does not exist: {source}"));
     }
 
-    // `jj.command` was already resolved and validated at wizard entry.
-    // Resolve secondary workspaces to the main repo so sibling checkouts
-    // remain grouped under a stable directory.
+    // `jj.command` was already resolved and validated at wizard entry. The
+    // source is already the main repository root (resolved by
+    // `resolve_source_from_ctx`), so sibling checkouts remain grouped under a
+    // stable directory; `repo_root` is an identity here.
     let repo = repo_root(&source);
     let dest_path = root
         .join(basename(&repo))
@@ -899,9 +891,23 @@ fn cmd_wizard() -> ! {
 /// The wizard runs as an interactive pane (TTY), so the error must be visible
 /// there rather than only on stderr.
 fn show_config_error_and_exit(message: &str) -> ! {
-    // Fatal errors must reach error.log even when their UI outlet (this
-    // modal) is dismissed instantly.
     log_error(message);
+    show_error_modal_and_exit("configuration error", message);
+}
+
+/// Fail-fast for the wizard's source resolution: same one-line summary +
+/// error.log pointer wording as the action-side `die()` toast, so both
+/// outlets carry identical copyable text. Rendered as a modal because the
+/// wizard pane has no toast outlet.
+fn show_source_error_and_exit(message: &str) -> ! {
+    let log_path = log_error(message);
+    let body = die_toast_body(message, log_path.as_deref());
+    show_error_modal_and_exit("jj-workspace error", &body);
+}
+
+/// Render a fatal error in a minimal TUI modal, wait for one keypress, exit
+/// non-zero. Callers log first; the modal only displays.
+fn show_error_modal_and_exit(title: &str, message: &str) -> ! {
     let _ = enable_raw_mode();
     let mut out = io::stdout();
     let _ = execute!(out, EnterAlternateScreen);
@@ -909,7 +915,7 @@ fn show_config_error_and_exit(message: &str) -> ! {
         Ok(terminal) => terminal,
         Err(_) => {
             let _ = disable_raw_mode();
-            fail(&message);
+            fail(message);
         }
     };
     let _ = terminal.draw(|frame| {
@@ -920,7 +926,7 @@ fn show_config_error_and_exit(message: &str) -> ! {
             render_modal_header(
                 frame,
                 Rect::new(inner.x, inner.y, inner.width, 1),
-                "configuration error",
+                title,
                 &p,
             );
             let body = Paragraph::new(vec![
@@ -946,89 +952,6 @@ fn show_config_error_and_exit(message: &str) -> ! {
     let _ = event::read();
     let _ = restore_terminal(&mut terminal);
     process::exit(1);
-}
-
-fn load_workspace_choices() -> Result<Vec<WorkspaceChoice>, String> {
-    load_workspace_choices_with(&herdr_bin())
-}
-
-/// Like `load_workspace_choices`, with an injectable herdr executable (tests
-/// pass a fake). Candidate paths are jj workspace roots only: herdr's
-/// `checkout_path` already names the workspace root, while the pane-cwd
-/// fallback may sit anywhere inside the repository and is normalized upward
-/// by `jj_root`; a workspace with no `.jj` marker on any ancestor is not a
-/// jj workspace and is filtered out.
-fn load_workspace_choices_with(bin: &str) -> Result<Vec<WorkspaceChoice>, String> {
-    let workspaces = herdr_json_with(bin, &["workspace", "list"])?;
-    let panes = herdr_json_with(bin, &["pane", "list"])?;
-    let workspace_values = workspaces
-        .pointer("/result/workspaces")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Herdr returned an invalid workspace list".to_string())?;
-    let pane_values = panes
-        .pointer("/result/panes")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Herdr returned an invalid pane list".to_string())?;
-
-    let mut choices = Vec::new();
-    for workspace in workspace_values {
-        let Some(id) = workspace.get("workspace_id").and_then(Value::as_str) else {
-            continue;
-        };
-        let label = workspace
-            .get("label")
-            .and_then(Value::as_str)
-            .unwrap_or(id)
-            .to_string();
-        let active_tab = workspace
-            .get("active_tab_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        let path = if let Some(path) = workspace
-            .pointer("/worktree/checkout_path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.is_empty())
-        {
-            Some(path.to_string())
-        } else {
-            let active_panes: Vec<&Value> = pane_values
-                .iter()
-                .filter(|pane| {
-                    pane.get("workspace_id").and_then(Value::as_str) == Some(id)
-                        && pane.get("tab_id").and_then(Value::as_str) == Some(active_tab)
-                })
-                .collect();
-            active_panes
-                .iter()
-                .copied()
-                .find(|pane| pane.get("focused").and_then(Value::as_bool) == Some(true))
-                .or_else(|| active_panes.first().copied())
-                .and_then(pane_path)
-        };
-
-        // jj-only filter + ancestor normalization: keep the candidate only
-        // when the path itself or one of its ancestors is a jj workspace
-        // root, and replace the path by that root. A pane cwd deep inside the
-        // repository therefore still resolves to the workspace root the new
-        // tab is created on; non-jj projects never appear as candidates.
-        if let Some(path) = path.and_then(|path| jj_root(&path)) {
-            choices.push(WorkspaceChoice {
-                id: id.into(),
-                label,
-                path,
-            });
-        }
-    }
-    Ok(choices)
-}
-
-fn pane_path(pane: &Value) -> Option<String> {
-    pane.get("foreground_cwd")
-        .and_then(Value::as_str)
-        .filter(|path| !path.is_empty())
-        .or_else(|| pane.get("cwd").and_then(Value::as_str))
-        .map(str::to_string)
 }
 
 fn herdr_json_with(bin: &str, args: &[&str]) -> Result<Value, String> {
@@ -1538,11 +1461,9 @@ fn catppuccin() -> Palette {
     }
 }
 
-/// Returns the chosen source + name + base revision, or None when cancelled.
-#[allow(clippy::too_many_arguments)]
+/// Returns the chosen name + base revision, or None when cancelled.
 fn run_workspace_wizard(
-    choices: &[WorkspaceChoice],
-    initial_selection: usize,
+    source: &WorkspaceSource,
     root: &Path,
     config: &Config,
     jj: &ResolvedJj,
@@ -1554,13 +1475,7 @@ fn run_workspace_wizard(
     execute!(out, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
-    let mut query = String::new();
-    let mut filtered = filtered_choice_indices(choices, &query);
-    let mut selected = filtered
-        .iter()
-        .position(|index| *index == initial_selection)
-        .unwrap_or(0);
-    let mut field = WizardField::WorkspaceSearch;
+    let mut field = WizardField::Name;
     let mut name = initial_name;
     let mut base = initial_base;
     let mut name_edit_state = NameEditState::Fresh;
@@ -1573,11 +1488,8 @@ fn run_workspace_wizard(
             draw_workspace_wizard(
                 frame,
                 &WizardView {
-                    choices,
-                    filtered: &filtered,
-                    selected,
+                    source: &source.path,
                     field,
-                    query: &query,
                     name: &name,
                     base: &base,
                     root,
@@ -1590,52 +1502,14 @@ fn run_workspace_wizard(
                 KeyCode::Esc => break None,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
                 KeyCode::Tab | KeyCode::BackTab => {
-                    // Zero-candidate collapse: no other field is reachable
-                    // (the UI renders source + esc only), so Tab must not
-                    // move focus to a hidden section.
-                    if !choices.is_empty() {
-                        field = next_wizard_field(field);
-                        error = None;
-                    }
-                }
-                KeyCode::Up if field == WizardField::WorkspaceSearch => {
-                    selected = previous_index(selected, filtered.len());
-                    error = None;
-                }
-                KeyCode::Down if field == WizardField::WorkspaceSearch => {
-                    selected = next_index(selected, filtered.len());
-                    error = None;
-                }
-                KeyCode::Char('p' | 'u' | 'k')
-                    if field == WizardField::WorkspaceSearch
-                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    selected = previous_index(selected, filtered.len());
-                    error = None;
-                }
-                KeyCode::Char('n' | 'd' | 'j')
-                    if field == WizardField::WorkspaceSearch
-                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    selected = next_index(selected, filtered.len());
+                    field = next_wizard_field(field);
                     error = None;
                 }
                 KeyCode::Enter => {
-                    // Zero-candidate collapse: Enter has nothing to submit
-                    // and must not surface the generic "no matching
-                    // workspace" error — the empty state is the message.
-                    if choices.is_empty() {
-                        continue;
-                    }
-                    let Some(choice_index) = filtered.get(selected).copied() else {
-                        error = Some("no matching workspace".into());
-                        continue;
-                    };
                     if !valid_branch(&name) {
                         error = Some("name must match [A-Za-z0-9._/-]".into());
                         continue;
                     }
-                    let source = choices[choice_index].clone();
                     if !Path::new(&source.path).is_dir() {
                         error = Some(format!("folder does not exist: {}", source.path));
                         continue;
@@ -1645,14 +1519,14 @@ fn run_workspace_wizard(
                         error = Some(format!("checkout already exists: {}", checkout.display()));
                         continue;
                     }
-                    // Candidates are guaranteed jj workspaces (jj-only filter
-                    // in `load_workspace_choices`), so the final base is
-                    // always solved from the resolution chain — or validated
-                    // when the user edited the field.
+                    // The source was validated as a jj workspace at entry
+                    // (`resolve_source_from_ctx`), so the final base is always
+                    // solved from the resolution chain — or validated when the
+                    // user edited the field.
                     let base_rev = match wizard_final_base_rev(
                         config,
                         jj,
-                        Path::new(&repo_root(&source.path)),
+                        Path::new(&source.path),
                         &base,
                         base_dirty,
                     ) {
@@ -1663,16 +1537,10 @@ fn run_workspace_wizard(
                         }
                     };
                     break Some(WizardResult {
-                        source,
+                        source: source.clone(),
                         name: name.clone(),
                         base_rev,
                     });
-                }
-                KeyCode::Backspace if field == WizardField::WorkspaceSearch => {
-                    query.pop();
-                    filtered = filtered_choice_indices(choices, &query);
-                    selected = 0;
-                    error = None;
                 }
                 KeyCode::Backspace if field == WizardField::Name => {
                     apply_name_key(&mut name, &mut name_edit_state, NameKey::Backspace);
@@ -1709,16 +1577,6 @@ fn run_workspace_wizard(
                     base_dirty = true;
                     error = None;
                 }
-                KeyCode::Char(c)
-                    if field == WizardField::WorkspaceSearch
-                        && !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    query.push(c);
-                    filtered = filtered_choice_indices(choices, &query);
-                    selected = 0;
-                    error = None;
-                }
                 _ => {}
             },
             Ok(_) => {}
@@ -1733,99 +1591,20 @@ fn run_workspace_wizard(
     Ok(outcome)
 }
 
-fn filtered_choice_indices(choices: &[WorkspaceChoice], query: &str) -> Vec<usize> {
-    if query.trim().is_empty() {
-        return (0..choices.len()).collect();
-    }
-
-    let mut matches: Vec<(usize, i64)> = choices
-        .iter()
-        .enumerate()
-        .filter_map(|(index, choice)| {
-            let label_score = fuzzy_score(&choice.label, query).map(|score| score + 1_000);
-            let path_score = fuzzy_score(&choice.path, query);
-            label_score
-                .into_iter()
-                .chain(path_score)
-                .max()
-                .map(|score| (index, score))
-        })
-        .collect();
-    matches.sort_by(|(left_index, left_score), (right_index, right_score)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left_index.cmp(right_index))
-    });
-    matches.into_iter().map(|(index, _)| index).collect()
-}
-
-fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
-    let query: Vec<char> = query
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
-    if query.is_empty() {
-        return Some(0);
-    }
-
-    let candidate: Vec<char> = candidate.chars().flat_map(char::to_lowercase).collect();
-    let mut score = 0i64;
-    let mut search_from = 0usize;
-    let mut previous_match = None;
-
-    for needle in query {
-        let offset = candidate[search_from..]
-            .iter()
-            .position(|ch| *ch == needle)?;
-        let index = search_from + offset;
-        score += 20;
-        if previous_match == Some(index.saturating_sub(1)) {
-            score += 15;
-        }
-        if index == 0 || !candidate[index - 1].is_alphanumeric() {
-            score += 10;
-        }
-        score -= index as i64;
-        previous_match = Some(index);
-        search_from = index + 1;
-    }
-
-    Some(score)
-}
-
-fn previous_index(selected: usize, len: usize) -> usize {
-    if len == 0 {
-        0
-    } else if selected == 0 {
-        len - 1
-    } else {
-        selected - 1
-    }
-}
-
-fn next_index(selected: usize, len: usize) -> usize {
-    if len == 0 {
-        0
-    } else {
-        (selected + 1) % len
-    }
-}
-
 fn workspace_destination(root: &Path, source: &str, name: &str) -> PathBuf {
     root.join(basename(&repo_root(source)))
         .join(branch_to_path_slug(name))
 }
 
 /// Content column indent shared by every section: the leading area is 3
-/// columns wide (2 spaces + 1 marker slot for the source list; the same
-/// gutter stays blank for name/base/checkout so their values align with the
-/// list labels).
+/// columns wide (2 spaces + 1 marker slot retained from the old source list);
+/// the same gutter stays blank for every content line so all values — name,
+/// base, source path and checkout path — align at one column.
 const SECTION_CONTENT_INDENT: u16 = 3;
 
 /// Section title grammar: always bold; focus is expressed by color only —
 /// accent (blue) when the field is focused, subtext0 otherwise. Read-only
-/// sections (checkout) never focus and use the subtext0 form.
+/// sections (source, checkout) never focus and use the subtext0 form.
 fn section_title_style(focused: bool, p: &Palette) -> Style {
     let color = if focused { p.accent } else { p.subtext0 };
     Style::default().fg(color).add_modifier(Modifier::BOLD)
@@ -1838,18 +1617,14 @@ fn render_section_title(frame: &mut Frame, area: Rect, title: &str, focused: boo
     );
 }
 
-/// Top-of-modal static hint line shown in the normal state. The zero-candidate
-/// collapse replaces it with an esc-only hint.
-const WIZARD_HINT: &str =
-    "type to filter or edit · ↑/↓ select · tab switch · ↵ create · esc cancel";
+/// Top-of-modal static hint line: one line covering editing, tab cycling,
+/// submit and cancel; no list-selection wording (select/filter).
+const WIZARD_HINT: &str = "type to edit · tab switch · ↵ create · esc cancel";
 
 fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
     let WizardView {
-        choices,
-        filtered,
-        selected,
+        source,
         field,
-        query,
         name,
         base,
         root,
@@ -1877,35 +1652,6 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
     );
     y += 1;
 
-    // Zero-candidate collapse: only the source section + esc affordance.
-    // The run loop already ignores Tab/Enter here, so nothing below is
-    // reachable — render source title, the query bar, the empty message and
-    // an esc hint, then stop.
-    if choices.is_empty() {
-        render_section_title(
-            frame,
-            Rect::new(inner.x, y, inner.width, 1),
-            "Source Workspace",
-            field == WizardField::WorkspaceSearch,
-            &p,
-        );
-        y += 1;
-        frame.render_widget(
-            Paragraph::new(format!(
-                "{pad}no jj workspaces — open herdr's project picker instead"
-            ))
-            .style(Style::default().fg(p.overlay0)),
-            Rect::new(inner.x, y, inner.width, 1),
-        );
-        y += 1;
-        frame.render_widget(
-            Paragraph::new(format!("{pad}press esc to close"))
-                .style(Style::default().fg(p.overlay0)),
-            Rect::new(inner.x, y, inner.width, 1),
-        );
-        return;
-    }
-
     // Static hint line: one place for all operation hints, before any section.
     frame.render_widget(
         Paragraph::new(WIZARD_HINT).style(Style::default().fg(p.overlay0)),
@@ -1914,75 +1660,7 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
     y += 1;
     y += 1; // blank separator after the hint block
 
-    // --- source workspace -------------------------------------------------
-    render_section_title(
-        frame,
-        Rect::new(inner.x, y, inner.width, 1),
-        "Source Workspace",
-        field == WizardField::WorkspaceSearch,
-        &p,
-    );
-    y += 1;
-    let query_focused = field == WizardField::WorkspaceSearch;
-    let query_span = if query.is_empty() && query_focused {
-        Span::styled(format!("{pad}filter…"), Style::default().fg(p.overlay0))
-    } else {
-        let cursor = if query_focused { "█" } else { "" };
-        Span::styled(format!("{pad}{query}{cursor}"), Style::default().fg(p.text))
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(query_span)).style(Style::default().bg(p.surface0)),
-        Rect::new(inner.x, y, inner.width, 1),
-    );
-    y += 1;
-
-    // List area: fixed block budget (header+hint+2 blanks+source title+query
-    // +4 section blocks+3 separators+error+buttons) leaves the rest to the
-    // list, clamped so tiny panes still fit.
-    let list_height = usize::from(inner.height.saturating_sub(17).clamp(3, 8));
-    let max_start = filtered.len().saturating_sub(list_height);
-    let start = selected.saturating_sub(list_height / 2).min(max_start);
-    let end = (start + list_height).min(filtered.len());
-    for (visible_index, choice_index) in filtered[start..end].iter().enumerate() {
-        let absolute_index = start + visible_index;
-        let choice = &choices[*choice_index];
-        let active = absolute_index == selected;
-        // Marker slot occupies the first column of the shared 3-wide gutter;
-        // the label always starts at the same column as other section content.
-        let marker = if active { "▸  " } else { "   " };
-        let line = Line::from(vec![
-            Span::styled(
-                format!("{marker}{} ", choice.label),
-                Style::default().add_modifier(if active {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-            ),
-            Span::styled(choice.path.clone(), Style::default().fg(p.subtext0)),
-        ]);
-        let style = if active {
-            Style::default().fg(p.text).bg(p.surface0)
-        } else {
-            Style::default().fg(p.text)
-        };
-        frame.render_widget(
-            Paragraph::new(line).style(style),
-            Rect::new(inner.x, y, inner.width, 1),
-        );
-        y += 1;
-    }
-    if filtered.is_empty() {
-        frame.render_widget(
-            Paragraph::new(format!("{pad}no matching workspaces"))
-                .style(Style::default().fg(p.overlay0)),
-            Rect::new(inner.x, y, inner.width, 1),
-        );
-        y += 1;
-    }
-
     // --- new workspace name -----------------------------------------------
-    y += 1;
     render_section_title(
         frame,
         Rect::new(inner.x, y, inner.width, 1),
@@ -2025,6 +1703,24 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
     );
     y += 1;
 
+    // --- source workspace (read-only) --------------------------------------
+    y += 1;
+    render_section_title(
+        frame,
+        Rect::new(inner.x, y, inner.width, 1),
+        "Source Workspace",
+        false,
+        &p,
+    );
+    y += 1;
+    // Read-only: the resolved main repository root; never focused, rendered
+    // like the checkout preview (subtext0, no edit background).
+    frame.render_widget(
+        Paragraph::new(format!("{pad}{source}")).style(Style::default().fg(p.subtext0)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 1;
+
     // --- checkout (read-only preview) -------------------------------------
     y += 1;
     render_section_title(
@@ -2035,15 +1731,7 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         &p,
     );
     y += 1;
-    // Every candidate is a jj workspace, so the preview is the derived
-    // destination; a filter with no match has no selected source to derive
-    // from and shows a placeholder instead.
-    let preview = match filtered.get(selected).map(|index| &choices[*index]) {
-        Some(choice) => workspace_destination(root, &choice.path, name)
-            .display()
-            .to_string(),
-        None => "no matching workspace".into(),
-    };
+    let preview = workspace_destination(root, source, name).display().to_string();
     frame.render_widget(
         Paragraph::new(format!("{pad}{preview}")).style(Style::default().fg(p.subtext0)),
         Rect::new(inner.x, y, inner.width, 1),
@@ -2308,6 +1996,37 @@ fn repo_root(workspace: &str) -> String {
     }
 }
 
+/// Resolve the wizard's single source from the plugin's own injected context
+/// (`HERDR_PLUGIN_CONTEXT_JSON`): `focused_pane_cwd` (the pane's shell cwd,
+/// the same authority herdr uses for labels/follow-cwd — never
+/// `foreground_cwd`) is walked up to its jj workspace root by `jj_root()`,
+/// then a secondary workspace is resolved to the main repository root by
+/// `repo_root()`. The caller's `workspace_id` (new-tab landing workspace)
+/// rides along. Missing cwd, an empty workspace id, a nonexistent path, or a
+/// non-jj directory are structured errors.
+fn resolve_source_from_ctx(ctx: &str) -> Result<WorkspaceSource, String> {
+    let workspace_id = json_string_field(ctx, "workspace_id").unwrap_or_default();
+    if workspace_id.is_empty() {
+        return Err(
+            "no workspace id in plugin context (is there an active workspace?)".to_string()
+        );
+    }
+    let cwd = json_string_field(ctx, "focused_pane_cwd")
+        .filter(|cwd| !cwd.is_empty())
+        .ok_or_else(|| {
+            "no focused pane cwd in plugin context (is there an active workspace?)".to_string()
+        })?;
+    if !Path::new(&cwd).is_dir() {
+        return Err(format!("focused pane cwd does not exist: {cwd}"));
+    }
+    let root = jj_root(&cwd)
+        .ok_or_else(|| format!("{cwd} is not inside a jj workspace (no .jj marker found)"))?;
+    Ok(WorkspaceSource {
+        id: workspace_id,
+        path: repo_root(&root),
+    })
+}
+
 fn valid_branch(branch: &str) -> bool {
     !branch.is_empty()
         && branch
@@ -2479,54 +2198,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspace_selector_wraps_in_both_directions() {
-        assert_eq!(previous_index(0, 3), 2);
-        assert_eq!(previous_index(2, 3), 1);
-        assert_eq!(next_index(2, 3), 0);
-        assert_eq!(next_index(0, 3), 1);
-    }
-
-    #[test]
-    fn workspace_selector_fuzzy_filters_labels_and_paths() {
-        let choices = vec![
-            WorkspaceChoice {
-                id: "w1".into(),
-                label: "general".into(),
-                path: "/home/nathan/misc".into(),
-            },
-            WorkspaceChoice {
-                id: "w2".into(),
-                label: "rivet-website".into(),
-                path: "/home/nathan/rivet-website".into(),
-            },
-            WorkspaceChoice {
-                id: "w3".into(),
-                label: "docs".into(),
-                path: "/home/nathan/dynamic-apps".into(),
-            },
-        ];
-
-        assert_eq!(filtered_choice_indices(&choices, "rvws"), vec![1]);
-        assert_eq!(filtered_choice_indices(&choices, "DYN APP"), vec![2]);
-        assert!(filtered_choice_indices(&choices, "not-here").is_empty());
-    }
-
-    #[test]
-    fn workspace_selector_prefers_label_matches() {
-        let choices = vec![
-            WorkspaceChoice {
-                id: "w1".into(),
-                label: "website".into(),
-                path: "/tmp/project".into(),
-            },
-            WorkspaceChoice {
-                id: "w2".into(),
-                label: "project".into(),
-                path: "/tmp/website".into(),
-            },
-        ];
-
-        assert_eq!(filtered_choice_indices(&choices, "web"), vec![0, 1]);
+    fn wizard_fields_cycle_through_the_two_editable_fields() {
+        assert_eq!(next_wizard_field(WizardField::Name), WizardField::Base);
+        assert_eq!(next_wizard_field(WizardField::Base), WizardField::Name);
     }
 
     #[test]
@@ -3242,19 +2916,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wizard_fields_cycle_through_three_fields() {
-        assert_eq!(
-            next_wizard_field(WizardField::WorkspaceSearch),
-            WizardField::Name
-        );
-        assert_eq!(next_wizard_field(WizardField::Name), WizardField::Base);
-        assert_eq!(
-            next_wizard_field(WizardField::Base),
-            WizardField::WorkspaceSearch
-        );
-    }
-
     // --- name field component-level editing (workspace-wizard: name 字段组件级编辑)
 
     fn name_char(name: &str, state: NameEditState, c: char) -> (String, NameEditState) {
@@ -3371,103 +3032,78 @@ mod tests {
         assert_eq!(jj_root(deep.to_str().unwrap()), None);
     }
 
-    /// Fake herdr that answers `workspace list` / `pane list` from two JSON
-    /// fixture files, for exercising candidate loading and jj filtering.
-    #[cfg(unix)]
-    fn make_fake_herdr_listing(dir: &Path, workspaces: &str, panes: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
-        fs::write(dir.join("workspaces.json"), workspaces).expect("write workspaces fixture");
-        fs::write(dir.join("panes.json"), panes).expect("write panes fixture");
-        let bin = dir.join("herdr");
-        fs::write(
-            &bin,
-            "#!/bin/sh\n\
-             D=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n\
-             case \"$1 $2\" in\n\
-               \"workspace list\") cat \"$D/workspaces.json\" ;;\n\
-               \"pane list\") cat \"$D/panes.json\" ;;\n\
-               *) exit 1 ;;\n\
-             esac\n",
-        )
-        .expect("write fake herdr");
-        fs::File::open(&bin)
-            .and_then(|file| file.sync_all())
-            .expect("sync fake herdr");
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))
-            .expect("make fake herdr executable");
-        bin.display().to_string()
-    }
-
     #[test]
-    #[cfg(unix)]
-    fn workspace_choices_keep_jj_roots_and_filter_everything_else() {
+    fn resolve_source_from_ctx_resolves_main_repo_root() {
         let dir = TempDir::new();
-        // jj repo whose checkout_path is present (the root carries `.jj`).
-        let repo_a = dir.path().join("alpha");
-        fs::create_dir_all(repo_a.join(".jj")).expect("create alpha .jj");
-        // jj repo WITHOUT a checkout_path: falls back to the active pane's
-        // cwd, which sits deep inside the repo — normalized up to the root.
-        let repo_b = dir.path().join("beta");
-        let pane_cwd_b = repo_b.join("sub/deep");
-        fs::create_dir_all(&pane_cwd_b).expect("create beta pane dirs");
-        fs::create_dir_all(repo_b.join(".jj")).expect("create beta .jj");
-        // Plain directory with a checkout_path but no `.jj` on any ancestor.
-        let repo_c = dir.path().join("gamma");
-        fs::create_dir_all(&repo_c).expect("create gamma dir");
-
-        let workspaces = format!(
-            r#"{{"result":{{"workspaces":[
-                {{"workspace_id":"w1","label":"alpha","active_tab_id":"w1:t1",
-                  "worktree":{{"checkout_path":"{a}"}}}},
-                {{"workspace_id":"w2","label":"beta","active_tab_id":"w2:t1",
-                  "worktree":{{}}}},
-                {{"workspace_id":"w3","label":"gamma","active_tab_id":"w3:t1",
-                  "worktree":{{"checkout_path":"{c}"}}}}
-            ]}}}}"#,
-            a = repo_a.display(),
-            c = repo_c.display(),
-        );
-        let panes = format!(
-            r#"{{"result":{{"panes":[
-                {{"workspace_id":"w2","tab_id":"w2:t1","focused":true,
-                  "foreground_cwd":"{deep}"}}
-            ]}}}}"#,
-            deep = pane_cwd_b.display(),
-        );
-        let herdr = make_fake_herdr_listing(dir.path(), &workspaces, &panes);
-        let choices = load_workspace_choices_with(&herdr).expect("choices load");
-        // w1 keeps its checkout path; w2's pane subdirectory is normalized to
-        // the beta root; w3 (no `.jj` anywhere) is filtered out entirely.
-        let got: Vec<(String, String, String)> = choices
-            .iter()
-            .map(|c| (c.id.clone(), c.label.clone(), c.path.clone()))
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                ("w1".into(), "alpha".into(), repo_a.display().to_string()),
-                ("w2".into(), "beta".into(), repo_b.display().to_string()),
-            ]
-        );
+        let repo = dir.path().join("main");
+        fs::create_dir_all(repo.join(".jj")).expect("create .jj");
+        let ctx = format!(r#"{{"workspace_id":"w1","focused_pane_cwd":"{}"}}"#, repo.display());
+        let source = resolve_source_from_ctx(&ctx).expect("main repo resolves");
+        assert_eq!(source.id, "w1");
+        assert_eq!(source.path, repo.display().to_string());
     }
 
     #[test]
-    #[cfg(unix)]
-    fn workspace_choices_are_empty_when_no_workspace_is_a_jj_repo() {
+    fn resolve_source_from_ctx_resolves_secondary_workspace_to_main_root() {
+        let dir = TempDir::new();
+        let main = dir.path().join("main");
+        fs::create_dir_all(main.join(".jj/repo")).expect("create main .jj store");
+        let secondary = dir.path().join("secondary");
+        fs::create_dir_all(secondary.join(".jj")).expect("create secondary .jj");
+        fs::write(secondary.join(".jj/repo"), "../../main/.jj/repo\n").expect("write pointer");
+        let ctx = format!(
+            r#"{{"workspace_id":"w1","focused_pane_cwd":"{}"}}"#,
+            secondary.display()
+        );
+        let source = resolve_source_from_ctx(&ctx).expect("secondary workspace resolves");
+        assert_eq!(source.path, main.display().to_string());
+    }
+
+    #[test]
+    fn resolve_source_from_ctx_walks_subdirectory_up_to_root() {
+        let dir = TempDir::new();
+        let repo = dir.path().join("repo");
+        let nested = repo.join("a/b/c");
+        fs::create_dir_all(&nested).expect("create nested dirs");
+        fs::create_dir_all(repo.join(".jj")).expect("create .jj");
+        let ctx = format!(
+            r#"{{"workspace_id":"w1","focused_pane_cwd":"{}"}}"#,
+            nested.display()
+        );
+        let source = resolve_source_from_ctx(&ctx).expect("subdirectory resolves");
+        assert_eq!(source.path, repo.display().to_string());
+    }
+
+    #[test]
+    fn resolve_source_from_ctx_non_jj_directory_is_an_error() {
         let dir = TempDir::new();
         let plain = dir.path().join("plain");
         fs::create_dir_all(&plain).expect("create plain dir");
-        let workspaces = format!(
-            r#"{{"result":{{"workspaces":[
-                {{"workspace_id":"w1","label":"plain","active_tab_id":"w1:t1",
-                  "worktree":{{"checkout_path":"{p}"}}}}
-            ]}}}}"#,
-            p = plain.display(),
-        );
-        let herdr = make_fake_herdr_listing(dir.path(), &workspaces, r#"{"result":{"panes":[]}}"#);
-        assert!(load_workspace_choices_with(&herdr)
-            .expect("an all-non-jj herd resolves to an empty choice list")
-            .is_empty());
+        let ctx = format!(r#"{{"workspace_id":"w1","focused_pane_cwd":"{}"}}"#, plain.display());
+        let err = resolve_source_from_ctx(&ctx).expect_err("non-jj must fail");
+        assert!(err.contains("not inside a jj workspace"), "{err}");
+    }
+
+    #[test]
+    fn resolve_source_from_ctx_nonexistent_cwd_is_an_error() {
+        let dir = TempDir::new();
+        let missing = dir.path().join("missing");
+        let ctx = format!(r#"{{"workspace_id":"w1","focused_pane_cwd":"{}"}}"#, missing.display());
+        let err = resolve_source_from_ctx(&ctx).expect_err("nonexistent cwd must fail");
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn resolve_source_from_ctx_missing_focused_pane_cwd_is_an_error() {
+        let ctx = r#"{"workspace_id":"w1"}"#;
+        let err = resolve_source_from_ctx(ctx).expect_err("missing cwd must fail");
+        assert!(err.contains("no focused pane cwd"), "{err}");
+    }
+
+    #[test]
+    fn resolve_source_from_ctx_empty_context_is_an_error() {
+        let err = resolve_source_from_ctx("").expect_err("empty context must fail");
+        assert!(err.contains("workspace id"), "{err}");
     }
 
     /// Writes a fake jj executable that runs `body` and returns a ResolvedJj
@@ -3928,35 +3564,21 @@ esac
     //
     // draw_workspace_wizard is a pure function over a Frame; a TestBackend
     // captures the frame buffer so the section layout, title grammar, shared
-    // content indent, hint line and the three state branches are assertable
-    // without a TTY.
+    // content indent, hint line and the read-only source section are
+    // assertable without a TTY.
 
     use ratatui::backend::TestBackend;
 
-    fn wizard_choice(id: &str, label: &str, path: &str) -> WorkspaceChoice {
-        WorkspaceChoice {
-            id: id.into(),
-            label: label.into(),
-            path: path.into(),
-        }
-    }
-
     fn wizard_view<'a>(
-        choices: &'a [WorkspaceChoice],
-        filtered: &'a [usize],
-        selected: usize,
+        source: &'a str,
         field: WizardField,
-        query: &'a str,
         name: &'a str,
         base: &'a str,
         error: Option<&'a str>,
     ) -> WizardView<'a> {
         WizardView {
-            choices,
-            filtered,
-            selected,
+            source,
             field,
-            query,
             name,
             base,
             root: Path::new("/tmp/wizard-root"),
@@ -3992,45 +3614,38 @@ esac
 
     #[test]
     fn wizard_renders_sectioned_layout_with_unified_titles_and_indent() {
-        let choices = vec![
-            wizard_choice("w1", "alpha", "/tmp/alpha"),
-            wizard_choice("w2", "beta", "/tmp/beta"),
-        ];
-        let filtered: Vec<usize> = vec![0, 1];
         let buffer = render_wizard(wizard_view(
-            &choices,
-            &filtered,
-            0,
-            WizardField::WorkspaceSearch,
-            "",
+            "/home/nathan/agent-os",
+            WizardField::Name,
             "ws/alpha",
             "trunk()",
             None,
         ));
 
         // Modal header + single static hint line at the top.
-        let hint = lines_containing(&buffer, "type to filter or edit · ↑/↓ select · tab switch");
+        let hint = lines_containing(&buffer, "type to edit · tab switch · ↵ create · esc cancel");
         assert_eq!(hint.len(), 1, "hint must appear exactly once: {hint:?}");
         assert!(hint[0] > 0, "hint sits below the modal header");
 
         // Section titles each on their own line, no operation-hint suffixes.
-        let source = lines_containing(&buffer, "Source Workspace");
-        assert_eq!(source.len(), 1, "{source:?}");
         let name = lines_containing(&buffer, "New Workspace Name");
         assert_eq!(name.len(), 1, "{name:?}");
         let base = lines_containing(&buffer, "Base · jj revset");
         assert_eq!(base.len(), 1, "{base:?}");
+        let source = lines_containing(&buffer, "Source Workspace");
+        assert_eq!(source.len(), 1, "{source:?}");
         let checkout = lines_containing(&buffer, "Checkout");
         assert_eq!(checkout.len(), 1, "{checkout:?}");
-        // No stray per-section hints remain on the title lines.
+        // No stray per-section hints, and no list-selection wording anywhere.
         assert!(lines_containing(&buffer, "tab to edit").is_empty());
-        assert!(lines_containing(&buffer, "tab edit name/base").is_empty());
+        assert!(lines_containing(&buffer, "type to filter").is_empty());
+        assert!(lines_containing(&buffer, "select").is_empty());
 
         // Titles render bold: assert on the first glyph column of each title line.
         for (y, title_text) in [
-            (source[0], "Source Workspace"),
             (name[0], "New Workspace Name"),
             (base[0], "Base · jj revset"),
+            (source[0], "Source Workspace"),
             (checkout[0], "Checkout"),
         ] {
             let title_start = line_text(&buffer, y).find(title_text).unwrap_or(0) as u16;
@@ -4041,145 +3656,124 @@ esac
             );
         }
 
-        // Content lines share the 3-column indent: query bar, name/base values
-        // and checkout path all start at the same column as the list label.
-        let source_y = source[0];
-        let query_y = source_y + 1;
-        let query_line = line_text(&buffer, query_y);
-        assert!(
-            query_line.contains("   filter…"),
-            "placeholder: {query_line:?}"
-        );
-        let list_y = query_y + 1;
-        let list_line = line_text(&buffer, list_y);
-        assert!(list_line.contains("▸  alpha "), "active row: {list_line:?}");
-        assert!(
-            line_text(&buffer, list_y + 1).contains("   beta "),
-            "inactive row keeps label column"
-        );
-        // name value, base value, checkout path all start with the 3-space pad.
+        // Content lines share the 3-column indent: name/base values, the
+        // source path and the checkout path all start at the same column.
         let name_value_y = name[0] + 1;
         assert!(
             line_text(&buffer, name_value_y).contains("   ws/alpha"),
-            "name value indent"
+            "name value indent: {:?}",
+            line_text(&buffer, name_value_y)
         );
         let base_value_y = base[0] + 1;
         assert!(
             line_text(&buffer, base_value_y).contains("   trunk()"),
-            "base value indent"
+            "base value indent: {:?}",
+            line_text(&buffer, base_value_y)
+        );
+        let source_value_y = source[0] + 1;
+        assert!(
+            line_text(&buffer, source_value_y).contains("   /home/nathan/agent-os"),
+            "source value indent: {:?}",
+            line_text(&buffer, source_value_y)
         );
         let checkout_value_y = checkout[0] + 1;
         assert!(
-            line_text(&buffer, checkout_value_y).contains("   "),
+            line_text(&buffer, checkout_value_y).contains("   /tmp/wizard-root/agent-os/ws-alpha"),
             "checkout value indent: {:?}",
             line_text(&buffer, checkout_value_y)
         );
     }
 
     #[test]
-    fn wizard_focus_switches_title_color_only() {
-        let choices = vec![wizard_choice("w1", "alpha", "/tmp/alpha")];
-        let filtered: Vec<usize> = vec![0];
-
-        let focused_name = render_wizard(wizard_view(
-            &choices,
-            &filtered,
-            0,
+    fn wizard_renders_sections_in_name_base_source_checkout_order() {
+        let buffer = render_wizard(wizard_view(
+            "/tmp/alpha",
             WizardField::Name,
-            "",
+            "ws/alpha",
+            "trunk()",
+            None,
+        ));
+        let ys = [
+            lines_containing(&buffer, "New Workspace Name")[0],
+            lines_containing(&buffer, "Base · jj revset")[0],
+            lines_containing(&buffer, "Source Workspace")[0],
+            lines_containing(&buffer, "Checkout")[0],
+        ];
+        assert!(
+            ys.windows(2).all(|pair| pair[0] < pair[1]),
+            "sections must render in fixed order, got y positions {ys:?}"
+        );
+    }
+
+    #[test]
+    fn wizard_focus_switches_title_color_only() {
+        // Name focused: its title is accent, every other title subtext0 —
+        // including the read-only Source/Checkout — and all stay bold.
+        let focused_name = render_wizard(wizard_view(
+            "/tmp/alpha",
+            WizardField::Name,
             "ws/alpha",
             "trunk()",
             None,
         ));
         let name_y = lines_containing(&focused_name, "New Workspace Name")[0];
+        let base_y = lines_containing(&focused_name, "Base · jj revset")[0];
         let source_y = lines_containing(&focused_name, "Source Workspace")[0];
+        let checkout_y = lines_containing(&focused_name, "Checkout")[0];
+        for (y, text) in [
+            (name_y, "New Workspace Name"),
+            (base_y, "Base · jj revset"),
+            (source_y, "Source Workspace"),
+            (checkout_y, "Checkout"),
+        ] {
+            let x = line_text(&focused_name, y).find(text).unwrap_or(0) as u16;
+            let cell = &focused_name[(x, y)];
+            let expected = if y == name_y {
+                palette_accent()
+            } else {
+                palette_subtext0()
+            };
+            assert_eq!(cell.style().fg, Some(expected), "title {text:?}");
+            assert!(
+                cell.style().add_modifier.contains(Modifier::BOLD),
+                "title {text:?} stays bold"
+            );
+        }
 
-        // Focused title is accent; unfocused is subtext0; both bold.
-        let name_x = line_text(&focused_name, name_y)
+        // Base focused: name falls back to subtext0, base turns accent, and
+        // the read-only titles never change color.
+        let focused_base = render_wizard(wizard_view(
+            "/tmp/alpha",
+            WizardField::Base,
+            "ws/alpha",
+            "trunk()",
+            None,
+        ));
+        let name_y = lines_containing(&focused_base, "New Workspace Name")[0];
+        let base_y = lines_containing(&focused_base, "Base · jj revset")[0];
+        let name_x = line_text(&focused_base, name_y)
             .find("New Workspace Name")
             .unwrap_or(0) as u16;
-        let source_x = line_text(&focused_name, source_y)
-            .find("Source Workspace")
+        let base_x = line_text(&focused_base, base_y)
+            .find("Base · jj revset")
             .unwrap_or(0) as u16;
-        let name_cell = &focused_name[(name_x, name_y)];
-        let source_cell = &focused_name[(source_x, source_y)];
-        assert_eq!(name_cell.style().fg, Some(palette_accent()));
-        assert_eq!(source_cell.style().fg, Some(palette_subtext0()));
-        assert!(name_cell.style().add_modifier.contains(Modifier::BOLD));
-        assert!(source_cell.style().add_modifier.contains(Modifier::BOLD));
-    }
-
-    #[test]
-    fn wizard_zero_candidate_collapses_to_source_and_esc_only() {
-        let choices: Vec<WorkspaceChoice> = vec![];
-        let filtered: Vec<usize> = vec![];
-        let buffer = render_wizard(wizard_view(
-            &choices,
-            &filtered,
-            0,
-            WizardField::WorkspaceSearch,
-            "",
-            "ws/alpha",
-            "trunk()",
-            None,
-        ));
-
-        assert_eq!(lines_containing(&buffer, "Source Workspace").len(), 1);
-        assert!(
-            lines_containing(
-                &buffer,
-                "no jj workspaces — open herdr's project picker instead"
-            )
-            .len()
-                == 1
-        );
-        assert!(lines_containing(&buffer, "New Workspace Name").is_empty());
-        assert!(lines_containing(&buffer, "Base · jj revset").is_empty());
-        assert!(lines_containing(&buffer, "create and open").is_empty());
-        // No full hint line in the collapsed state (create/tab would lie).
-        assert!(lines_containing(&buffer, "tab switch").is_empty());
-        assert!(lines_containing(&buffer, "press esc to close").len() == 1);
-    }
-
-    #[test]
-    fn wizard_query_no_match_keeps_sections_with_placeholder_preview() {
-        let choices = vec![wizard_choice("w1", "alpha", "/tmp/alpha")];
-        let filtered: Vec<usize> = vec![];
-        let buffer = render_wizard(wizard_view(
-            &choices,
-            &filtered,
-            0,
-            WizardField::WorkspaceSearch,
-            "zzz",
-            "ws/alpha",
-            "trunk()",
-            None,
-        ));
-
-        assert!(lines_containing(&buffer, "no matching workspaces").len() == 1);
-        assert_eq!(lines_containing(&buffer, "New Workspace Name").len(), 1);
-        assert_eq!(lines_containing(&buffer, "Base · jj revset").len(), 1);
-        assert_eq!(lines_containing(&buffer, "Checkout").len(), 1);
-        // Checkout preview shows the placeholder, not a fabricated path.
-        let checkout_y = lines_containing(&buffer, "Checkout")[0];
-        assert!(line_text(&buffer, checkout_y + 1).contains("no matching workspace"));
-    }
-
-    #[test]
-    fn wizard_query_empty_unfocused_shows_no_placeholder() {
-        let choices = vec![wizard_choice("w1", "alpha", "/tmp/alpha")];
-        let filtered: Vec<usize> = vec![0];
-        let buffer = render_wizard(wizard_view(
-            &choices,
-            &filtered,
-            0,
-            WizardField::Name,
-            "",
-            "ws/alpha",
-            "trunk()",
-            None,
-        ));
-        assert!(lines_containing(&buffer, "filter…").is_empty());
+        let name_cell = &focused_base[(name_x, name_y)];
+        let base_cell = &focused_base[(base_x, base_y)];
+        assert_eq!(name_cell.style().fg, Some(palette_subtext0()));
+        assert_eq!(base_cell.style().fg, Some(palette_accent()));
+        assert!(base_cell.style().add_modifier.contains(Modifier::BOLD));
+        // Read-only titles stay subtext0 no matter which field is focused.
+        for (y, text) in [
+            (source_y, "Source Workspace"),
+            (checkout_y, "Checkout"),
+        ] {
+            let x = line_text(&focused_base, y).find(text).unwrap_or(0) as u16;
+            assert_eq!(
+                focused_base[(x, y)].style().fg,
+                Some(palette_subtext0()),
+                "read-only title {text:?} must stay subtext0"
+            );
+        }
     }
 
     /// Palette probes for render assertions (mirrors `catppuccin`).

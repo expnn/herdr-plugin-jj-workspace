@@ -42,20 +42,21 @@ A [Herdr](https://herdr.dev) plugin to create and remove [Jujutsu](https://jj-vc
 
 ## Quickstart
 
-- `prefix+a` or `prefix+shift+a` — choose a Herdr workspace, name the jj workspace, and open it as a new tab in the selected workspace
+- `prefix+a` or `prefix+shift+a` — name the jj workspace for the focused pane's repository and open it as a new tab in the same workspace
 - `prefix+d` — remove the current jj checkout and close its tab
 
-The source selector starts on the current workspace with fuzzy search focused.
-Type to filter by workspace label or path, use `↑`/`↓` (including
-`Ctrl+↑`/`Ctrl+↓`) to navigate the matches, and press `Tab` to cycle the
-editable fields (source list → new workspace name → base revision).
+The wizard uses a single read-only source: the focused pane's directory,
+resolved up to its jj workspace root — secondary workspaces are normalized to
+the main repository root — and shown in the read-only **Source Workspace**
+section. Press `Tab` to cycle the editable fields (new workspace name ↔ base
+revision).
 
-Candidates are **jj workspaces only**: a Herdr workspace is listed when its
-path — the workspace root, or the active pane's directory normalized up to
-the nearest `.jj` — is inside a jj repository. New tabs are always created at
-the workspace root, so launching from a pane in a subdirectory still checks
-out at the root. When no workspace is a jj repository, the wizard opens with
-an empty state instead of a list.
+The source is always the repository of the pane you trigger the action from:
+launching from a pane in a subdirectory still checks out at the root, and
+creating a workspace for another repository means focusing a pane inside it
+first, then triggering the action again. When the focused pane is not inside
+a jj repository, the action shows an error toast and the wizard does not
+open.
 
 The plugin creates an empty sparse checkout from the resolved base revision
 (`trunk()` by default), materializes the coding agent's startup files (a
