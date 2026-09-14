@@ -37,3 +37,10 @@ id = "remove"
 title = "Remove jj workspace"
 contexts = ["workspace"]
 command = ["./target/release/jj-workspace", "remove"]
+
+# Interactive remove dialog opened by the remove action.
+[[panes]]
+id = "remove-wizard"
+title = "Remove jj workspace"
+placement = "overlay"
+command = ["./target/release/jj-workspace", "remove-wizard"]

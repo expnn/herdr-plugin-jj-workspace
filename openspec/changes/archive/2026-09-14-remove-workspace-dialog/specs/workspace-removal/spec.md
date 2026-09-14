@@ -1,9 +1,55 @@
-# workspace-removal Specification
+# workspace-removal Delta
 
-## Purpose
-TBD - created by archiving change lifecycle-docs. Update Purpose after archive.
+## ADDED Requirements
 
-## Requirements
+### Requirement: 删除目标解析与守卫
+
+删除目标 SHALL 为聚焦 pane 的 cwd 上溯得到的最近 jj workspace 根（副 workspace 本身，不消解到主仓库根）。主 workspace 自身 MUST NOT 被删除；在主 workspace 上下文触发时 SHALL 进入副 workspace 选择流程（见 `workspace-removal-dialog` 能力）。非 jj 目录、路径不存在或不安全路径（`/`、无父级）SHALL 被拒绝且不产生任何变更。
+
+#### Scenario: 副 workspace 子目录触发
+
+- **WHEN** 聚焦 pane 的 cwd 位于副 workspace 的子目录
+- **THEN** 删除目标为该副 workspace 根
+
+#### Scenario: 主 workspace 不可作为删除目标
+
+- **WHEN** 聚焦 pane 位于主 workspace
+- **THEN** 目标不解析为主 workspace 自身，改由 picker 选择具体副 workspace
+
+### Requirement: 按 pane 选择关闭（替代 tab 关闭）
+
+删除流程 SHALL 只关闭用户在对话框中勾选的 pane，MUST NOT 使用 `herdr tab close` 或其它按 tab 关闭的接口。候选 pane SHALL 为所有 herdr workspace 中 cwd 或 foreground_cwd 位于目标目录内（含目录本身与子路径，须做路径边界比较）的 pane；cwd 在目录外的 pane SHALL NOT 被关闭。tab 与 herdr workspace 的关闭 SHALL 由 herdr 的「最后一个 pane 关闭即关 tab、最后一个 tab 关闭即关 workspace」级联自然发生。单个 pane 的关闭失败 SHALL 仅警告，不阻断其余 pane 的关闭与流程结束；成功执行时未勾选的 pane SHALL 保持运行（其 cwd 将失效的警示由对话框呈现）。
+
+#### Scenario: 同 tab 异目录 pane 存活
+
+- **WHEN** 目标 tab 内存在 cwd 已在其它目录的 pane 且用户未勾选它
+- **THEN** 该 pane 与所在 tab 保持存活（tab 因仍有 pane 而不关闭）
+
+#### Scenario: 全部 pane 被勾选时 tab 级联关闭
+
+- **WHEN** 用户勾选某 tab 的全部 pane 并执行
+- **THEN** 关闭这些 pane 后该 tab 自然关闭，目标目录下不再有 pane 残留
+
+#### Scenario: 对话框自身 pane 的处理
+
+- **WHEN** 删除执行到关闭 pane 阶段
+- **THEN** 对话框自身 overlay pane 不在候选中、不被显式关闭，随进程退出自然关闭
+
+### Requirement: 执行结果与失败语义
+
+执行中任一破坏性步骤失败 SHALL 停留在对话框 Status 视图，说明失败步骤与已完成/未执行的部分，并给出 `error.log` 指针；成功时对话框自动退出。失败 MUST NOT 继续执行后续步骤（迁移失败不 forget；forget 失败不删目录；目录删除失败不关 pane）。
+
+#### Scenario: forget 失败不关 pane
+
+- **WHEN** `jj workspace forget` 失败
+- **THEN** 目录与 pane 保持不变，Status 报告失败与后续未执行
+
+#### Scenario: 成功以 Status 收尾
+
+- **WHEN** 全部步骤成功
+- **THEN** 结果在 Status 视图呈现后自动退出（不再依赖 toast 作为唯一出口）
+
+## MODIFIED Requirements
 
 ### Requirement: 移除前拒绝脏工作副本
 
@@ -67,50 +113,3 @@ TBD - created by archiving change lifecycle-docs. Update Purpose after archive.
 
 - **WHEN** 目标来自 picker 的 missing on disk 项（路径未记录，`root` 为空）
 - **THEN** 仅执行 `jj workspace forget`；session 迁移、目录删除与 pane 关闭均跳过（路径未知）并在 Status 中标记
-
-### Requirement: 删除目标解析与守卫
-
-删除目标 SHALL 为聚焦 pane 的 cwd 上溯得到的最近 jj workspace 根（副 workspace 本身，不消解到主仓库根）。主 workspace 自身 MUST NOT 被删除；在主 workspace 上下文触发时 SHALL 进入副 workspace 选择流程（见 `workspace-removal-dialog` 能力）。非 jj 目录、路径不存在或不安全路径（`/`、无父级）SHALL 被拒绝且不产生任何变更。
-
-#### Scenario: 副 workspace 子目录触发
-
-- **WHEN** 聚焦 pane 的 cwd 位于副 workspace 的子目录
-- **THEN** 删除目标为该副 workspace 根
-
-#### Scenario: 主 workspace 不可作为删除目标
-
-- **WHEN** 聚焦 pane 位于主 workspace
-- **THEN** 目标不解析为主 workspace 自身，改由 picker 选择具体副 workspace
-
-### Requirement: 按 pane 选择关闭（替代 tab 关闭）
-
-删除流程 SHALL 只关闭用户在对话框中勾选的 pane，MUST NOT 使用 `herdr tab close` 或其它按 tab 关闭的接口。候选 pane SHALL 为所有 herdr workspace 中 cwd 或 foreground_cwd 位于目标目录内（含目录本身与子路径，须做路径边界比较）的 pane；cwd 在目录外的 pane SHALL NOT 被关闭。tab 与 herdr workspace 的关闭 SHALL 由 herdr 的「最后一个 pane 关闭即关 tab、最后一个 tab 关闭即关 workspace」级联自然发生。单个 pane 的关闭失败 SHALL 仅警告，不阻断其余 pane 的关闭与流程结束；成功执行时未勾选的 pane SHALL 保持运行（其 cwd 将失效的警示由对话框呈现）。
-
-#### Scenario: 同 tab 异目录 pane 存活
-
-- **WHEN** 目标 tab 内存在 cwd 已在其它目录的 pane 且用户未勾选它
-- **THEN** 该 pane 与所在 tab 保持存活（tab 因仍有 pane 而不关闭）
-
-#### Scenario: 全部 pane 被勾选时 tab 级联关闭
-
-- **WHEN** 用户勾选某 tab 的全部 pane 并执行
-- **THEN** 关闭这些 pane 后该 tab 自然关闭，目标目录下不再有 pane 残留
-
-#### Scenario: 对话框自身 pane 的处理
-
-- **WHEN** 删除执行到关闭 pane 阶段
-- **THEN** 对话框自身 overlay pane 不在候选中、不被显式关闭，随进程退出自然关闭
-
-### Requirement: 执行结果与失败语义
-
-执行中任一破坏性步骤失败 SHALL 停留在对话框 Status 视图，说明失败步骤与已完成/未执行的部分，并给出 `error.log` 指针；成功时对话框自动退出。失败 MUST NOT 继续执行后续步骤（迁移失败不 forget；forget 失败不删目录；目录删除失败不关 pane）。
-
-#### Scenario: forget 失败不关 pane
-
-- **WHEN** `jj workspace forget` 失败
-- **THEN** 目录与 pane 保持不变，Status 报告失败与后续未执行
-
-#### Scenario: 成功以 Status 收尾
-
-- **WHEN** 全部步骤成功
-- **THEN** 结果在 Status 视图呈现后自动退出（不再依赖 toast 作为唯一出口）

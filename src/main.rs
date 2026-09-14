@@ -4,12 +4,14 @@
 // One binary, dispatched by subcommand (set in herdr-plugin.toml):
 //   open <workspace|tab>  action: capture the caller, open the wizard pane
 //   wizard                pane:   select a source + name, create the two-pane workspace
-//   remove                action: `jj workspace forget` + delete dir + close tab
+//   remove                action: precheck config/jj/target, open the remove dialog pane
+//   remove-wizard         pane:   review + execute the workspace removal
 //
 // The wizard renders the actual "new worktree" modal using the same TUI stack as
 // Herdr (ratatui + crossterm), ported from herdr's src/ui/dialogs.rs and
 // src/ui/widgets.rs so it looks and behaves like the built-in dialog.
 
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -20,7 +22,10 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -30,7 +35,9 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    },
     Frame, Terminal,
 };
 use serde::Deserialize;
@@ -634,8 +641,11 @@ fn main() {
         Some("wizard") => cmd_wizard(),
         Some("finish-tab") => cmd_finish_tab(&args),
         Some("remove") => cmd_remove(),
+        Some("remove-wizard") => cmd_remove_wizard(),
         other => {
-            eprintln!("usage: jj-workspace <open [workspace|tab] | wizard | remove>");
+            eprintln!(
+                "usage: jj-workspace <open [workspace|tab] | wizard | remove | remove-wizard>"
+            );
             eprintln!("got: {other:?}");
             process::exit(2);
         }
@@ -799,7 +809,7 @@ fn cmd_wizard() -> ! {
     let ctx = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
     let source = match resolve_source_from_ctx(&ctx) {
         Ok(source) => source,
-        Err(err) => show_source_error_and_exit(&err),
+        Err(err) => show_resolution_error_and_exit(&err),
     };
     let root = workspaces_root(&config);
 
@@ -906,11 +916,11 @@ fn show_config_error_and_exit(message: &str) -> ! {
     show_error_modal_and_exit("configuration error", message);
 }
 
-/// Fail-fast for the wizard's source resolution: same one-line summary +
-/// error.log pointer wording as the action-side `die()` toast, so both
-/// outlets carry identical copyable text. Rendered as a modal because the
-/// wizard pane has no toast outlet.
-fn show_source_error_and_exit(message: &str) -> ! {
+/// Fail-fast for the interactive panes' context resolution (wizard source /
+/// remove target): same one-line summary + error.log pointer wording as the
+/// action-side `die()` toast, so both outlets carry identical copyable text.
+/// Rendered as a modal because a pane has no toast outlet.
+fn show_resolution_error_and_exit(message: &str) -> ! {
     let log_path = log_error(message);
     let body = die_toast_body(message, log_path.as_deref());
     show_error_modal_and_exit("jj-workspace error", &body);
@@ -1284,39 +1294,12 @@ fn agent_attention_toast(herdr: &str, label: &str, body: &str) {
     let _ = toast.status();
 }
 
-/// Positive counterpart to `die`'s toast: report a completed opencode
-/// session migration. Herdr caps titles at 80 and bodies at 240 chars, so
-/// the body is truncated with an ellipsis when the main repo path is long.
-fn migrated_toast(count: usize, main_repo: &Path) {
-    let text = format!(
-        "migrated {count} opencode session(s) to {}",
-        main_repo.display()
-    );
-    let body = if text.chars().count() > 240 {
-        text.chars().take(239).collect::<String>() + "…"
-    } else {
-        text
-    };
-    let _ = Command::new(herdr_bin())
-        .args([
-            "notification",
-            "show",
-            "opencode sessions migrated",
-            "--body",
-            &body,
-            "--position",
-            "top-right",
-        ])
-        .status();
-}
-
-/// Refuse to remove a workspace that still has uncommitted changes. Verified
-/// on jj 0.45.1: `jj workspace forget` silently discards a dirty working
-/// copy (exit 0, no protection), and the materialized files are deleted right
-/// after — the only real data-loss point of `remove`. Already-committed work
-/// and bookmarks survive (they live in the shared repo store). Fail-closed:
-/// a failed check is treated as dirty.
-fn check_remove_clean(jj: &ResolvedJj, workspace: &Path) -> Result<(), String> {
+/// The uncommitted changes of `workspace` as `jj diff --summary -r @` output
+/// lines (trimmed, blanks dropped). Empty = clean. A spawn failure or a
+/// non-zero exit is an `Err` (fail-closed: the caller must refuse removal
+/// rather than treat "could not check" as "clean"). The error wording keeps
+/// the `refusing to remove` marker the toast/tests rely on.
+fn workspace_change_lines(jj: &ResolvedJj, workspace: &Path) -> Result<Vec<String>, String> {
     // Short name on the first line (toast-critical: herdr truncates long
     // bodies); the full path follows on its own line for stderr and the log.
     let name = workspace
@@ -1349,100 +1332,755 @@ fn check_remove_clean(jj: &ResolvedJj, workspace: &Path) -> Result<(), String> {
             workspace.display()
         ));
     }
-    if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "refusing to remove workspace '{name}': it has uncommitted changes.\n\
-         workspace path: {}\n\
-         Already-committed work and bookmarks are safe in the repo store, but the \
-         materialized changes in this checkout would be deleted.\n\
-         Commit (`jj commit`) or undo (`jj restore`) them first, then run remove again.",
-        workspace.display()
-    ))
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
-/// Action (headless): forget the current jj workspace, delete it, close its tab.
+/// Action (headless): precheck config, `jj.command` and the removal target,
+/// then open the removal dialog pane. All mutation happens in the pane after
+/// explicit authorization; the action only gates reachability (missing cwd,
+/// non-jj directory, unsafe path, unresolvable main repo) with a toast.
 fn cmd_remove() -> ! {
     let config = load_config().unwrap_or_else(|err| die(&err.to_string()));
-    let jj = resolve_jj_command(&config.jj.command, &path_dirs())
-        .unwrap_or_else(|err| die(&err.to_string()));
+    // Resolve eagerly so a broken `jj.command` fails the action (and surfaces
+    // as a toast) instead of surfacing only inside the dialog pane.
+    if let Err(err) = resolve_jj_command(&config.jj.command, &path_dirs()) {
+        die(&err.to_string());
+    }
+    // Precheck the target from our own injected context (no `--env`
+    // forwarding): the pane re-resolves from its own context, so any
+    // divergence falls through to the pane's fail-fast modal.
     let ctx = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
-    let tab = env::var("HERDR_TAB_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| json_string_field(&ctx, "tab_id"));
-    let cwd = json_string_field(&ctx, "workspace_cwd").unwrap_or_default();
-    if cwd.is_empty() {
-        die("no workspace cwd in context");
+    let _target = resolve_remove_target(&ctx).unwrap_or_else(|err| die(&err));
+
+    let mut cmd = Command::new(herdr_bin());
+    cmd.args([
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        &plugin_id(),
+        "--entrypoint",
+        "remove-wizard",
+    ])
+    .arg("--focus");
+    match cmd.status() {
+        Ok(status) => process::exit(status.code().unwrap_or(0)),
+        Err(err) => {
+            eprintln!("error: failed to open remove dialog pane: {err}");
+            process::exit(1);
+        }
+    }
+}
+
+/// Pane (interactive TTY): review the removal in the dialog and, on
+/// authorization, run the staged pipeline. Esc leaves without any mutation.
+fn cmd_remove_wizard() -> ! {
+    let config = match load_config() {
+        Ok(config) => config,
+        Err(err) => show_config_error_and_exit(&err.to_string()),
+    };
+    let jj = match resolve_jj_command(&config.jj.command, &path_dirs()) {
+        Ok(jj) => jj,
+        Err(err) => show_config_error_and_exit(&err.to_string()),
+    };
+    // Re-resolve from our own injected context: the dialog never trusts an
+    // action-side resolution. Failure renders the fail-fast modal (same copy
+    // as the action toast + error.log pointer) instead of the dialog.
+    let ctx = env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
+    let target = match resolve_remove_target(&ctx) {
+        Ok(target) => target,
+        Err(err) => show_resolution_error_and_exit(&err),
+    };
+    let herdr = herdr_bin();
+
+    match run_remove_dialog(&jj, &target, &herdr) {
+        ReviewOutcome::Cancelled => process::exit(0),
+        ReviewOutcome::Authorized(plan) => {
+            let failed = run_remove_pipeline(&jj, &herdr, &plan);
+            process::exit(if failed { 1 } else { 0 });
+        }
+    }
+}
+
+/// Execute an authorized plan in the Status view (tasks 5.2–5.3). Stages run
+/// strictly in order; a destructive failure logs, points Status at
+/// `error.log` and stops, leaving later stages Pending. Per-pane close
+/// failures are warnings inside the close stage, never failures.
+fn run_remove_pipeline(jj: &ResolvedJj, herdr: &str, plan: &RemovePlan) -> bool {
+    let mut state = StatusState::new(plan.dir.as_deref());
+    let mut view = match StatusView::open(&state) {
+        Ok(view) => view,
+        Err(err) => {
+            // Fail closed: without the Status view there is no visible outlet
+            // for progress or failure, so do not start destructive work.
+            let _ = disable_raw_mode();
+            eprintln!("error: cannot start status view: {err}");
+            return true;
+        }
+    };
+
+    // Stage 1: migrate the selected opencode sessions. `dir: None` was
+    // already marked skipped by the constructor — never call with no path.
+    if plan.dir.is_some() {
+        state.running(StatusTask::Migrate);
+        let _ = view.update(&state);
+        let dir = plan.dir.as_deref().expect("dir is Some");
+        match opencode_migration::migrate_selected_opencode_sessions(
+            dir,
+            &plan.main_repo,
+            &plan.session_ids,
+        ) {
+            opencode_migration::Outcome::Skipped(reason) => {
+                state.skipped(StatusTask::Migrate, reason)
+            }
+            opencode_migration::Outcome::Migrated { count, main_repo } => state.done(
+                StatusTask::Migrate,
+                format!("{count} session(s) migrated to {}", main_repo.display()),
+            ),
+            opencode_migration::Outcome::Refused(message) => {
+                return fail_pipeline(&mut view, &mut state, StatusTask::Migrate, &message)
+            }
+        }
+        let _ = view.update(&state);
     }
 
-    let canon = match fs::canonicalize(&cwd) {
-        Ok(p) => p,
-        Err(err) => die(&format!("cannot resolve {cwd}: {err}")),
-    };
-    if !canon.join(".jj").exists() {
-        die(&format!("{} is not a jj workspace", canon.display()));
+    // Stage 2: unregister the workspace. Commits and bookmarks stay in the
+    // shared store, so this is the safe step even for stale registrations.
+    state.running(StatusTask::Forget);
+    let _ = view.update(&state);
+    match resolve_forget_name(jj, plan) {
+        Some(name) => match jj_forget_workspace(jj, &plan.main_repo, &name) {
+            Ok(()) => state.done(
+                StatusTask::Forget,
+                "unregistered; commits & bookmarks stay in the shared store",
+            ),
+            Err(message) => {
+                return fail_pipeline(&mut view, &mut state, StatusTask::Forget, &message)
+            }
+        },
+        None => {
+            return fail_pipeline(
+                &mut view,
+                &mut state,
+                StatusTask::Forget,
+                "cannot resolve the workspace name to forget",
+            )
+        }
     }
-    // The MAIN workspace stores .jj/repo as a directory; a secondary workspace
-    // stores it as a file pointer. Never remove the main workspace.
-    if canon.join(".jj").join("repo").is_dir() {
-        die(&format!(
-            "refusing to remove the MAIN jj workspace ({})",
-            canon.display()
-        ));
+    let _ = view.update(&state);
+
+    // Stage 3: delete the directory (missing = skipped, never failed).
+    if let Some(dir) = plan.dir.as_deref() {
+        if dir.exists() {
+            state.running(StatusTask::Delete);
+            let _ = view.update(&state);
+            match fs::remove_dir_all(dir) {
+                Ok(()) => state.done(StatusTask::Delete, dir.display().to_string()),
+                Err(err) => {
+                    return fail_pipeline(
+                        &mut view,
+                        &mut state,
+                        StatusTask::Delete,
+                        &format!("failed to delete {}: {err}", dir.display()),
+                    )
+                }
+            }
+        } else {
+            state.skipped(StatusTask::Delete, "already missing");
+        }
+        let _ = view.update(&state);
     }
-    if canon == Path::new("/") || canon.parent().is_none() {
-        die(&format!(
+
+    // Stage 4: close the selected panes, best-effort. Individual refusals are
+    // warnings (logged + summarised), never a pipeline failure.
+    if plan.dir.is_some() {
+        if plan.pane_ids.is_empty() {
+            state.skipped(StatusTask::ClosePanes, "no panes selected");
+        } else {
+            state.running(StatusTask::ClosePanes);
+            let _ = view.update(&state);
+            let mut closed = 0usize;
+            let mut failed = 0usize;
+            for pane_id in &plan.pane_ids {
+                match close_herdr_pane(herdr, pane_id) {
+                    Ok(()) => closed += 1,
+                    Err(message) => {
+                        failed += 1;
+                        log_error(&message);
+                    }
+                }
+            }
+            state.done(StatusTask::ClosePanes, close_summary(closed, failed));
+        }
+        let _ = view.update(&state);
+    }
+
+    // Reaching this point means no destructive stage failed; `any_failure`
+    // stays the single source of truth for the exit code.
+    let failed = state.any_failure();
+    let _ = view.finish(failed);
+    failed
+}
+
+/// Record a destructive-stage failure: log it, point Status at the log, draw
+/// the failure and wait for the user to close. Always returns `true` (the
+/// pipeline failure marker).
+fn fail_pipeline(
+    view: &mut StatusView,
+    state: &mut StatusState,
+    task: StatusTask,
+    message: &str,
+) -> bool {
+    state.failed(task, message);
+    if let Some(path) = log_error(message) {
+        state.set_error_log(path);
+    }
+    let _ = view.update(state);
+    let _ = view.finish(true);
+    true
+}
+
+/// The workspace name `jj workspace forget` needs. Picker selections carry
+/// the name directly; a secondary target resolves it by matching the
+/// canonical workspace root in `jj workspace list`; the last resort is the
+/// directory basename.
+fn resolve_forget_name(jj: &ResolvedJj, plan: &RemovePlan) -> Option<String> {
+    if let Some(name) = plan.workspace_name.clone().filter(|name| !name.is_empty()) {
+        return Some(name);
+    }
+    let dir = plan.dir.as_deref()?;
+    if let Ok(entries) = list_secondary_workspaces(jj, &plan.main_repo) {
+        if let Ok(canon) = fs::canonicalize(dir) {
+            let matched = entries.iter().find(|entry| {
+                entry
+                    .root
+                    .as_deref()
+                    .and_then(|root| fs::canonicalize(root).ok())
+                    .as_deref()
+                    == Some(canon.as_path())
+            });
+            if let Some(entry) = matched {
+                return Some(entry.name.clone());
+            }
+        }
+    }
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// Close-stage summary: individual `pane close` refusals are warnings (the
+/// stage is still Done), never a pipeline failure (design D4).
+fn close_summary(closed: usize, failed: usize) -> String {
+    if failed == 0 {
+        format!("{closed} pane(s) closed")
+    } else {
+        format!("{closed} closed, {failed} failed (warning)")
+    }
+}
+
+// --- remove dialog data sources (remove-workspace-dialog, tasks 2.1–2.4) ---
+//
+// Backend half of the removal dialog: target resolution, the secondary
+// workspace picker, the global pane scan, the opencode session preview,
+// display formatting and the individual commands the execution pipeline
+// drives. The TUI and the pipeline itself live in later lanes and call
+// exactly these signatures.
+
+/// Where a `remove` invocation points: the main workspace (the dialog then
+/// runs the secondary-workspace picker) or one secondary workspace (review).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoveTarget {
+    /// `.jj/repo` is a directory: the focused pane is in the main workspace,
+    /// which can never itself be removed — pick a secondary workspace first.
+    Main { main_root: PathBuf },
+    /// A secondary workspace root plus the main repo it belongs to.
+    Secondary { target: PathBuf, main_repo: PathBuf },
+}
+
+/// A path the removal flow refuses to touch: `/` or anything without a
+/// parent (there is nothing above it to keep, and deleting it is never the
+/// intent of "remove this workspace").
+fn unsafe_remove_path(path: &Path) -> bool {
+    path == Path::new("/") || path.parent().is_none()
+}
+
+/// Resolve the removal target from the plugin's own context JSON
+/// (`focused_pane_cwd`, falling back to `workspace_cwd`): canonicalize, then
+/// walk up with [`jj_root`] to the nearest directory carrying `.jj`. That
+/// directory IS the target — secondary workspaces are deliberately not
+/// resolved through to the main repo root (the workspace itself is what gets
+/// removed).
+///
+/// `.jj/repo` being a directory marks the main workspace; a secondary
+/// workspace additionally resolves its `.jj/repo` pointer to the main repo
+/// and fails closed when that pointer is missing, unreadable or
+/// self-referencing. The first error line is short and actionable: it is
+/// what the action's toast renders.
+fn resolve_remove_target(ctx: &str) -> Result<RemoveTarget, String> {
+    let cwd = json_string_field(ctx, "focused_pane_cwd")
+        .filter(|cwd| !cwd.is_empty())
+        .or_else(|| json_string_field(ctx, "workspace_cwd").filter(|cwd| !cwd.is_empty()))
+        .ok_or_else(|| {
+            "no focused pane cwd in plugin context (is there an active workspace?)".to_string()
+        })?;
+    let canon = fs::canonicalize(&cwd)
+        .map_err(|err| format!("cannot resolve focused pane cwd '{cwd}': {err}"))?;
+    if unsafe_remove_path(&canon) {
+        return Err(format!(
             "refusing to remove unsafe path: {}",
             canon.display()
         ));
     }
-    // Refuse dirty workspaces before anything destructive happens.
-    check_remove_clean(&jj, &canon).unwrap_or_else(|message| die(&message));
-
-    // Migrate opencode sessions bound to this workspace (root or
-    // subdirectories) to the main repo before the directory disappears —
-    // opencode keys sessions by directory. Fail-closed like the clean check:
-    // a refused migration aborts the whole removal with nothing forgotten,
-    // deleted or closed (design D9).
-    let main_repo = opencode_migration::resolve_main_repo(&canon).unwrap_or_else(|| {
-        die(&format!(
+    let root = jj_root(&canon.display().to_string())
+        .ok_or_else(|| format!("{cwd} is not inside a jj workspace (no .jj marker found)"))?;
+    let target = fs::canonicalize(&root).unwrap_or_else(|_| PathBuf::from(&root));
+    if unsafe_remove_path(&target) {
+        return Err(format!(
+            "refusing to remove unsafe path: {}",
+            target.display()
+        ));
+    }
+    // The MAIN workspace stores `.jj/repo` as a directory; a secondary
+    // workspace stores it as a file pointer to the main store.
+    if target.join(".jj").join("repo").is_dir() {
+        return Ok(RemoveTarget::Main { main_root: target });
+    }
+    let main_repo = opencode_migration::resolve_main_repo(&target).ok_or_else(|| {
+        format!(
             "cannot resolve the main repo for this workspace (refusing to remove)\n\
              the .jj/repo pointer is missing, unreadable, or points at the workspace itself\n\
              workspace path: {}",
-            canon.display()
-        ))
-    });
-    match opencode_migration::migrate_opencode_sessions(&canon, &main_repo) {
-        opencode_migration::Outcome::Skipped(_reason) => {}
-        opencode_migration::Outcome::Refused(message) => die(&message),
-        opencode_migration::Outcome::Migrated { count, main_repo } => {
-            migrated_toast(count, &main_repo);
-        }
-    }
+            target.display()
+        )
+    })?;
+    Ok(RemoveTarget::Secondary { target, main_repo })
+}
 
-    let mut forget = Command::new(&jj.executable);
-    forget
-        .current_dir(&canon)
+/// One row of the secondary-workspace picker. A `None` root is a stale
+/// registration: the path was never recorded or the directory is gone (jj
+/// renders it empty); such entries can still be forgotten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceEntry {
+    name: String,
+    root: Option<PathBuf>,
+}
+
+/// The jj template rendering one `name<TAB>root` line per registered
+/// workspace (`root` empty when the path is not recorded / deleted). Passed
+/// as ONE argv item — jj compiles it, the shell never touches it.
+const WORKSPACE_LIST_TEMPLATE: &str = "name ++ \"\\t\" ++ root ++ \"\\n\"";
+
+/// Parse the template output of `jj workspace list`: `name<TAB>root` per
+/// line, empty root → `None`, malformed lines (no tab, empty name) skipped,
+/// result sorted by name.
+fn parse_workspace_list(stdout: &str) -> Vec<WorkspaceEntry> {
+    let mut entries: Vec<WorkspaceEntry> = stdout
+        .lines()
+        .filter_map(|line| {
+            let (name, root) = line.split_once('\t')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let root = root.trim();
+            Some(WorkspaceEntry {
+                name: name.to_string(),
+                root: (!root.is_empty()).then(|| PathBuf::from(root)),
+            })
+        })
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
+/// List every secondary workspace registered in `main_repo`, excluding the
+/// main workspace itself (canonical path comparison) and sorting by name.
+/// Spawn failure or a non-zero exit is an `Err` carrying the first stderr
+/// line — the picker must not silently show an empty list when jj failed.
+fn list_secondary_workspaces(
+    jj: &ResolvedJj,
+    main_repo: &Path,
+) -> Result<Vec<WorkspaceEntry>, String> {
+    let mut command = Command::new(&jj.executable);
+    command
         .args(&jj.extra_args)
-        .args(["workspace", "forget"]);
-    run_or(forget, "jj workspace forget", die);
-
-    if let Err(err) = fs::remove_dir_all(&canon) {
-        die(&format!("failed to delete {}: {err}", canon.display()));
+        .arg("-R")
+        .arg(main_repo)
+        .arg("--ignore-working-copy")
+        .args(["workspace", "list", "-T", WORKSPACE_LIST_TEMPLATE]);
+    let output = command
+        .output()
+        .map_err(|err| format!("jj workspace list failed to start: {err}"))?;
+    if !output.status.success() {
+        let reason = first_stderr_line(&output.stderr)
+            .unwrap_or_else(|| format!("exit {}", output.status.code().unwrap_or(-1)));
+        return Err(format!("jj workspace list failed: {reason}"));
     }
+    let main_canon = fs::canonicalize(main_repo).ok();
+    Ok(
+        parse_workspace_list(&String::from_utf8_lossy(&output.stdout))
+            .into_iter()
+            .filter(|entry| match (&entry.root, &main_canon) {
+                (Some(root), Some(main)) => match fs::canonicalize(root) {
+                    Ok(root) => root != *main,
+                    Err(_) => true,
+                },
+                _ => true,
+            })
+            .collect(),
+    )
+}
 
-    match tab {
-        Some(tab) => {
-            let mut close = Command::new(herdr_bin());
-            close.args(["tab", "close", &tab]);
-            run_or(close, "herdr tab close", die);
+/// First non-empty stderr line, trimmed; `None` when stderr is empty.
+fn first_stderr_line(stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+/// One `herdr pane list` entry; every optional field stays optional so field
+/// drift between herdr versions only narrows the matching, never panics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneInfo {
+    pane_id: String,
+    tab_id: String,
+    workspace_id: String,
+    label: Option<String>,
+    agent: Option<String>,
+    agent_status: Option<String>,
+    cwd: Option<String>,
+    foreground_cwd: Option<String>,
+}
+
+/// Why a pane matched the removal target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneMatch {
+    /// The pane's shell cwd is inside the target.
+    Cwd,
+    /// Only the foreground process cwd is inside the target (the shell
+    /// itself still sits elsewhere).
+    ForegroundOnly,
+}
+
+/// A candidate pane plus the reason it matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneCandidate {
+    info: PaneInfo,
+    matched_via: PaneMatch,
+}
+
+/// Optional string field of a JSON object.
+fn pane_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Parse `herdr pane list` JSON (`result.panes[]`). Entries without a
+/// `pane_id` are skipped; every other field tolerates absence and defaults
+/// to empty / `None`.
+fn parse_panes(json: &Value) -> Vec<PaneInfo> {
+    let panes = match json
+        .get("result")
+        .and_then(|result| result.get("panes"))
+        .and_then(Value::as_array)
+    {
+        Some(panes) => panes,
+        None => return Vec::new(),
+    };
+    panes
+        .iter()
+        .filter_map(|pane| {
+            let pane_id = pane.get("pane_id").and_then(Value::as_str)?;
+            if pane_id.is_empty() {
+                return None;
+            }
+            Some(PaneInfo {
+                pane_id: pane_id.to_string(),
+                tab_id: pane_string(pane, "tab_id").unwrap_or_default(),
+                workspace_id: pane_string(pane, "workspace_id").unwrap_or_default(),
+                label: pane_string(pane, "label"),
+                agent: pane_string(pane, "agent"),
+                agent_status: pane_string(pane, "agent_status"),
+                cwd: pane_string(pane, "cwd"),
+                foreground_cwd: pane_string(pane, "foreground_cwd"),
+            })
+        })
+        .collect()
+}
+
+/// True when `dir` is `target` itself or a descendant of it, with a
+/// component boundary (`/a/bc` must never match `/a/b`). Canonicalizes both
+/// sides when possible (so symlinked pane cwds still match); a deleted pane
+/// cwd — canonicalize fails — falls back to a lexical, component-based
+/// prefix comparison against the canonical target.
+fn path_within(target: &Path, dir: &str) -> bool {
+    if dir.is_empty() {
+        return false;
+    }
+    let dir_path = Path::new(dir);
+    let target = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    match fs::canonicalize(dir_path) {
+        Ok(canon_dir) => canon_dir == target || canon_dir.starts_with(&target),
+        Err(_) => dir_path == target.as_path() || dir_path.starts_with(&target),
+    }
+}
+
+/// Match `pane` against `target`: the shell cwd first, then the foreground
+/// process cwd. `None` when neither is inside the target.
+fn pane_matches_target(target: &Path, pane: &PaneInfo) -> Option<PaneMatch> {
+    if let Some(cwd) = pane.cwd.as_deref() {
+        if path_within(target, cwd) {
+            return Some(PaneMatch::Cwd);
         }
-        None => eprintln!("warning: no tab id in context; Herdr tab left open"),
     }
-    println!("removed jj workspace: {}", canon.display());
-    process::exit(0);
+    if let Some(cwd) = pane.foreground_cwd.as_deref() {
+        if path_within(target, cwd) {
+            return Some(PaneMatch::ForegroundOnly);
+        }
+    }
+    None
+}
+
+/// The plugin's own overlay panes: cwd == plugin root AND one of this
+/// plugin's pane titles. `pane process-info` cannot identify overlay panes
+/// (herdr 0.8.2 returns `pane_not_found`, measured), so this rule (design
+/// D5) keeps the dialog from listing or closing itself.
+fn is_plugin_own_pane(pane: &PaneInfo, plugin_root: &Path) -> bool {
+    let label = match pane.label.as_deref() {
+        Some(label) => label,
+        None => return false,
+    };
+    if !matches!(label, "Remove jj workspace" | "New jj workspace") {
+        return false;
+    }
+    let cwd = match pane.cwd.as_deref() {
+        Some(cwd) => cwd,
+        None => return false,
+    };
+    match (fs::canonicalize(cwd), fs::canonicalize(plugin_root)) {
+        (Ok(pane_cwd), Ok(root)) => pane_cwd == root,
+        _ => Path::new(cwd) == plugin_root,
+    }
+}
+
+/// Scan every herdr pane for candidates inside `target`, excluding this
+/// plugin's own overlay panes. A failed `pane list` degrades to an empty
+/// candidate list (no panes listed, no panes closed) rather than an error.
+fn scan_pane_candidates(herdr: &str, target: &Path, plugin_root: &Path) -> Vec<PaneCandidate> {
+    let json = match herdr_json_with(herdr, &["pane", "list"]) {
+        Ok(json) => json,
+        Err(_) => return Vec::new(),
+    };
+    parse_panes(&json)
+        .into_iter()
+        .filter(|pane| !is_plugin_own_pane(pane, plugin_root))
+        .filter_map(|pane| {
+            pane_matches_target(target, &pane).map(|matched_via| PaneCandidate {
+                info: pane,
+                matched_via,
+            })
+        })
+        .collect()
+}
+
+/// Extract `<id_field> → label` from a `result.<collection>[]` response,
+/// skipping entries missing either side.
+fn label_map(
+    result: Result<Value, String>,
+    collection: &str,
+    id_field: &str,
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let json = match result {
+        Ok(json) => json,
+        Err(_) => return map,
+    };
+    let items = match json
+        .get("result")
+        .and_then(|result| result.get(collection))
+        .and_then(Value::as_array)
+    {
+        Some(items) => items,
+        None => return map,
+    };
+    for item in items {
+        if let (Some(id), Some(label)) = (pane_string(item, id_field), pane_string(item, "label")) {
+            map.insert(id, label);
+        }
+    }
+    map
+}
+
+/// Display labels for pane grouping: `(workspace_id → label, tab_id →
+/// label)` from `herdr workspace list` / `herdr tab list`. Either command
+/// failing (or malformed JSON) degrades to an empty map, so the dialog falls
+/// back to raw ids instead of failing.
+fn pane_group_labels(herdr: &str) -> (HashMap<String, String>, HashMap<String, String>) {
+    let workspaces = label_map(
+        herdr_json_with(herdr, &["workspace", "list"]),
+        "workspaces",
+        "workspace_id",
+    );
+    let tabs = label_map(herdr_json_with(herdr, &["tab", "list"]), "tabs", "tab_id");
+    (workspaces, tabs)
+}
+
+/// One session row for the dialog's Plan section. The raw `id` rides along
+/// so the later subset migration call can pass it back verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionDisplay {
+    id: String,
+    title: String,
+    directory: String,
+    time_updated: i64,
+}
+
+/// The dialog's view of the opencode preview: `Skipped` (opencode/DB absent
+/// or no rows — nothing to migrate), `Refused` (fail-closed blocking check),
+/// or `Ready` rows plus the migration destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionPreview {
+    Skipped(String),
+    Refused(String),
+    Ready {
+        rows: Vec<SessionDisplay>,
+        main_repo: PathBuf,
+    },
+}
+
+/// Read-only preview of the sessions bound to `ws`, mapped from the frozen
+/// `opencode_migration::inspect_opencode_sessions` API (SELECTs only).
+/// Preview success does not relax the execution-time fail-closed check — the
+/// pipeline re-inspects there.
+fn session_preview(ws: &Path, main_repo: &Path) -> SessionPreview {
+    match opencode_migration::inspect_opencode_sessions(ws, main_repo) {
+        opencode_migration::Inspection::Skipped(reason) => SessionPreview::Skipped(reason),
+        opencode_migration::Inspection::Refused(reason) => SessionPreview::Refused(reason),
+        opencode_migration::Inspection::Ready { rows, main_repo } => SessionPreview::Ready {
+            rows: rows
+                .into_iter()
+                .map(|row| SessionDisplay {
+                    id: row.id,
+                    title: row.title,
+                    directory: row.directory,
+                    time_updated: row.time_updated,
+                })
+                .collect(),
+            main_repo,
+        },
+    }
+}
+
+/// `dir` as a path relative to `target`: `.` for the target itself,
+/// otherwise the suffix with no leading `/`. Paths outside the target (or
+/// stale, deleted pane cwds) fall back to the full string.
+fn relative_to_target(target: &Path, dir: &str) -> String {
+    let dir_path = Path::new(dir);
+    let base = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let candidate = fs::canonicalize(dir_path).unwrap_or_else(|_| dir_path.to_path_buf());
+    match candidate.strip_prefix(&base) {
+        Ok(rest) if rest.as_os_str().is_empty() => ".".to_string(),
+        Ok(rest) => rest.display().to_string(),
+        Err(_) => dir.to_string(),
+    }
+}
+
+const MINUTE_MS: i64 = 60_000;
+const HOUR_MS: i64 = 3_600_000;
+const DAY_MS: i64 = 86_400_000;
+
+/// Human age for an epoch-millisecond timestamp: `just now`, `5m ago`,
+/// `3h ago`, `6d ago`, then an absolute `YYYY-MM-DD` (UTC) from a week on.
+/// Future timestamps clamp to `just now`.
+fn format_age_ms(ms: i64, now_ms: i64) -> String {
+    let delta = now_ms.saturating_sub(ms).max(0);
+    if delta < MINUTE_MS {
+        "just now".to_string()
+    } else if delta < HOUR_MS {
+        format!("{}m ago", delta / MINUTE_MS)
+    } else if delta < DAY_MS {
+        format!("{}h ago", delta / HOUR_MS)
+    } else if delta < 7 * DAY_MS {
+        format!("{}d ago", delta / DAY_MS)
+    } else {
+        format_date_utc(ms)
+    }
+}
+
+/// `YYYY-MM-DD` (UTC) for an epoch-millisecond timestamp, reusing the
+/// civil-from-days timestamp formatter.
+fn format_date_utc(ms: i64) -> String {
+    let secs = ms.div_euclid(1000).max(0) as u64;
+    format_unix_timestamp(secs).chars().take(10).collect()
+}
+
+/// `jj commit -m <message>` in `workspace` (argv, no shell). A non-zero exit
+/// carries the first stderr line so the dialog can show jj's own error; the
+/// caller refreshes the clean check and only then proceeds.
+fn jj_commit(jj: &ResolvedJj, workspace: &Path, message: &str) -> Result<(), String> {
+    let mut command = Command::new(&jj.executable);
+    command
+        .current_dir(workspace)
+        .args(&jj.extra_args)
+        .args(["commit", "-m", message]);
+    let output = command
+        .output()
+        .map_err(|err| format!("jj commit failed to start: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let code = output.status.code().unwrap_or(-1);
+    Err(match first_stderr_line(&output.stderr) {
+        Some(line) => format!("jj commit failed (exit {code}): {line}"),
+        None => format!("jj commit failed (exit {code})"),
+    })
+}
+
+/// Forget the registered workspace `name` from `main_repo`'s store. Works
+/// for stale registrations whose directory is already gone (design D3), so
+/// the picker can clean those up.
+fn jj_forget_workspace(jj: &ResolvedJj, main_repo: &Path, name: &str) -> Result<(), String> {
+    let mut command = Command::new(&jj.executable);
+    command
+        .args(&jj.extra_args)
+        .arg("-R")
+        .arg(main_repo)
+        .args(["workspace", "forget", name]);
+    let output = command
+        .output()
+        .map_err(|err| format!("jj workspace forget failed to start: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let code = output.status.code().unwrap_or(-1);
+    Err(match first_stderr_line(&output.stderr) {
+        Some(line) => format!("jj workspace forget failed (exit {code}): {line}"),
+        None => format!("jj workspace forget failed (exit {code})"),
+    })
+}
+
+/// Close one herdr pane (`herdr pane close <pane_id>`). Individual failures
+/// are warnings at the call site (design D4): the pipeline keeps closing the
+/// remaining panes.
+fn close_herdr_pane(herdr: &str, pane_id: &str) -> Result<(), String> {
+    let output = Command::new(herdr)
+        .args(["pane", "close", pane_id])
+        .output()
+        .map_err(|err| format!("herdr pane close failed to start: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let code = output.status.code().unwrap_or(-1);
+    Err(match first_stderr_line(&output.stderr) {
+        Some(line) => format!("herdr pane close failed (exit {code}): {line}"),
+        None => format!("herdr pane close failed (exit {code})"),
+    })
 }
 
 // --- wizard TUI (ported from herdr src/ui/dialogs.rs + widgets.rs) ----------
@@ -1457,6 +2095,8 @@ struct Palette {
     text: Color,
     subtext0: Color,
     red: Color,
+    green: Color,
+    yellow: Color,
 }
 
 fn catppuccin() -> Palette {
@@ -1469,6 +2109,8 @@ fn catppuccin() -> Palette {
         text: Color::Rgb(205, 214, 244),
         subtext0: Color::Rgb(166, 173, 200),
         red: Color::Rgb(243, 139, 168),
+        green: Color::Rgb(166, 227, 161),
+        yellow: Color::Rgb(249, 226, 175),
     }
 }
 
@@ -1782,7 +2424,11 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     Ok(())
 }
 
@@ -1880,6 +2526,1918 @@ fn button_rects(inner: Rect) -> (Rect, Rect) {
     x = x.saturating_add(create).saturating_add(gap);
     let cancel_rect = Rect::new(x, y, cancel, 1);
     (create_rect, cancel_rect)
+}
+
+// --- remove dialog (remove-workspace-dialog, tasks 3.1–3.5) -----------------
+//
+// The dialog shares the wizard's modal chrome. This module owns the pure
+// selection model (flat rows, cursor, toggles, counts), the row builder that
+// renders Workspace/Plan/Checks, the picker/review event loops, and the
+// Status view API the execution pipeline drives.
+
+/// Modal width shared with the wizard.
+const REMOVE_MODAL_WIDTH: u16 = 96;
+/// Static hint lines, one per dialog mode.
+const PICKER_HINT: &str = "↑↓ move · ↵ select · esc cancel";
+const REVIEW_HINT: &str = "↑↓ move · space toggle · a all/none · c commit… · ↵ remove · esc cancel";
+const COMMIT_HINT: &str = "type message · ↵ commit · esc back";
+const STATUS_WORKING_HINT: &str = "removing workspace…";
+const STATUS_FAILED_HINT: &str = "↵ close · esc close";
+
+/// Dynamic review rows: their text is derived from the selection model at
+/// draw time (it changes with the selection), never frozen in the row.
+const PANE_WARNING_ID: &str = "pane-warning";
+const SESSION_COUNT_ID: &str = "session-count";
+const PANE_COUNT_ID: &str = "pane-count";
+
+/// What a flat review row represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    Section,
+    Task,
+    Group,
+    Session,
+    Pane,
+    Note,
+    Check,
+    Warning,
+}
+
+/// Semantic color of a row, mapped to the palette at render time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowTone {
+    Normal,
+    Dim,
+    Accent,
+    Error,
+    Ok,
+    Warning,
+}
+
+/// One line of the review screen. Selection state lives in [`ReviewModel`]
+/// (keyed by `id`); the row carries presentation only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewRow {
+    kind: RowKind,
+    depth: u8,
+    text: String,
+    tone: RowTone,
+    /// Leaf id for Session/Pane rows; semantic tag for Task/Warning rows.
+    id: Option<String>,
+}
+
+impl ReviewRow {
+    fn section(text: impl Into<String>) -> ReviewRow {
+        ReviewRow {
+            kind: RowKind::Section,
+            depth: 0,
+            text: text.into(),
+            tone: RowTone::Normal,
+            id: None,
+        }
+    }
+
+    fn task(text: impl Into<String>, id: &str) -> ReviewRow {
+        ReviewRow {
+            kind: RowKind::Task,
+            depth: 1,
+            text: text.into(),
+            tone: RowTone::Normal,
+            id: Some(id.to_string()),
+        }
+    }
+
+    fn group(text: impl Into<String>, depth: u8) -> ReviewRow {
+        ReviewRow {
+            kind: RowKind::Group,
+            depth,
+            text: text.into(),
+            tone: RowTone::Normal,
+            id: None,
+        }
+    }
+
+    fn leaf(kind: RowKind, id: String, text: String) -> ReviewRow {
+        ReviewRow {
+            kind,
+            depth: 2,
+            text,
+            tone: RowTone::Normal,
+            id: Some(id),
+        }
+    }
+
+    fn session(id: String, text: String) -> ReviewRow {
+        ReviewRow::leaf(RowKind::Session, id, text)
+    }
+
+    fn pane(id: String, text: String) -> ReviewRow {
+        // Panes sit under workspace (depth 2) → tab (depth 3) groups.
+        ReviewRow {
+            kind: RowKind::Pane,
+            depth: 4,
+            text,
+            tone: RowTone::Normal,
+            id: Some(id),
+        }
+    }
+
+    fn note(text: impl Into<String>, depth: u8, tone: RowTone) -> ReviewRow {
+        ReviewRow {
+            kind: RowKind::Note,
+            depth,
+            text: text.into(),
+            tone,
+            id: None,
+        }
+    }
+
+    fn check(text: impl Into<String>, tone: RowTone) -> ReviewRow {
+        ReviewRow {
+            kind: RowKind::Check,
+            depth: 1,
+            text: text.into(),
+            tone,
+            id: None,
+        }
+    }
+
+    /// Dynamic "N of M selected" note; the text is computed at draw time
+    /// from the live selection counts.
+    fn count_note(id: &str, depth: u8) -> ReviewRow {
+        ReviewRow {
+            kind: RowKind::Note,
+            depth,
+            text: String::new(),
+            tone: RowTone::Dim,
+            id: Some(id.to_string()),
+        }
+    }
+
+    fn warning() -> ReviewRow {
+        ReviewRow {
+            kind: RowKind::Warning,
+            depth: 2,
+            text: String::new(),
+            tone: RowTone::Warning,
+            id: Some(PANE_WARNING_ID.to_string()),
+        }
+    }
+}
+
+/// Which Plan tasks a review target can perform. A picker entry whose `root`
+/// is empty has an unknown working directory: only `jj workspace forget` is
+/// scopeable, so migration, directory deletion and pane closing are skipped
+/// and shown as such.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlanAvailability {
+    migrate: bool,
+    forget: bool,
+    delete: bool,
+    close_panes: bool,
+}
+
+fn plan_availability(dir: Option<&Path>) -> PlanAvailability {
+    let path_known = dir.is_some();
+    PlanAvailability {
+        migrate: path_known,
+        forget: true,
+        delete: path_known,
+        close_panes: path_known,
+    }
+}
+
+/// The authorized removal the dialog hands back to the execution pipeline.
+///
+/// `dir: None` = the picker selected a `missing on disk` entry whose working
+/// directory is unknown: only `jj workspace forget` runs, and the empty
+/// `session_ids`/`pane_ids` encode "nothing to scope". `workspace_name: None`
+/// means the pipeline resolves the name itself at execution time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemovePlan {
+    dir: Option<PathBuf>,
+    main_repo: PathBuf,
+    workspace_name: Option<String>,
+    session_ids: Vec<String>,
+    pane_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewOutcome {
+    Cancelled,
+    Authorized(RemovePlan),
+}
+
+/// Everything the review screen renders and checks, gathered once when the
+/// dialog opens (and refreshed after an in-dialog commit).
+struct ReviewData {
+    dir: Option<PathBuf>,
+    main_repo: PathBuf,
+    workspace_name: Option<String>,
+    target_label: String,
+    availability: PlanAvailability,
+    clean: Option<Result<Vec<String>, String>>,
+    sessions: SessionPreview,
+    panes: Vec<PaneCandidate>,
+    workspace_labels: HashMap<String, String>,
+    tab_labels: HashMap<String, String>,
+    triggered_pane: Option<String>,
+    now_ms: i64,
+}
+
+impl ReviewData {
+    /// `c` is offered only when the clean check came back dirty and the
+    /// working directory is known (a commit needs a cwd). A failed check is
+    /// fail-closed and not a dirty-workcopy case, so it does not offer `c`.
+    fn can_commit(&self) -> bool {
+        if self.dir.is_none() {
+            return false;
+        }
+        matches!(&self.clean, Some(Ok(changes)) if !changes.is_empty())
+    }
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Render `path` for display, abbreviating a leading `$HOME` prefix with `~`
+/// (component-boundary match, so a sibling like `/home/user2` stays verbatim).
+/// Degrades to the plain path when `HOME` is unset or empty.
+fn display_home_path(path: &Path) -> String {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    display_home_path_with(path, home.as_deref())
+}
+
+/// Testable core of [`display_home_path`] with the home directory injected.
+fn display_home_path_with(path: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Truncate by characters with an ellipsis (session titles can be long).
+fn truncate_title(title: &str, max: usize) -> String {
+    let mut chars = title.chars();
+    let truncated: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+fn session_row_text(session: &SessionDisplay, target: &Path, now_ms: i64) -> String {
+    format!(
+        "{} — {} · {}",
+        truncate_title(&session.title, 40),
+        relative_to_target(target, &session.directory),
+        format_age_ms(session.time_updated, now_ms)
+    )
+}
+
+fn pane_row_text(pane: &PaneCandidate, dir: Option<&Path>, triggered: Option<&str>) -> String {
+    let mut parts = vec![pane.info.pane_id.clone()];
+    match (&pane.info.agent, &pane.info.agent_status) {
+        (Some(agent), Some(status)) => parts.push(format!("{agent} {status}")),
+        (Some(agent), None) => parts.push(agent.clone()),
+        (None, Some(status)) => parts.push(status.clone()),
+        (None, None) => {}
+    }
+    if let (Some(target), Some(cwd)) = (dir, pane.info.cwd.as_deref()) {
+        parts.push(relative_to_target(target, cwd));
+    }
+    if pane.matched_via == PaneMatch::ForegroundOnly {
+        parts.push("[^fg]".to_string());
+    }
+    if triggered == Some(pane.info.pane_id.as_str()) {
+        parts.push("(triggered here)".to_string());
+    }
+    parts.join(" · ")
+}
+
+fn group_label(id: &str, labels: &HashMap<String, String>, fallback: &str) -> String {
+    if id.is_empty() {
+        return fallback.to_string();
+    }
+    labels.get(id).cloned().unwrap_or_else(|| id.to_string())
+}
+
+/// Group candidates herdr-workspace → tab, preserving first-seen order.
+fn group_panes(panes: &[PaneCandidate]) -> Vec<(String, Vec<(String, Vec<&PaneCandidate>)>)> {
+    let mut groups: Vec<(String, Vec<(String, Vec<&PaneCandidate>)>)> = Vec::new();
+    for pane in panes {
+        let workspace_index = match groups
+            .iter()
+            .position(|(id, _)| *id == pane.info.workspace_id)
+        {
+            Some(index) => index,
+            None => {
+                groups.push((pane.info.workspace_id.clone(), Vec::new()));
+                groups.len() - 1
+            }
+        };
+        let tabs = &mut groups[workspace_index].1;
+        let tab_index = match tabs.iter().position(|(id, _)| *id == pane.info.tab_id) {
+            Some(index) => index,
+            None => {
+                tabs.push((pane.info.tab_id.clone(), Vec::new()));
+                tabs.len() - 1
+            }
+        };
+        tabs[tab_index].1.push(pane);
+    }
+    groups
+}
+
+/// Build the flat review row list. Pure: rendering and the selection model
+/// share it, and it is the single place the stale-target skip rules live.
+fn build_review_rows(data: &ReviewData) -> Vec<ReviewRow> {
+    let mut rows = Vec::new();
+
+    rows.push(ReviewRow::section("Workspace"));
+    rows.push(ReviewRow::note(
+        format!("target    {}", data.target_label),
+        1,
+        RowTone::Normal,
+    ));
+    rows.push(ReviewRow::note(
+        format!("main repo {}", display_home_path(&data.main_repo)),
+        1,
+        RowTone::Dim,
+    ));
+
+    rows.push(ReviewRow::section("Plan"));
+
+    // 1. migrate opencode sessions -----------------------------------------
+    rows.push(ReviewRow::task("1. migrate opencode sessions", "migrate"));
+    if !data.availability.migrate {
+        rows.push(ReviewRow::note(
+            "skipped (workspace path unknown)",
+            2,
+            RowTone::Dim,
+        ));
+    } else {
+        match &data.sessions {
+            SessionPreview::Skipped(reason) => rows.push(ReviewRow::note(
+                format!("skipped: {reason}"),
+                2,
+                RowTone::Dim,
+            )),
+            SessionPreview::Refused(reason) => rows.push(ReviewRow::note(
+                format!("blocked: {reason}"),
+                2,
+                RowTone::Error,
+            )),
+            SessionPreview::Ready { rows: sessions, .. } => {
+                if sessions.is_empty() {
+                    rows.push(ReviewRow::note(
+                        "no sessions bound to this workspace",
+                        2,
+                        RowTone::Dim,
+                    ));
+                } else if let Some(target) = data.dir.as_deref() {
+                    rows.push(ReviewRow::count_note(SESSION_COUNT_ID, 2));
+                    for session in sessions {
+                        rows.push(ReviewRow::session(
+                            session.id.clone(),
+                            session_row_text(session, target, data.now_ms),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. jj workspace forget -------------------------------------------------
+    rows.push(ReviewRow::task("2. jj workspace forget", "forget"));
+    if data.availability.forget {
+        rows.push(ReviewRow::note(
+            "commits and bookmarks stay in the shared repo store",
+            2,
+            RowTone::Dim,
+        ));
+    } else {
+        rows.push(ReviewRow::note("skipped", 2, RowTone::Dim));
+    }
+
+    // 3. delete directory ----------------------------------------------------
+    rows.push(ReviewRow::task("3. delete directory", "delete"));
+    if !data.availability.delete {
+        rows.push(ReviewRow::note(
+            "skipped (workspace path unknown)",
+            2,
+            RowTone::Dim,
+        ));
+    } else if let Some(dir) = data.dir.as_deref() {
+        if dir.is_dir() {
+            rows.push(ReviewRow::note(display_home_path(dir), 2, RowTone::Normal));
+        } else {
+            rows.push(ReviewRow::note(
+                format!("already missing: {}", display_home_path(dir)),
+                2,
+                RowTone::Dim,
+            ));
+        }
+    }
+
+    // 4. close panes ---------------------------------------------------------
+    rows.push(ReviewRow::task("4. close panes", "close"));
+    if !data.availability.close_panes {
+        rows.push(ReviewRow::note(
+            "skipped (workspace path unknown)",
+            2,
+            RowTone::Dim,
+        ));
+    } else if data.panes.is_empty() {
+        rows.push(ReviewRow::note(
+            "no panes inside the target",
+            2,
+            RowTone::Dim,
+        ));
+    } else {
+        rows.push(ReviewRow::count_note(PANE_COUNT_ID, 2));
+        for (workspace_id, tabs) in group_panes(&data.panes) {
+            rows.push(ReviewRow::group(
+                group_label(&workspace_id, &data.workspace_labels, "(unknown workspace)"),
+                2,
+            ));
+            for (tab_id, panes) in tabs {
+                rows.push(ReviewRow::group(
+                    group_label(&tab_id, &data.tab_labels, "(unknown tab)"),
+                    3,
+                ));
+                for pane in panes {
+                    rows.push(ReviewRow::pane(
+                        pane.info.pane_id.clone(),
+                        pane_row_text(pane, data.dir.as_deref(), data.triggered_pane.as_deref()),
+                    ));
+                }
+            }
+        }
+        rows.push(ReviewRow::warning());
+    }
+
+    // Checks -----------------------------------------------------------------
+    rows.push(ReviewRow::section("Checks"));
+    match &data.clean {
+        None => rows.push(ReviewRow::check(
+            "· clean working copy: skipped (workspace path unknown)",
+            RowTone::Dim,
+        )),
+        Some(Ok(changes)) if changes.is_empty() => {
+            rows.push(ReviewRow::check("✓ clean working copy", RowTone::Ok))
+        }
+        Some(Ok(changes)) => {
+            rows.push(ReviewRow::check(
+                format!(
+                    "✗ clean working copy: {} uncommitted change(s)",
+                    changes.len()
+                ),
+                RowTone::Error,
+            ));
+            for line in changes.iter().take(3) {
+                rows.push(ReviewRow::note(format!("  {line}"), 2, RowTone::Dim));
+            }
+            if changes.len() > 3 {
+                rows.push(ReviewRow::note(
+                    format!("  … {} more", changes.len() - 3),
+                    2,
+                    RowTone::Dim,
+                ));
+            }
+            rows.push(ReviewRow::note(
+                "preserve: jj commit -m \"<message>\" (press c)",
+                2,
+                RowTone::Dim,
+            ));
+            rows.push(ReviewRow::note(
+                "discard:  jj restore (not run by this dialog)",
+                2,
+                RowTone::Dim,
+            ));
+        }
+        Some(Err(message)) => {
+            rows.push(ReviewRow::check(
+                "✗ clean working copy: check failed (refusing to remove)",
+                RowTone::Error,
+            ));
+            let first = message.lines().next().unwrap_or(message);
+            rows.push(ReviewRow::note(first.to_string(), 2, RowTone::Dim));
+            rows.push(ReviewRow::note(
+                "fix the jj repository first; commit/restore cannot help",
+                2,
+                RowTone::Dim,
+            ));
+        }
+    }
+    if !data.availability.migrate {
+        rows.push(ReviewRow::check(
+            "· opencode sessions: skipped (workspace path unknown)",
+            RowTone::Dim,
+        ));
+    } else {
+        match &data.sessions {
+            SessionPreview::Skipped(reason) => rows.push(ReviewRow::check(
+                format!("· opencode sessions: skipped ({reason})"),
+                RowTone::Dim,
+            )),
+            SessionPreview::Refused(reason) => {
+                rows.push(ReviewRow::check(
+                    "✗ opencode sessions: DB unreadable (refusing to remove)",
+                    RowTone::Error,
+                ));
+                rows.push(ReviewRow::note(reason.clone(), 2, RowTone::Dim));
+                rows.push(ReviewRow::note(
+                    "resolve this outside the dialog, then reopen it",
+                    2,
+                    RowTone::Dim,
+                ));
+            }
+            SessionPreview::Ready {
+                rows: sessions,
+                main_repo,
+            } => {
+                rows.push(ReviewRow::check(
+                    format!("✓ opencode sessions: {} bound", sessions.len()),
+                    RowTone::Ok,
+                ));
+                rows.push(ReviewRow::note(
+                    format!("migrate to {}", display_home_path(main_repo)),
+                    2,
+                    RowTone::Dim,
+                ));
+            }
+        }
+    }
+
+    rows
+}
+
+/// Why `↵` must not authorize yet: `Some(summary)` when any check is ✗.
+/// Path-unknown targets skip the clean check, so nothing blocks them there.
+fn review_blocking_reason(data: &ReviewData) -> Option<String> {
+    match &data.clean {
+        Some(Err(message)) => {
+            let first = message.lines().next().unwrap_or(message);
+            Some(format!("blocked: {first}"))
+        }
+        Some(Ok(changes)) if !changes.is_empty() => Some(format!(
+            "blocked: {} uncommitted change(s) — press c to commit, or run jj restore outside the dialog",
+            changes.len()
+        )),
+        _ => match &data.sessions {
+            SessionPreview::Refused(reason) => {
+                let first = reason.lines().next().unwrap_or(reason);
+                Some(format!(
+                    "blocked: opencode sessions cannot be migrated: {first}"
+                ))
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Default verdict of a group header checkbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupSelection {
+    All,
+    None,
+    Partial,
+}
+
+/// Pure selection/scroll state over the flat review rows: cursor movement,
+/// leaf toggles, group cascade, global toggle, counts and warning text.
+/// `scroll` is independent of the cursor (wheel scrolling never moves the
+/// selection; cursor moves re-follow it). Rendering reads the same rows and
+/// helpers, so the view needs no parallel state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewModel {
+    rows: Vec<ReviewRow>,
+    cursor: usize,
+    scroll: usize,
+    selected_sessions: HashSet<String>,
+    selected_panes: HashSet<String>,
+}
+
+impl ReviewModel {
+    /// Build the model with every session and pane selected (spec default).
+    fn new(rows: Vec<ReviewRow>) -> ReviewModel {
+        let mut model = ReviewModel {
+            rows,
+            cursor: 0,
+            scroll: 0,
+            selected_sessions: HashSet::new(),
+            selected_panes: HashSet::new(),
+        };
+        model.select_all(true);
+        model.cursor = model.first_toggleable().unwrap_or(0);
+        model
+    }
+
+    fn is_selected(&self, kind: RowKind, id: &str) -> bool {
+        match kind {
+            RowKind::Session => self.selected_sessions.contains(id),
+            RowKind::Pane => self.selected_panes.contains(id),
+            _ => false,
+        }
+    }
+
+    fn set_selected(&mut self, kind: RowKind, id: &str, selected: bool) {
+        let set = match kind {
+            RowKind::Session => &mut self.selected_sessions,
+            RowKind::Pane => &mut self.selected_panes,
+            _ => return,
+        };
+        if selected {
+            set.insert(id.to_string());
+        } else {
+            set.remove(id);
+        }
+    }
+
+    /// Select or clear every session and pane.
+    fn select_all(&mut self, selected: bool) {
+        let leaves: Vec<(RowKind, String)> = self
+            .rows
+            .iter()
+            .filter_map(|row| match row.kind {
+                RowKind::Session | RowKind::Pane => row.id.clone().map(|id| (row.kind, id)),
+                _ => None,
+            })
+            .collect();
+        for (kind, id) in leaves {
+            self.set_selected(kind, &id, selected);
+        }
+    }
+
+    /// A group header (herdr workspace / tab) has descendants when a deeper
+    /// leaf follows before the next row at its own depth or shallower.
+    fn has_descendants(&self, index: usize) -> bool {
+        let Some(row) = self.rows.get(index) else {
+            return false;
+        };
+        let depth = row.depth;
+        self.rows[index + 1..]
+            .iter()
+            .take_while(|next| next.depth > depth)
+            .any(|next| matches!(next.kind, RowKind::Session | RowKind::Pane))
+    }
+
+    /// Leaves and group headers can be toggled/cursored. Task rows are plain
+    /// text by design: the hierarchical lists underneath carry selection.
+    fn is_toggleable(&self, index: usize) -> bool {
+        match self.rows.get(index) {
+            Some(row) => match row.kind {
+                RowKind::Session | RowKind::Pane => row.id.is_some(),
+                RowKind::Group => self.has_descendants(index),
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    fn first_toggleable(&self) -> Option<usize> {
+        (0..self.rows.len()).find(|&index| self.is_toggleable(index))
+    }
+
+    /// Move the cursor to the next/previous toggleable row; stays put when
+    /// there is none in that direction.
+    fn move_cursor(&mut self, delta: isize) {
+        let mut index = self.cursor as isize + delta;
+        while index >= 0 && (index as usize) < self.rows.len() {
+            if self.is_toggleable(index as usize) {
+                self.cursor = index as usize;
+                return;
+            }
+            index += delta;
+        }
+    }
+
+    /// Space on a leaf toggles just it; on a group header (herdr workspace /
+    /// tab) it cascades to every descendant leaf (a header with no leaves is
+    /// inert). Task rows are never toggleable, so `space` is a no-op there.
+    fn toggle_current(&mut self) {
+        let index = self.cursor;
+        let Some((kind, depth, id)) = self
+            .rows
+            .get(index)
+            .map(|row| (row.kind, row.depth, row.id.clone()))
+        else {
+            return;
+        };
+        match kind {
+            RowKind::Session | RowKind::Pane => {
+                if let Some(id) = id {
+                    let selected = !self.is_selected(kind, &id);
+                    self.set_selected(kind, &id, selected);
+                }
+            }
+            RowKind::Group => {
+                let select = self.group_state(index) != GroupSelection::All;
+                let toggles: Vec<(RowKind, String)> = self.rows[index + 1..]
+                    .iter()
+                    .take_while(|next| next.depth > depth)
+                    .filter_map(|next| match next.kind {
+                        RowKind::Session | RowKind::Pane => {
+                            next.id.clone().map(|id| (next.kind, id))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for (kind, id) in toggles {
+                    self.set_selected(kind, &id, select);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `a`: if everything is selected, clear all; otherwise select all.
+    fn toggle_all(&mut self) {
+        let all_selected = {
+            let (session_selected, session_total) = self.session_count();
+            let (pane_selected, pane_total) = self.pane_count();
+            session_selected == session_total && pane_selected == pane_total
+        };
+        self.select_all(!all_selected);
+    }
+
+    fn leaf_count(&self, kind: RowKind) -> (usize, usize) {
+        let mut selected = 0;
+        let mut total = 0;
+        for row in &self.rows {
+            if row.kind != kind {
+                continue;
+            }
+            if let Some(id) = row.id.as_deref() {
+                total += 1;
+                if self.is_selected(kind, id) {
+                    selected += 1;
+                }
+            }
+        }
+        (selected, total)
+    }
+
+    fn session_count(&self) -> (usize, usize) {
+        self.leaf_count(RowKind::Session)
+    }
+
+    fn pane_count(&self) -> (usize, usize) {
+        self.leaf_count(RowKind::Pane)
+    }
+
+    /// Live "N of M selected" text for a leaf list; `None` when the list has
+    /// no leaves (the row then renders nothing).
+    fn count_text(&self, kind: RowKind) -> Option<String> {
+        let (selected, total) = self.leaf_count(kind);
+        (total > 0).then(|| format!("{selected} of {total} selected"))
+    }
+
+    fn session_count_text(&self) -> Option<String> {
+        self.count_text(RowKind::Session)
+    }
+
+    fn pane_count_text(&self) -> Option<String> {
+        self.count_text(RowKind::Pane)
+    }
+
+    /// Selected/total leaves under the group/task header at `index`.
+    fn group_counts(&self, index: usize) -> (usize, usize) {
+        let Some(row) = self.rows.get(index) else {
+            return (0, 0);
+        };
+        let depth = row.depth;
+        let mut selected = 0;
+        let mut total = 0;
+        for next in self.rows[index + 1..]
+            .iter()
+            .take_while(|next| next.depth > depth)
+        {
+            if matches!(next.kind, RowKind::Session | RowKind::Pane) {
+                if let Some(id) = next.id.as_deref() {
+                    total += 1;
+                    if self.is_selected(next.kind, id) {
+                        selected += 1;
+                    }
+                }
+            }
+        }
+        (selected, total)
+    }
+
+    fn group_state(&self, index: usize) -> GroupSelection {
+        let (selected, total) = self.group_counts(index);
+        if total == 0 || selected == 0 {
+            GroupSelection::None
+        } else if selected == total {
+            GroupSelection::All
+        } else {
+            GroupSelection::Partial
+        }
+    }
+
+    /// Panes the user unchecked: they keep running while their cwd vanishes.
+    fn unselected_pane_count(&self) -> usize {
+        let (selected, total) = self.pane_count();
+        total - selected
+    }
+
+    fn pane_warning_text(&self) -> Option<String> {
+        let unselected = self.unselected_pane_count();
+        if unselected == 0 {
+            return None;
+        }
+        let total = self.pane_count().1;
+        if unselected == total {
+            Some(format!(
+                "all {total} pane(s) keep running; their cwd will be deleted"
+            ))
+        } else {
+            Some(format!(
+                "{unselected} pane(s) keep running; their cwd will be deleted"
+            ))
+        }
+    }
+
+    fn selected_leaf_ids(&self, kind: RowKind) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|row| row.kind == kind)
+            .filter_map(|row| {
+                row.id
+                    .as_deref()
+                    .filter(|id| self.is_selected(kind, id))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn selected_session_ids(&self) -> Vec<String> {
+        self.selected_leaf_ids(RowKind::Session)
+    }
+
+    fn selected_pane_ids(&self) -> Vec<String> {
+        self.selected_leaf_ids(RowKind::Pane)
+    }
+
+    /// Stored offset clamped to the current content/viewport bounds. The
+    /// cursor does not move it; [`ReviewModel::follow_cursor`] does, after
+    /// cursor moves.
+    fn scroll_offset(&self, view_height: usize) -> usize {
+        clamp_scroll(self.scroll, view_height, self.rows.len())
+    }
+
+    /// Manual scroll (wheel): clamped to the content bounds, never moves the
+    /// cursor.
+    fn scroll_by(&mut self, delta: isize, view_height: usize, content_height: usize) {
+        let next = (self.scroll as isize + delta).max(0) as usize;
+        self.scroll = clamp_scroll(next, view_height, content_height);
+    }
+
+    /// Re-adjust the stored offset just enough to keep the cursor visible
+    /// (the pre-wheel `scroll_offset` semantics).
+    fn follow_cursor(&mut self, view_height: usize) {
+        self.scroll = follow_cursor_offset(self.cursor, self.scroll, view_height);
+    }
+
+    /// Rebuild rows (e.g. after a commit refreshed the checks) keeping the
+    /// current selection; the cursor is clamped to a toggleable row.
+    fn replace_rows(&mut self, rows: Vec<ReviewRow>) {
+        self.rows = rows;
+        if self.cursor >= self.rows.len() {
+            self.cursor = self.rows.len().saturating_sub(1);
+        }
+        if !self.is_toggleable(self.cursor) {
+            self.cursor = self.first_toggleable().unwrap_or(0);
+        }
+    }
+
+    /// The authorized plan. `dir: None` (picker `missing on disk`) yields
+    /// empty session/pane lists: there is no known working directory to scope
+    /// them to, and only forget runs.
+    fn to_plan(
+        &self,
+        dir: Option<PathBuf>,
+        main_repo: PathBuf,
+        workspace_name: Option<String>,
+    ) -> RemovePlan {
+        let path_known = dir.is_some();
+        RemovePlan {
+            dir,
+            main_repo,
+            workspace_name,
+            session_ids: if path_known {
+                self.selected_session_ids()
+            } else {
+                Vec::new()
+            },
+            pane_ids: if path_known {
+                self.selected_pane_ids()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+}
+
+/// The four removal pipeline stages, in execution order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTask {
+    Migrate,
+    Forget,
+    Delete,
+    ClosePanes,
+}
+
+impl StatusTask {
+    fn label(self) -> &'static str {
+        match self {
+            StatusTask::Migrate => "migrate opencode sessions",
+            StatusTask::Forget => "jj workspace forget",
+            StatusTask::Delete => "delete directory",
+            StatusTask::ClosePanes => "close panes",
+        }
+    }
+}
+
+/// One task's display state in the Status view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StatusItemState {
+    Pending,
+    Running,
+    Done(String),
+    Skipped(String),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusItem {
+    task: StatusTask,
+    state: StatusItemState,
+}
+
+/// Pure Status view model: the four ordered items plus the optional
+/// `error.log` pointer shown on failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusState {
+    items: Vec<StatusItem>,
+    error_log: Option<String>,
+}
+
+impl StatusState {
+    /// Fresh state for a plan. A target whose working directory is unknown
+    /// (picker `missing on disk`) can only run `jj workspace forget`; the
+    /// path-scoped tasks start Skipped with the reason.
+    fn new(dir: Option<&Path>) -> StatusState {
+        let mut state = StatusState {
+            items: Vec::new(),
+            error_log: None,
+        };
+        for task in [
+            StatusTask::Migrate,
+            StatusTask::Forget,
+            StatusTask::Delete,
+            StatusTask::ClosePanes,
+        ] {
+            let path_scoped = matches!(
+                task,
+                StatusTask::Migrate | StatusTask::Delete | StatusTask::ClosePanes
+            );
+            let item_state = if dir.is_none() && path_scoped {
+                StatusItemState::Skipped("skipped: workspace path unknown".to_string())
+            } else {
+                StatusItemState::Pending
+            };
+            state.items.push(StatusItem {
+                task,
+                state: item_state,
+            });
+        }
+        state
+    }
+
+    fn set(&mut self, task: StatusTask, state: StatusItemState) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.task == task) {
+            item.state = state;
+        }
+    }
+
+    fn running(&mut self, task: StatusTask) {
+        self.set(task, StatusItemState::Running);
+    }
+
+    fn done(&mut self, task: StatusTask, message: impl Into<String>) {
+        self.set(task, StatusItemState::Done(message.into()));
+    }
+
+    fn skipped(&mut self, task: StatusTask, message: impl Into<String>) {
+        self.set(task, StatusItemState::Skipped(message.into()));
+    }
+
+    fn failed(&mut self, task: StatusTask, message: impl Into<String>) {
+        self.set(task, StatusItemState::Failed(message.into()));
+    }
+
+    fn set_error_log(&mut self, path: impl Into<String>) {
+        self.error_log = Some(path.into());
+    }
+
+    fn any_failure(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item.state, StatusItemState::Failed(_)))
+    }
+
+    fn first_failure(&self) -> Option<(StatusTask, &str)> {
+        self.items.iter().find_map(|item| match &item.state {
+            StatusItemState::Failed(message) => Some((item.task, message.as_str())),
+            _ => None,
+        })
+    }
+}
+
+/// Review modes (the commit sub-mode swaps the hint and the status line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialogMode {
+    Review,
+    Commit,
+}
+
+/// Adaptive modal height: content-sized, clamped to
+/// `[31, min(area.height - 4, 45)]` (the wizard's fixed 26 is the floor).
+fn remove_modal_height(area: Rect, content_height: u16) -> u16 {
+    let cap = area.height.saturating_sub(4).min(45);
+    let floor = 31.min(cap);
+    content_height.clamp(floor, cap.max(floor))
+}
+
+/// Scrollable content viewport of the remove modal in `area` for `row_count`
+/// rows: the adaptive modal height minus the fixed chrome (header, hint,
+/// blank, status line, button row = 7 rows). Mirrors the draw layout.
+fn dialog_view_height(area: Rect, row_count: usize) -> usize {
+    remove_modal_height(area, (row_count as u16).saturating_add(7)).saturating_sub(7) as usize
+}
+
+/// Clamp a scroll offset to `[0, content_height - view_height]`; content that
+/// fits the viewport stays at 0.
+fn clamp_scroll(offset: usize, view_height: usize, content_height: usize) -> usize {
+    if view_height == 0 {
+        return 0;
+    }
+    offset.min(content_height.saturating_sub(view_height))
+}
+
+/// Minimal adjustment of `offset` that brings `cursor` back into view.
+fn follow_cursor_offset(cursor: usize, offset: usize, view_height: usize) -> usize {
+    if view_height == 0 {
+        return offset;
+    }
+    if cursor < offset {
+        cursor
+    } else if cursor >= offset + view_height {
+        cursor + 1 - view_height
+    } else {
+        offset
+    }
+}
+
+/// Vertical scrollbar for a list viewport: `area` is the 1-column strip on
+/// the modal's right content edge; nothing is drawn when the list fits.
+fn render_list_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    content_len: usize,
+    view_height: usize,
+    offset: usize,
+    p: &Palette,
+) {
+    if view_height == 0 || content_len <= view_height {
+        return;
+    }
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("▲"))
+        .end_symbol(Some("▼"))
+        .track_symbol(Some("┃"))
+        .track_style(Style::default().fg(p.overlay0))
+        .thumb_symbol("█")
+        .thumb_style(Style::default().fg(p.subtext0));
+    let mut state = ScrollbarState::new(content_len)
+        .viewport_content_length(view_height)
+        .position(offset);
+    frame.render_stateful_widget(scrollbar, area, &mut state);
+}
+
+/// Centered action + cancel row with the wizard's geometry, but with dialog
+/// labels (`remove` is destructive, the picker uses `select`).
+fn remove_button_rects(inner: Rect, action: &str, cancel: &str) -> (Rect, Rect) {
+    let action_text = action_button_text(Some("↵"), action);
+    let cancel_text = action_button_text(Some("esc"), cancel);
+    let action_w = action_text.chars().count() as u16;
+    let cancel_w = cancel_text.chars().count() as u16;
+    let gap = 2u16;
+    let mut x = inner.x + inner.width.saturating_sub(action_w + cancel_w + gap) / 2;
+    let y = inner.y + inner.height.saturating_sub(1);
+    let action_rect = Rect::new(x, y, action_w, 1);
+    x = x.saturating_add(action_w).saturating_add(gap);
+    (action_rect, Rect::new(x, y, cancel_w, 1))
+}
+
+/// One review row: `›` cursor (toggleable rows only), depth indent aligned
+/// with `SECTION_CONTENT_INDENT`, checkbox for selectable leaves and group
+/// headers. Section titles render flush at the row area's left edge, exactly
+/// like the create wizard's; they are never a cursor target.
+fn draw_review_row(
+    frame: &mut Frame,
+    area: Rect,
+    model: &ReviewModel,
+    index: usize,
+    row: &ReviewRow,
+    p: &Palette,
+) {
+    if row.kind == RowKind::Section {
+        frame.render_widget(
+            Paragraph::new(row.text.clone()).style(section_title_style(false, p)),
+            area,
+        );
+        return;
+    }
+    let cursor = if index == model.cursor && model.is_toggleable(index) {
+        "›"
+    } else {
+        " "
+    };
+    let depth = "  ".repeat(usize::from(row.depth));
+    let marker = match row.kind {
+        RowKind::Session | RowKind::Pane => {
+            let id = row.id.as_deref().unwrap_or_default();
+            if model.is_selected(row.kind, id) {
+                "[x] "
+            } else {
+                "[ ] "
+            }
+        }
+        RowKind::Group if model.has_descendants(index) => match model.group_state(index) {
+            GroupSelection::All => "[x] ",
+            GroupSelection::None => "[ ] ",
+            GroupSelection::Partial => "[-] ",
+        },
+        _ => "",
+    };
+    let text = match row.id.as_deref() {
+        Some(PANE_WARNING_ID) => model.pane_warning_text().unwrap_or_default(),
+        Some(SESSION_COUNT_ID) => model.session_count_text().unwrap_or_default(),
+        Some(PANE_COUNT_ID) => model.pane_count_text().unwrap_or_default(),
+        _ => row.text.clone(),
+    };
+    let mut style = match row.kind {
+        RowKind::Task => Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        _ => match row.tone {
+            RowTone::Normal => Style::default().fg(p.text),
+            RowTone::Dim => Style::default().fg(p.overlay0),
+            RowTone::Accent => Style::default().fg(p.accent),
+            RowTone::Error => Style::default().fg(p.red),
+            RowTone::Ok => Style::default().fg(p.green),
+            RowTone::Warning => Style::default().fg(p.yellow),
+        },
+    };
+    if index == model.cursor && model.is_toggleable(index) {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    frame.render_widget(
+        Paragraph::new(format!("{cursor}  {depth}{marker}{text}")).style(style),
+        area,
+    );
+}
+
+fn draw_review_dialog(
+    frame: &mut Frame,
+    model: &ReviewModel,
+    mode: DialogMode,
+    error: Option<&str>,
+    commit_message: &str,
+) {
+    let p = catppuccin();
+    let area = frame.area();
+    dim_background(frame, area);
+    let desired = remove_modal_height(area, (model.rows.len() as u16).saturating_add(7));
+    let Some(inner) = render_modal_shell(frame, area, REMOVE_MODAL_WIDTH, desired, &p) else {
+        return;
+    };
+    if inner.height < 8 {
+        return;
+    }
+
+    let hint = match mode {
+        DialogMode::Review => REVIEW_HINT,
+        DialogMode::Commit => COMMIT_HINT,
+    };
+    let mut y = inner.y;
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, y, inner.width, 1),
+        "Remove jj workspace",
+        &p,
+    );
+    y += 1;
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(p.overlay0)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 2; // hint + blank separator
+
+    let buttons_y = inner.y + inner.height.saturating_sub(1);
+    let status_y = buttons_y.saturating_sub(1);
+    let content_height = status_y.saturating_sub(y) as usize;
+    let offset = model.scroll_offset(content_height);
+    for (row_index, row) in model
+        .rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(content_height)
+    {
+        let rect = Rect::new(inner.x, y + (row_index - offset) as u16, inner.width, 1);
+        draw_review_row(frame, rect, model, row_index, row, &p);
+    }
+
+    // Vertical scrollbar on the right edge inside the border, only while the
+    // rows overflow the viewport.
+    render_list_scrollbar(
+        frame,
+        Rect::new(
+            inner.x + inner.width.saturating_sub(1),
+            y,
+            1,
+            content_height as u16,
+        ),
+        model.rows.len(),
+        content_height,
+        offset,
+        &p,
+    );
+
+    // Blocked/error/commit line, always directly above the buttons.
+    let (status_text, status_style) = match mode {
+        DialogMode::Commit => (
+            format!("c commit> {commit_message}█"),
+            Style::default().fg(p.text),
+        ),
+        DialogMode::Review => match error {
+            Some(message) => (message.to_string(), Style::default().fg(p.red)),
+            None => (String::new(), Style::default().fg(p.overlay0)),
+        },
+    };
+    frame.render_widget(
+        Paragraph::new(status_text)
+            .style(status_style)
+            .wrap(Wrap { trim: false }),
+        Rect::new(inner.x, status_y, inner.width, 1),
+    );
+
+    let (action_rect, cancel_rect) = remove_button_rects(inner, "remove", "cancel");
+    render_action_button(
+        frame,
+        action_rect,
+        Some("↵"),
+        "remove",
+        Style::default()
+            .fg(panel_contrast_fg(&p))
+            .bg(p.red)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(p.text)
+            .bg(p.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+/// Picker-local state: the enumerated secondary workspaces, the cursor, the
+/// persistent scroll offset (wheel; independent of the cursor) and the load
+/// error (if `jj workspace list` failed).
+struct PickerState {
+    entries: Vec<WorkspaceEntry>,
+    cursor: usize,
+    scroll: usize,
+    error: Option<String>,
+}
+
+fn draw_picker(frame: &mut Frame, state: &PickerState) {
+    let p = catppuccin();
+    let area = frame.area();
+    dim_background(frame, area);
+    let desired = remove_modal_height(area, (state.entries.len() as u16).saturating_add(7));
+    let Some(inner) = render_modal_shell(frame, area, REMOVE_MODAL_WIDTH, desired, &p) else {
+        return;
+    };
+    if inner.height < 8 {
+        return;
+    }
+
+    let mut y = inner.y;
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, y, inner.width, 1),
+        "Remove jj workspace",
+        &p,
+    );
+    y += 1;
+    frame.render_widget(
+        Paragraph::new(PICKER_HINT).style(Style::default().fg(p.overlay0)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 2;
+
+    let buttons_y = inner.y + inner.height.saturating_sub(1);
+    let status_y = buttons_y.saturating_sub(1);
+    let content_height = status_y.saturating_sub(y) as usize;
+
+    if state.entries.is_empty() && state.error.is_none() {
+        frame.render_widget(
+            Paragraph::new("no secondary jj workspaces").style(Style::default().fg(p.overlay0)),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
+    let offset = clamp_scroll(state.scroll, content_height, state.entries.len());
+    if content_height > 0 && !state.entries.is_empty() {
+        for (index, entry) in state
+            .entries
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(content_height)
+        {
+            let is_cursor = index == state.cursor;
+            let cursor = if is_cursor { "›" } else { " " };
+            let (path, tone) = match &entry.root {
+                Some(root) => (display_home_path(root), p.text),
+                None => ("(missing on disk)".to_string(), p.overlay0),
+            };
+            let style = if is_cursor {
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(tone)
+            };
+            frame.render_widget(
+                Paragraph::new(format!("{cursor}  {:<28} {path}", entry.name)).style(style),
+                Rect::new(inner.x, y + (index - offset) as u16, inner.width, 1),
+            );
+        }
+    }
+
+    // Same scrollbar placement/styling as the review list.
+    render_list_scrollbar(
+        frame,
+        Rect::new(
+            inner.x + inner.width.saturating_sub(1),
+            y,
+            1,
+            content_height as u16,
+        ),
+        state.entries.len(),
+        content_height,
+        offset,
+        &p,
+    );
+
+    let error_text = state.error.clone().unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(error_text)
+            .style(Style::default().fg(p.red))
+            .wrap(Wrap { trim: false }),
+        Rect::new(inner.x, status_y, inner.width, 1),
+    );
+
+    let (action_rect, cancel_rect) = remove_button_rects(inner, "select", "cancel");
+    render_action_button(
+        frame,
+        action_rect,
+        Some("↵"),
+        "select",
+        Style::default()
+            .fg(panel_contrast_fg(&p))
+            .bg(p.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(p.text)
+            .bg(p.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+/// Picker event loop. Returns the chosen entry or `None` on esc / load error
+/// / terminal failure (fail-closed: no removal).
+fn run_picker(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    jj: &ResolvedJj,
+    main_root: &Path,
+) -> Option<WorkspaceEntry> {
+    let mut state = PickerState {
+        entries: Vec::new(),
+        cursor: 0,
+        scroll: 0,
+        error: None,
+    };
+    match list_secondary_workspaces(jj, main_root) {
+        Ok(entries) => state.entries = entries,
+        Err(message) => state.error = Some(message),
+    }
+    loop {
+        let view_height = terminal
+            .size()
+            .map(|size| {
+                dialog_view_height(
+                    Rect::new(0, 0, size.width, size.height),
+                    state.entries.len(),
+                )
+            })
+            .unwrap_or(0);
+        let _ = terminal.draw(|frame| draw_picker(frame, &state));
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc => return None,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return None,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.cursor = state.cursor.saturating_sub(1);
+                    state.scroll = follow_cursor_offset(state.cursor, state.scroll, view_height);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if state.cursor + 1 < state.entries.len() {
+                        state.cursor += 1;
+                    }
+                    state.scroll = follow_cursor_offset(state.cursor, state.scroll, view_height);
+                }
+                KeyCode::Enter => {
+                    if state.error.is_none() {
+                        if let Some(entry) = state.entries.get(state.cursor) {
+                            return Some(entry.clone());
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Mouse(mouse)) => {
+                let delta = match mouse.kind {
+                    MouseEventKind::ScrollUp => -3isize,
+                    MouseEventKind::ScrollDown => 3,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    state.scroll = clamp_scroll(
+                        (state.scroll as isize + delta).max(0) as usize,
+                        view_height,
+                        state.entries.len(),
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Collect the review screen's data. `dir: None` means the picker chose a
+/// `missing on disk` entry: migration, deletion and pane closing cannot be
+/// scoped, so no scan/check is attempted and the rows say skipped.
+fn gather_review_data(
+    jj: &ResolvedJj,
+    dir: Option<PathBuf>,
+    main_repo: PathBuf,
+    workspace_name: Option<String>,
+    herdr: &str,
+) -> ReviewData {
+    let target_label = match (&dir, &workspace_name) {
+        (Some(path), _) => display_home_path(path),
+        (None, Some(name)) => format!("{name} (missing on disk)"),
+        (None, None) => "(missing on disk)".to_string(),
+    };
+    let availability = plan_availability(dir.as_deref());
+    let (clean, sessions, panes, workspace_labels, tab_labels) = if let Some(path) = dir.as_deref()
+    {
+        let (workspace_labels, tab_labels) = pane_group_labels(herdr);
+        (
+            Some(workspace_change_lines(jj, path)),
+            session_preview(path, &main_repo),
+            scan_pane_candidates(herdr, path, &plugin_root()),
+            workspace_labels,
+            tab_labels,
+        )
+    } else {
+        (
+            None,
+            SessionPreview::Skipped("workspace path unknown".to_string()),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+    };
+    let triggered_pane = json_string_field(
+        &env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default(),
+        "focused_pane_id",
+    )
+    .filter(|id| !id.is_empty());
+
+    ReviewData {
+        dir,
+        main_repo,
+        workspace_name,
+        target_label,
+        availability,
+        clean,
+        sessions,
+        panes,
+        workspace_labels,
+        tab_labels,
+        triggered_pane,
+        now_ms: now_millis(),
+    }
+}
+
+/// Run the full remove dialog: picker (main workspace only), review, commit
+/// sub-mode. Returns the authorized plan or `Cancelled` (esc / terminal
+/// failure — neither produces a change). IO failures fail closed.
+fn run_remove_dialog(jj: &ResolvedJj, target: &RemoveTarget, herdr: &str) -> ReviewOutcome {
+    if enable_raw_mode().is_err() {
+        return ReviewOutcome::Cancelled;
+    }
+    let mut out = io::stdout();
+    if execute!(out, EnterAlternateScreen).is_err() {
+        let _ = disable_raw_mode();
+        return ReviewOutcome::Cancelled;
+    }
+    // Mouse reporting so herdr forwards real wheel events instead of its
+    // alternate-scroll Up/Down translation (review scroll never moves the
+    // cursor). Every exit path either goes through `restore_terminal` or the
+    // explicit cleanup below.
+    if execute!(out, EnableMouseCapture).is_err() {
+        let _ = execute!(out, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+        return ReviewOutcome::Cancelled;
+    }
+    let mut terminal = match Terminal::new(CrosstermBackend::new(out)) {
+        Ok(terminal) => terminal,
+        Err(_) => {
+            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            return ReviewOutcome::Cancelled;
+        }
+    };
+
+    // Picker first when the caller sits in the main workspace.
+    let (workspace_name, dir, main_repo) = match target {
+        RemoveTarget::Main { main_root } => match run_picker(&mut terminal, jj, main_root) {
+            Some(entry) => (Some(entry.name), entry.root, main_root.clone()),
+            None => {
+                let _ = restore_terminal(&mut terminal);
+                return ReviewOutcome::Cancelled;
+            }
+        },
+        RemoveTarget::Secondary { target, main_repo } => {
+            (None, Some(target.clone()), main_repo.clone())
+        }
+    };
+
+    let mut data = gather_review_data(jj, dir, main_repo, workspace_name, herdr);
+    let mut model = ReviewModel::new(build_review_rows(&data));
+
+    let mut mode = DialogMode::Review;
+    let mut error: Option<String> = None;
+    let mut commit_message = String::new();
+
+    let outcome = loop {
+        let view_height = terminal
+            .size()
+            .map(|size| {
+                dialog_view_height(Rect::new(0, 0, size.width, size.height), model.rows.len())
+            })
+            .unwrap_or(0);
+        let _ = terminal.draw(|frame| {
+            draw_review_dialog(frame, &model, mode, error.as_deref(), &commit_message)
+        });
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc => {
+                    if mode == DialogMode::Commit {
+                        mode = DialogMode::Review;
+                        commit_message.clear();
+                        error = None;
+                    } else {
+                        break ReviewOutcome::Cancelled;
+                    }
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break ReviewOutcome::Cancelled;
+                }
+                KeyCode::Up | KeyCode::Char('k') if mode == DialogMode::Review => {
+                    model.move_cursor(-1);
+                    model.follow_cursor(view_height);
+                    error = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') if mode == DialogMode::Review => {
+                    model.move_cursor(1);
+                    model.follow_cursor(view_height);
+                    error = None;
+                }
+                KeyCode::Char(' ') if mode == DialogMode::Review => {
+                    model.toggle_current();
+                    error = None;
+                }
+                KeyCode::Char('a') if mode == DialogMode::Review => {
+                    model.toggle_all();
+                    error = None;
+                }
+                KeyCode::Char('c') if mode == DialogMode::Review && data.can_commit() => {
+                    mode = DialogMode::Commit;
+                    commit_message.clear();
+                    error = None;
+                }
+                KeyCode::Backspace if mode == DialogMode::Commit => {
+                    commit_message.pop();
+                    error = None;
+                }
+                KeyCode::Char(c)
+                    if mode == DialogMode::Commit
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    commit_message.push(c);
+                    error = None;
+                }
+                KeyCode::Enter => match mode {
+                    DialogMode::Review => {
+                        // Task 5.1: recheck the work copy immediately before
+                        // authorizing (TOCTOU convergence). A fresh failure or
+                        // new dirt refreshes the checks, returns to review and
+                        // executes nothing.
+                        if let Some(dir) = data.dir.clone() {
+                            data.clean = Some(workspace_change_lines(jj, &dir));
+                            model.replace_rows(build_review_rows(&data));
+                            model.follow_cursor(view_height);
+                        }
+                        match review_blocking_reason(&data) {
+                            Some(reason) => error = Some(reason),
+                            None => {
+                                break ReviewOutcome::Authorized(model.to_plan(
+                                    data.dir.clone(),
+                                    data.main_repo.clone(),
+                                    data.workspace_name.clone(),
+                                ))
+                            }
+                        }
+                    }
+                    DialogMode::Commit => {
+                        if commit_message.trim().is_empty() {
+                            mode = DialogMode::Review;
+                            error = Some("commit message must not be empty".to_string());
+                            continue;
+                        }
+                        let Some(dir) = data.dir.clone() else {
+                            mode = DialogMode::Review;
+                            error = Some("cannot commit: workspace path unknown".to_string());
+                            continue;
+                        };
+                        match jj_commit(jj, &dir, &commit_message) {
+                            Ok(()) => {
+                                data.clean = Some(workspace_change_lines(jj, &dir));
+                                model.replace_rows(build_review_rows(&data));
+                                model.follow_cursor(view_height);
+                                commit_message.clear();
+                                mode = DialogMode::Review;
+                                error = None;
+                            }
+                            Err(message) => {
+                                mode = DialogMode::Review;
+                                error = Some(message);
+                            }
+                        }
+                    }
+                },
+                _ => {}
+            },
+            Ok(Event::Mouse(mouse)) => {
+                // Wheel = content scroll only; cursor and selection stay put.
+                let delta = match mouse.kind {
+                    MouseEventKind::ScrollUp => -3isize,
+                    MouseEventKind::ScrollDown => 3,
+                    _ => 0,
+                };
+                if delta != 0 {
+                    model.scroll_by(delta, view_height, model.rows.len());
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                let _ = restore_terminal(&mut terminal);
+                return ReviewOutcome::Cancelled;
+            }
+        }
+    };
+
+    let _ = restore_terminal(&mut terminal);
+    outcome
+}
+
+fn status_row_text(item: &StatusItem) -> (String, RowTone) {
+    let (glyph, tone) = match &item.state {
+        StatusItemState::Pending => ("·", RowTone::Dim),
+        StatusItemState::Running => ("◌", RowTone::Accent),
+        StatusItemState::Done(_) => ("✓", RowTone::Ok),
+        StatusItemState::Skipped(_) => ("·", RowTone::Dim),
+        StatusItemState::Failed(_) => ("✗", RowTone::Error),
+    };
+    let message = match &item.state {
+        StatusItemState::Pending => "",
+        StatusItemState::Running => "running…",
+        StatusItemState::Done(message)
+        | StatusItemState::Skipped(message)
+        | StatusItemState::Failed(message) => message,
+    };
+    let text = if message.is_empty() {
+        format!("{glyph} {}", item.task.label())
+    } else {
+        format!("{glyph} {} — {message}", item.task.label())
+    };
+    (text, tone)
+}
+
+fn draw_status(frame: &mut Frame, state: &StatusState, waiting: bool) {
+    let p = catppuccin();
+    let area = frame.area();
+    dim_background(frame, area);
+    let desired = remove_modal_height(area, (state.items.len() as u16).saturating_add(10));
+    let Some(inner) = render_modal_shell(frame, area, REMOVE_MODAL_WIDTH, desired, &p) else {
+        return;
+    };
+    if inner.height < 8 {
+        return;
+    }
+
+    let hint = if waiting {
+        STATUS_FAILED_HINT
+    } else {
+        STATUS_WORKING_HINT
+    };
+    let mut y = inner.y;
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, y, inner.width, 1),
+        "Remove jj workspace",
+        &p,
+    );
+    y += 1;
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(p.overlay0)),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+    y += 2;
+
+    render_section_title(
+        frame,
+        Rect::new(inner.x, y, inner.width, 1),
+        "Status",
+        true,
+        &p,
+    );
+    y += 1;
+    for item in &state.items {
+        let (text, tone) = status_row_text(item);
+        let style = match tone {
+            RowTone::Normal => Style::default().fg(p.text),
+            RowTone::Dim => Style::default().fg(p.overlay0),
+            RowTone::Accent => Style::default().fg(p.accent),
+            RowTone::Error => Style::default().fg(p.red),
+            RowTone::Ok => Style::default().fg(p.green),
+            RowTone::Warning => Style::default().fg(p.yellow),
+        };
+        frame.render_widget(
+            Paragraph::new(format!("   {text}")).style(style),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        y += 1;
+        if y + 3 >= inner.y + inner.height {
+            break;
+        }
+    }
+
+    if waiting {
+        if let Some((task, reason)) = state.first_failure() {
+            y += 1;
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "failed: {} — {}",
+                    task.label(),
+                    truncate_title(reason, 90)
+                ))
+                .style(Style::default().fg(p.red)),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+            let log = state
+                .error_log
+                .clone()
+                .unwrap_or_else(|| "(error.log unavailable)".to_string());
+            frame.render_widget(
+                Paragraph::new(format!("full log: {log}")).style(Style::default().fg(p.overlay0)),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+        }
+        let text = action_button_text(Some("↵"), "close");
+        let width = text.chars().count() as u16;
+        let x = inner.x + inner.width.saturating_sub(width) / 2;
+        let rect = Rect::new(x, inner.y + inner.height.saturating_sub(1), width, 1);
+        render_action_button(
+            frame,
+            rect,
+            Some("↵"),
+            "close",
+            Style::default()
+                .fg(panel_contrast_fg(&p))
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+}
+
+/// Drives the Status TUI: call [`StatusView::open`] once, [`StatusView::update`]
+/// after every task transition, then [`StatusView::finish`] with the overall
+/// failure flag. On success `finish` restores the terminal immediately (the
+/// process then exits and its overlay pane closes); on failure it waits for
+/// ↵ / esc so the reason and the error.log pointer stay readable.
+struct StatusView {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    /// Last drawn state; `finish` renders it once more before restoring.
+    state: StatusState,
+}
+
+impl StatusView {
+    fn open(state: &StatusState) -> io::Result<StatusView> {
+        enable_raw_mode()?;
+        let mut out = io::stdout();
+        execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+        let mut terminal = match Terminal::new(CrosstermBackend::new(out)) {
+            Ok(terminal) => terminal,
+            Err(err) => {
+                let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+                let _ = disable_raw_mode();
+                return Err(err);
+            }
+        };
+        terminal.draw(|frame| draw_status(frame, state, false))?;
+        Ok(StatusView {
+            terminal,
+            state: state.clone(),
+        })
+    }
+
+    fn update(&mut self, state: &StatusState) -> io::Result<()> {
+        self.state = state.clone();
+        self.terminal
+            .draw(|frame| draw_status(frame, state, false))?;
+        Ok(())
+    }
+
+    fn finish(&mut self, any_failure: bool) -> io::Result<()> {
+        let state = self.state.clone();
+        self.terminal
+            .draw(|frame| draw_status(frame, &state, any_failure))?;
+        if any_failure {
+            loop {
+                match event::read() {
+                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
+                        KeyCode::Enter | KeyCode::Esc => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break
+                        }
+                        _ => {}
+                    },
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        restore_terminal(&mut self.terminal)
+    }
 }
 
 // --- naming (mirrors src/worktree.rs in herdr) -----------------------------
@@ -3644,12 +6202,23 @@ esac
     fn remove_dirty_workspace_is_refused_with_guidance() {
         let dir = TempDir::new();
         let jj = make_fake_jj(dir.path(), "jj", "echo 'A new-file.txt'\n");
-        let err = check_remove_clean(&jj, dir.path()).expect_err("dirty workspace must be refused");
-        assert!(err.contains("uncommitted changes"), "{err}");
-        assert!(err.contains("bookmarks are safe"), "{err}");
-        assert!(err.contains("`jj commit`"), "{err}");
-        assert!(err.contains("`jj restore`"), "{err}");
-        assert!(err.contains("refusing to remove"), "{err}");
+        let changes = workspace_change_lines(&jj, dir.path()).expect("dirty changes");
+        assert_eq!(changes, vec!["A new-file.txt"]);
+
+        // The review screen renders the block reason and both exit paths.
+        let mut data = known_review_data(dir.path().to_path_buf());
+        data.clean = Some(Ok(changes));
+        let rendered: String = build_review_rows(&data)
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("uncommitted change(s)"), "{rendered}");
+        assert!(rendered.contains("jj commit"), "{rendered}");
+        assert!(rendered.contains("jj restore"), "{rendered}");
+        assert!(rendered.contains("bookmarks stay"), "{rendered}");
+        let blocked = review_blocking_reason(&data).expect("dirty blocks authorization");
+        assert!(blocked.contains("uncommitted change(s)"), "{blocked}");
     }
 
     #[test]
@@ -3658,7 +6227,9 @@ esac
         let dir = TempDir::new();
         let jj = make_fake_jj(dir.path(), "jj", "");
         assert!(
-            check_remove_clean(&jj, dir.path()).is_ok(),
+            workspace_change_lines(&jj, dir.path())
+                .expect("clean check")
+                .is_empty(),
             "clean workspace must pass the check"
         );
     }
@@ -3668,10 +6239,651 @@ esac
     fn remove_check_failure_is_fail_closed() {
         let dir = TempDir::new();
         let jj = make_fake_jj(dir.path(), "jj", "exit 3\n");
-        let err =
-            check_remove_clean(&jj, dir.path()).expect_err("a failed check must refuse, not pass");
+        let err = workspace_change_lines(&jj, dir.path())
+            .expect_err("a failed check must refuse, not pass");
         assert!(err.contains("cannot check"), "{err}");
         assert!(err.contains("refusing to remove"), "{err}");
+    }
+
+    fn remove_plan(dir: Option<PathBuf>, name: Option<&str>, main_repo: PathBuf) -> RemovePlan {
+        RemovePlan {
+            dir,
+            main_repo,
+            workspace_name: name.map(str::to_string),
+            session_ids: Vec::new(),
+            pane_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_forget_name_prefers_the_plan_name() {
+        let dir = TempDir::new();
+        // A failing jj proves the picker-supplied name needs no lookup.
+        let jj = make_fake_jj(dir.path(), "jj", "exit 1\n");
+        let plan = remove_plan(
+            Some(dir.path().to_path_buf()),
+            Some("from-picker"),
+            dir.path().to_path_buf(),
+        );
+        assert_eq!(
+            resolve_forget_name(&jj, &plan).as_deref(),
+            Some("from-picker")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_forget_name_matches_root_then_falls_back_to_basename() {
+        let dir = TempDir::new();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).expect("create main repo dir");
+        let ws = dir.path().join("workspace/checkout");
+        std::fs::create_dir_all(&ws).expect("create workspace dir");
+
+        // `jj workspace list` output: an unrelated entry plus the one whose
+        // canonical root matches the target.
+        let jj = make_fake_jj(
+            dir.path(),
+            "jj",
+            r#"D=$(dirname "$0")
+printf 'other\t%s\nfound\t%s\n' "$D/unrelated" "$D/workspace/checkout"
+"#,
+        );
+        let plan = remove_plan(Some(ws.clone()), None, main.clone());
+        assert_eq!(resolve_forget_name(&jj, &plan).as_deref(), Some("found"));
+
+        // No matching entry → directory basename.
+        let empty = make_fake_jj(dir.path(), "empty-jj", "exit 0\n");
+        assert_eq!(
+            resolve_forget_name(&empty, &plan).as_deref(),
+            Some("checkout")
+        );
+
+        // Unknown path and no picker name → nothing to forget.
+        let unknown = remove_plan(None, None, main);
+        assert_eq!(resolve_forget_name(&jj, &unknown), None);
+    }
+
+    #[test]
+    fn close_summary_reports_warnings_without_failing() {
+        assert_eq!(close_summary(3, 0), "3 pane(s) closed");
+        assert_eq!(close_summary(3, 1), "3 closed, 1 failed (warning)");
+        assert_eq!(close_summary(0, 2), "0 closed, 2 failed (warning)");
+    }
+
+    // --- remove dialog data sources -------------------------------------
+
+    /// Writes a fake herdr whose `body` answers the dialog's read commands,
+    /// returning its executable path. Separate from `make_fake_herdr` (which
+    /// serves the agent-readiness schedule) so neither fixture grows cases
+    /// the other does not need.
+    #[cfg(unix)]
+    fn make_fake_herdr_dialog(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = dir.join("herdr-dialog");
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}")).expect("write fake herdr");
+        std::fs::File::open(&bin)
+            .and_then(|file| file.sync_all())
+            .expect("sync fake herdr");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake herdr executable");
+        bin.display().to_string()
+    }
+
+    fn pane_info(pane_id: &str, cwd: Option<&str>, foreground_cwd: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.to_string(),
+            tab_id: "t1".to_string(),
+            workspace_id: "w1".to_string(),
+            label: Some("shell".to_string()),
+            agent: None,
+            agent_status: None,
+            cwd: cwd.map(str::to_string),
+            foreground_cwd: foreground_cwd.map(str::to_string),
+        }
+    }
+
+    /// Creates `main/.jj/repo` (directory) and `ws/.jj/repo` (file pointer to
+    /// main), returning the canonical `(root, main, ws)` paths.
+    #[cfg(unix)]
+    fn make_repo_layout(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let main = dir.join("main");
+        std::fs::create_dir_all(main.join(".jj/repo")).expect("create main repo");
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(ws.join(".jj")).expect("create secondary workspace");
+        std::fs::write(ws.join(".jj/repo"), "../../main/.jj/repo").expect("write repo pointer");
+        (
+            fs::canonicalize(dir).expect("canonical root"),
+            fs::canonicalize(&main).expect("canonical main"),
+            fs::canonicalize(&ws).expect("canonical workspace"),
+        )
+    }
+
+    #[test]
+    fn parse_workspace_list_marks_stale_rows_and_sorts_by_name() {
+        let entries = parse_workspace_list(
+            "stale\t\n\
+             main\t/repos/main\n\
+             malformed line without a tab\n\
+             \t/repos/no-name\n\
+             ws-b\t/repos/ws-b\n\
+             ws-a\t/repos/ws-a\n",
+        );
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["main", "stale", "ws-a", "ws-b"], "{entries:?}");
+        assert_eq!(entries[0].root.as_deref(), Some(Path::new("/repos/main")));
+        assert_eq!(entries[1].root, None, "empty root means stale on disk");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_secondary_workspaces_excludes_the_main_workspace() {
+        let dir = TempDir::new();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(main.join(".jj/repo")).expect("create main repo");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).expect("create secondary dir");
+        let jj = make_fake_jj(
+            dir.path(),
+            "jj",
+            r#"D=$(dirname "$0")
+printf '%s\n' "$@" > "$D/argv"
+printf 'main\t%s\nstale\t\nother\t%s\n' "$D/main" "$D/other"
+"#,
+        );
+
+        let entries = list_secondary_workspaces(&jj, &main).expect("list workspaces");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["other", "stale"], "{entries:?}");
+        assert_eq!(entries[0].root.as_deref(), Some(other.as_path()));
+        assert_eq!(entries[1].root, None);
+
+        // The invocation is argv-only: -R <main> --ignore-working-copy, and
+        // the template is one argv item.
+        let argv = fs::read_to_string(dir.path().join("argv")).expect("read argv");
+        let argv: Vec<&str> = argv.lines().collect();
+        assert_eq!(argv[0], "-R", "{argv:?}");
+        assert_eq!(argv[1], main.display().to_string(), "{argv:?}");
+        assert_eq!(argv[2], "--ignore-working-copy", "{argv:?}");
+        assert_eq!(&argv[3..6], ["workspace", "list", "-T"], "{argv:?}");
+        assert!(
+            argv[6].contains("name ++ \"\\t\" ++ root ++ \"\\n\""),
+            "{argv:?}"
+        );
+        assert_eq!(argv.len(), 7, "{argv:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_secondary_workspaces_reports_the_first_stderr_line() {
+        let dir = TempDir::new();
+        let jj = make_fake_jj(
+            dir.path(),
+            "jj",
+            "echo 'no jj repo here' >&2\necho 'second line' >&2\nexit 2\n",
+        );
+        let err = list_secondary_workspaces(&jj, dir.path()).expect_err("must fail");
+        assert!(err.contains("no jj repo here"), "{err}");
+        assert!(!err.contains("second line"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_remove_target_walks_up_from_a_subdirectory() {
+        let dir = TempDir::new();
+        let (_root, main, ws) = make_repo_layout(dir.path());
+        let sub = ws.join("src/deep");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        let ctx = format!(r#"{{"focused_pane_cwd":"{}"}}"#, sub.display());
+        match resolve_remove_target(&ctx).expect("secondary target") {
+            RemoveTarget::Secondary { target, main_repo } => {
+                assert_eq!(target, ws);
+                assert_eq!(main_repo, main);
+            }
+            other => panic!("expected Secondary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_remove_target_falls_back_to_workspace_cwd() {
+        let dir = TempDir::new();
+        let (_root, _main, ws) = make_repo_layout(dir.path());
+        let ctx = format!(r#"{{"workspace_cwd":"{}"}}"#, ws.display());
+        match resolve_remove_target(&ctx).expect("secondary target") {
+            RemoveTarget::Secondary { target, .. } => assert_eq!(target, ws),
+            other => panic!("expected Secondary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_remove_target_detects_the_main_workspace() {
+        let dir = TempDir::new();
+        let (_root, main, _ws) = make_repo_layout(dir.path());
+        let sub = main.join("src");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        let ctx = format!(r#"{{"focused_pane_cwd":"{}"}}"#, sub.display());
+        match resolve_remove_target(&ctx).expect("main target") {
+            RemoveTarget::Main { main_root } => assert_eq!(main_root, main),
+            other => panic!("expected Main, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_remove_target_refuses_unsafe_paths() {
+        assert!(unsafe_remove_path(Path::new("/")));
+        assert!(!unsafe_remove_path(Path::new("/tmp/ws")));
+
+        let err = resolve_remove_target(r#"{"focused_pane_cwd":"/"}"#)
+            .expect_err("the filesystem root is never a removal target");
+        assert!(err.contains("unsafe path"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_remove_target_fails_closed_without_a_repo_pointer() {
+        // `.jj` exists but `.jj/repo` does not: a secondary workspace whose
+        // pointer cannot be read must not be reported as removable.
+        let dir = TempDir::new();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join(".jj")).expect("create .jj");
+        let ctx = format!(r#"{{"focused_pane_cwd":"{}"}}"#, ws.display());
+        let err = resolve_remove_target(&ctx).expect_err("missing pointer must fail closed");
+        assert!(err.contains("cannot resolve the main repo"), "{err}");
+        assert!(err.contains("refusing to remove"), "{err}");
+
+        // A self-referencing pointer resolves back to the workspace itself.
+        std::fs::write(ws.join(".jj/repo"), "repo").expect("write self pointer");
+        let err = resolve_remove_target(&ctx).expect_err("self pointer must fail closed");
+        assert!(err.contains("cannot resolve the main repo"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_remove_target_rejects_missing_cwd_and_non_jj_dirs() {
+        let err = resolve_remove_target("{}").expect_err("missing cwd");
+        assert!(err.contains("no focused pane cwd"), "{err}");
+
+        let dir = TempDir::new();
+        let ctx = format!(r#"{{"focused_pane_cwd":"{}"}}"#, dir.path().display());
+        let err = resolve_remove_target(&ctx).expect_err("no .jj marker");
+        assert!(err.contains("not inside a jj workspace"), "{err}");
+
+        let ctx = format!(
+            r#"{{"focused_pane_cwd":"{}"}}"#,
+            dir.path().join("gone").display()
+        );
+        let err = resolve_remove_target(&ctx).expect_err("nonexistent cwd");
+        assert!(err.contains("cannot resolve focused pane cwd"), "{err}");
+    }
+
+    #[test]
+    fn path_within_requires_a_component_boundary() {
+        let base = Path::new("/a/b");
+        assert!(path_within(base, "/a/b"));
+        assert!(path_within(base, "/a/b/"));
+        assert!(path_within(base, "/a/b/c"));
+        assert!(!path_within(base, "/a/bc"));
+        assert!(!path_within(base, "/a"));
+        assert!(!path_within(base, ""));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_within_follows_symlinks_for_existing_dirs() {
+        let dir = TempDir::new();
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(target.join("sub")).expect("create target");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        assert!(path_within(&target, &link.display().to_string()));
+        assert!(path_within(
+            &target,
+            &link.join("sub").display().to_string()
+        ));
+        assert!(!path_within(
+            &target,
+            &dir.path().join("other").display().to_string()
+        ));
+    }
+
+    #[test]
+    fn pane_matches_target_prefers_cwd_and_accepts_foreground_only() {
+        let target = Path::new("/a/b");
+        assert_eq!(
+            pane_matches_target(target, &pane_info("p1", Some("/a/b/sub"), None)),
+            Some(PaneMatch::Cwd)
+        );
+        assert_eq!(
+            pane_matches_target(target, &pane_info("p2", Some("/elsewhere"), None)),
+            None
+        );
+        assert_eq!(
+            pane_matches_target(
+                target,
+                &pane_info("p3", Some("/elsewhere"), Some("/a/b/sub"))
+            ),
+            Some(PaneMatch::ForegroundOnly)
+        );
+        assert_eq!(
+            pane_matches_target(target, &pane_info("p4", Some("/a/bc"), None)),
+            None
+        );
+        // cwd wins when both cwds are inside.
+        assert_eq!(
+            pane_matches_target(target, &pane_info("p5", Some("/a/b/x"), Some("/a/b/y"))),
+            Some(PaneMatch::Cwd)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_plugin_own_pane_requires_root_cwd_and_a_plugin_title() {
+        let dir = TempDir::new();
+        let root = fs::canonicalize(dir.path()).expect("canonical plugin root");
+        let cwd = root.display().to_string();
+        let mut pane = pane_info("p1", Some(&cwd), None);
+
+        pane.label = Some("Remove jj workspace".into());
+        assert!(is_plugin_own_pane(&pane, &root));
+        pane.label = Some("New jj workspace".into());
+        assert!(is_plugin_own_pane(&pane, &root));
+        pane.label = Some("shell".into());
+        assert!(!is_plugin_own_pane(&pane, &root));
+        pane.label = Some("Remove jj workspace".into());
+        pane.cwd = Some("/elsewhere".into());
+        assert!(!is_plugin_own_pane(&pane, &root));
+        pane.cwd = None;
+        assert!(!is_plugin_own_pane(&pane, &root));
+    }
+
+    #[test]
+    fn parse_panes_tolerates_missing_fields_and_skips_entries_without_ids() {
+        let json = serde_json::json!({
+            "result": {
+                "panes": [
+                    {
+                        "pane_id": "p1",
+                        "tab_id": "t1",
+                        "workspace_id": "w1",
+                        "label": "shell",
+                        "agent": "codex",
+                        "agent_status": "working",
+                        "cwd": "/a",
+                        "foreground_cwd": "/a/sub"
+                    },
+                    {"tab_id": "t2"},
+                    {"pane_id": ""},
+                    {"pane_id": "p2", "cwd": "/b"},
+                    "not an object"
+                ]
+            }
+        });
+        let panes = parse_panes(&json);
+        assert_eq!(panes.len(), 2, "{panes:?}");
+        assert_eq!(panes[0].pane_id, "p1");
+        assert_eq!(panes[0].foreground_cwd.as_deref(), Some("/a/sub"));
+        assert_eq!(panes[1].pane_id, "p2");
+        assert_eq!(panes[1].tab_id, "");
+        assert_eq!(panes[1].workspace_id, "");
+        assert_eq!(panes[1].label, None);
+
+        assert!(parse_panes(&serde_json::json!({"result": {}})).is_empty());
+        assert!(parse_panes(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn relative_to_target_reports_dot_and_nested_suffixes() {
+        let dir = TempDir::new();
+        let root = fs::canonicalize(dir.path()).expect("canonical root");
+        std::fs::create_dir_all(root.join("src/deep")).expect("create subdir");
+
+        assert_eq!(relative_to_target(&root, &root.display().to_string()), ".");
+        assert_eq!(
+            relative_to_target(&root, &root.join("src/deep").display().to_string()),
+            "src/deep"
+        );
+        // Deleted / never-created subpaths still render lexically.
+        assert_eq!(
+            relative_to_target(&root, &root.join("gone").display().to_string()),
+            "gone"
+        );
+        let outside = TempDir::new();
+        let outside_path = outside.path().join("other");
+        assert_eq!(
+            relative_to_target(&root, &outside_path.display().to_string()),
+            outside_path.display().to_string()
+        );
+    }
+
+    #[test]
+    fn format_age_ms_buckets_ages_and_falls_back_to_a_date() {
+        // 2026-09-17 00:00:00 UTC (a week after the known 2026-09-09 epoch).
+        let now = 1_788_912_000_000 + 8 * 86_400_000;
+        assert_eq!(format_age_ms(now, now), "just now");
+        assert_eq!(format_age_ms(now - 30_000, now), "just now");
+        assert_eq!(format_age_ms(now - 5 * 60_000, now), "5m ago");
+        assert_eq!(format_age_ms(now - 3 * 3_600_000, now), "3h ago");
+        assert_eq!(format_age_ms(now - 6 * 86_400_000, now), "6d ago");
+        assert_eq!(format_age_ms(now - 8 * 86_400_000, now), "2026-09-09");
+        // Future timestamps clamp instead of rendering negative ages.
+        assert_eq!(format_age_ms(now + 60_000, now), "just now");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_change_lines_reports_changes_and_is_fail_closed() {
+        let dir = TempDir::new();
+        let clean = make_fake_jj(dir.path(), "clean-jj", "");
+        assert!(workspace_change_lines(&clean, dir.path())
+            .expect("clean check")
+            .is_empty());
+
+        let dirty = make_fake_jj(
+            dir.path(),
+            "dirty-jj",
+            "echo 'A new-file.txt'\necho '   '\necho 'M modified.txt'\n",
+        );
+        let lines = workspace_change_lines(&dirty, dir.path()).expect("dirty lines");
+        assert_eq!(lines, vec!["A new-file.txt", "M modified.txt"]);
+
+        let failed = make_fake_jj(dir.path(), "failed-jj", "echo 'broken store' >&2\nexit 3\n");
+        let err = workspace_change_lines(&failed, dir.path()).expect_err("must refuse");
+        assert!(err.contains("cannot check"), "{err}");
+        assert!(err.contains("refusing to remove"), "{err}");
+
+        let missing = ResolvedJj {
+            executable: dir.path().join("does-not-exist"),
+            extra_args: Vec::new(),
+        };
+        let err = workspace_change_lines(&missing, dir.path()).expect_err("spawn failure");
+        assert!(err.contains("cannot check"), "{err}");
+        assert!(err.contains("refusing to remove"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_pane_candidates_filters_and_excludes_own_overlay_panes() {
+        let dir = TempDir::new();
+        let target_dir = dir.path().join("target");
+        std::fs::create_dir_all(&target_dir).expect("create target");
+        let target = fs::canonicalize(&target_dir).expect("canonical target");
+        let plugin_dir = dir.path().join("plugin");
+        std::fs::create_dir_all(&plugin_dir).expect("create plugin root");
+        let plugin = fs::canonicalize(&plugin_dir).expect("canonical plugin root");
+        let sibling = format!("{}bc", target.display());
+        let target_s = target.display().to_string();
+        let plugin_s = plugin.display().to_string();
+        let body = format!(
+            r#"case "$1 $2" in
+  "pane list")
+    printf '%s' '{{"result":{{"panes":[
+      {{"pane_id":"inside","tab_id":"t1","workspace_id":"w1","label":"shell","cwd":"{target_s}"}},
+      {{"pane_id":"fg","tab_id":"t1","workspace_id":"w1","label":"shell","cwd":"/elsewhere","foreground_cwd":"{target_s}/src"}},
+      {{"pane_id":"sibling","tab_id":"t2","workspace_id":"w2","label":"shell","cwd":"{sibling}"}},
+      {{"pane_id":"own","tab_id":"t3","workspace_id":"w3","label":"Remove jj workspace","cwd":"{plugin_s}"}},
+      {{"tab_id":"t4"}}
+    ]}}}}'
+    ;;
+esac
+"#
+        );
+        let herdr = make_fake_herdr_dialog(dir.path(), &body);
+        let candidates = scan_pane_candidates(&herdr, &target, &plugin);
+        let ids: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.info.pane_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["inside", "fg"], "{candidates:?}");
+        assert_eq!(candidates[0].matched_via, PaneMatch::Cwd);
+        assert_eq!(candidates[1].matched_via, PaneMatch::ForegroundOnly);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_pane_candidates_degrades_to_empty_when_pane_list_fails() {
+        let dir = TempDir::new();
+        let herdr = make_fake_herdr_dialog(dir.path(), "echo 'server down' >&2\nexit 1\n");
+        let candidates = scan_pane_candidates(&herdr, dir.path(), dir.path());
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pane_group_labels_maps_ids_to_labels_and_degrades_to_empty() {
+        let dir = TempDir::new();
+        let herdr = make_fake_herdr_dialog(
+            dir.path(),
+            r#"case "$1 $2" in
+  "workspace list")
+    echo '{"result":{"workspaces":[{"workspace_id":"w1","label":"alpha"},{"workspace_id":"w2"}]}}'
+    ;;
+  "tab list")
+    echo '{"result":{"tabs":[{"tab_id":"t1","label":"main"}]}}'
+    ;;
+esac
+"#,
+        );
+        let (workspaces, tabs) = pane_group_labels(&herdr);
+        assert_eq!(workspaces.get("w1").map(String::as_str), Some("alpha"));
+        assert!(!workspaces.contains_key("w2"), "{workspaces:?}");
+        assert_eq!(tabs.get("t1").map(String::as_str), Some("main"));
+
+        // One command failing empties only its map; the other survives.
+        let dir2 = TempDir::new();
+        let herdr2 = make_fake_herdr_dialog(
+            dir2.path(),
+            r#"case "$1 $2" in
+  "workspace list") exit 1 ;;
+  "tab list") echo '{"result":{"tabs":[{"tab_id":"t1","label":"main"}]}}' ;;
+esac
+"#,
+        );
+        let (workspaces, tabs) = pane_group_labels(&herdr2);
+        assert!(workspaces.is_empty());
+        assert_eq!(tabs.get("t1").map(String::as_str), Some("main"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn jj_commit_runs_in_the_workspace_and_reports_stderr() {
+        let dir = TempDir::new();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+        let jj = make_fake_jj(
+            dir.path(),
+            "jj",
+            r#"D=$(dirname "$0")
+printf '%s\n' "$@" > "$D/argv"
+pwd > "$D/cwd"
+"#,
+        );
+        jj_commit(&jj, &workspace, "fix the thing").expect("commit succeeds");
+        let argv = fs::read_to_string(dir.path().join("argv")).expect("read argv");
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec!["commit", "-m", "fix the thing"]
+        );
+        let cwd = fs::read_to_string(dir.path().join("cwd")).expect("read cwd");
+        let expected = fs::canonicalize(&workspace).expect("canonical workspace");
+        assert_eq!(cwd.trim(), expected.display().to_string());
+
+        // argv-form jj.command leading args ride before the subcommand.
+        let mut extra = make_fake_jj(
+            dir.path(),
+            "extra-jj",
+            "D=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" > \"$D/argv-extra\"\n",
+        );
+        extra.extra_args = vec!["--at-op".into(), "@-".into()];
+        jj_commit(&extra, &workspace, "m").expect("commit with extra args");
+        let argv = fs::read_to_string(dir.path().join("argv-extra")).expect("read extra argv");
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec!["--at-op", "@-", "commit", "-m", "m"]
+        );
+
+        let failing = make_fake_jj(
+            dir.path(),
+            "fail-jj",
+            "echo 'error: conflicted commit' >&2\nexit 1\n",
+        );
+        let err = jj_commit(&failing, &workspace, "m").expect_err("must fail");
+        assert!(err.contains("jj commit failed"), "{err}");
+        assert!(err.contains("conflicted commit"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn jj_forget_workspace_targets_the_main_repo_by_argv() {
+        let dir = TempDir::new();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).expect("create main dir");
+        let jj = make_fake_jj(
+            dir.path(),
+            "jj",
+            "D=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" > \"$D/argv\"\n",
+        );
+        jj_forget_workspace(&jj, &main, "ws-a").expect("forget works");
+        let argv = fs::read_to_string(dir.path().join("argv")).expect("read argv");
+        let argv: Vec<&str> = argv.lines().collect();
+        assert_eq!(argv[0], "-R", "{argv:?}");
+        assert_eq!(argv[1], main.display().to_string(), "{argv:?}");
+        assert_eq!(&argv[2..], ["workspace", "forget", "ws-a"], "{argv:?}");
+
+        let failing = make_fake_jj(
+            dir.path(),
+            "fail-jj",
+            "echo 'no such workspace' >&2\nexit 1\n",
+        );
+        let err = jj_forget_workspace(&failing, &main, "ws-a").expect_err("must fail");
+        assert!(err.contains("jj workspace forget failed"), "{err}");
+        assert!(err.contains("no such workspace"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn close_herdr_pane_passes_the_pane_id_and_reports_stderr() {
+        let dir = TempDir::new();
+        let herdr = make_fake_herdr_dialog(
+            dir.path(),
+            "D=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" > \"$D/argv\"\n",
+        );
+        close_herdr_pane(&herdr, "pane-1").expect("close succeeds");
+        let argv = fs::read_to_string(dir.path().join("argv")).expect("read argv");
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec!["pane", "close", "pane-1"]
+        );
+
+        let dir2 = TempDir::new();
+        let failing = make_fake_herdr_dialog(dir2.path(), "echo 'pane not found' >&2\nexit 1\n");
+        let err = close_herdr_pane(&failing, "pane-1").expect_err("must fail");
+        assert!(err.contains("herdr pane close failed"), "{err}");
+        assert!(err.contains("pane not found"), "{err}");
     }
 
     #[test]
@@ -3758,6 +6970,825 @@ esac
         );
     }
 
+    // --- remove dialog selection model ----------------------------------
+
+    fn sample_review_rows() -> Vec<ReviewRow> {
+        vec![
+            ReviewRow::section("Plan"),
+            ReviewRow::task("1. migrate opencode sessions", "migrate"),
+            ReviewRow::session("s1".into(), "one".into()),
+            ReviewRow::session("s2".into(), "two".into()),
+            ReviewRow::task("2. jj workspace forget", "forget"),
+            ReviewRow::task("4. close panes", "close"),
+            ReviewRow::group("ws-a", 2),
+            ReviewRow::group("tab-1", 3),
+            ReviewRow::pane("p1".into(), "first".into()),
+            ReviewRow::pane("p2".into(), "second".into()),
+            ReviewRow::group("ws-b", 2),
+            ReviewRow::pane("p3".into(), "third".into()),
+            ReviewRow::warning(),
+        ]
+    }
+
+    fn row_index(rows: &[ReviewRow], needle: &str) -> usize {
+        rows.iter()
+            .position(|row| row.text == needle)
+            .unwrap_or_else(|| panic!("no row {needle:?}"))
+    }
+
+    fn candidate(pane_id: &str, workspace_id: &str, tab_id: &str) -> PaneCandidate {
+        PaneCandidate {
+            info: PaneInfo {
+                pane_id: pane_id.to_string(),
+                tab_id: tab_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                label: None,
+                agent: None,
+                agent_status: None,
+                cwd: None,
+                foreground_cwd: None,
+            },
+            matched_via: PaneMatch::Cwd,
+        }
+    }
+
+    fn stale_review_data() -> ReviewData {
+        ReviewData {
+            dir: None,
+            main_repo: PathBuf::from("/main"),
+            workspace_name: Some("ws-old".to_string()),
+            target_label: "ws-old (missing on disk)".to_string(),
+            availability: plan_availability(None),
+            clean: None,
+            sessions: SessionPreview::Skipped("workspace path unknown".to_string()),
+            panes: Vec::new(),
+            workspace_labels: HashMap::new(),
+            tab_labels: HashMap::new(),
+            triggered_pane: None,
+            now_ms: 0,
+        }
+    }
+
+    fn known_review_data(dir: PathBuf) -> ReviewData {
+        let availability = plan_availability(Some(&dir));
+        ReviewData {
+            dir: Some(dir),
+            main_repo: PathBuf::from("/main"),
+            workspace_name: None,
+            target_label: "/ws".to_string(),
+            availability,
+            clean: Some(Ok(Vec::new())),
+            sessions: SessionPreview::Skipped("no sessions".to_string()),
+            panes: Vec::new(),
+            workspace_labels: HashMap::new(),
+            tab_labels: HashMap::new(),
+            triggered_pane: None,
+            now_ms: 0,
+        }
+    }
+
+    #[test]
+    fn review_model_selects_all_leaves_by_default() {
+        let model = ReviewModel::new(sample_review_rows());
+        assert_eq!(model.session_count(), (2, 2));
+        assert_eq!(model.pane_count(), (3, 3));
+        assert!(model.pane_warning_text().is_none());
+        // The cursor starts on the first toggleable row (the first session);
+        // task rows are plain text and never cursor targets.
+        assert_eq!(model.rows[model.cursor].id.as_deref(), Some("s1"));
+        assert!(!model.is_toggleable(1), "migrate task row");
+        assert!(!model.is_toggleable(5), "close-panes task row");
+    }
+
+    #[test]
+    fn review_model_group_header_cascades_to_its_subtree() {
+        let rows = sample_review_rows();
+        let tab = row_index(&rows, "tab-1");
+        let mut model = ReviewModel::new(rows);
+        model.cursor = tab;
+        assert_eq!(model.group_state(tab), GroupSelection::All);
+
+        model.toggle_current();
+        assert!(!model.is_selected(RowKind::Pane, "p1"));
+        assert!(!model.is_selected(RowKind::Pane, "p2"));
+        assert!(
+            model.is_selected(RowKind::Pane, "p3"),
+            "other groups untouched"
+        );
+        assert_eq!(model.group_state(tab), GroupSelection::None);
+        assert_eq!(
+            model.group_state(row_index(&model.rows, "ws-b")),
+            GroupSelection::All
+        );
+
+        model.toggle_current();
+        assert!(model.is_selected(RowKind::Pane, "p1"));
+
+        // A leaf toggle leaves its group partially selected.
+        model.cursor = row_index(&model.rows, "first");
+        model.toggle_current();
+        assert_eq!(model.group_state(tab), GroupSelection::Partial);
+        assert_eq!(
+            model.group_state(row_index(&model.rows, "ws-a")),
+            GroupSelection::Partial
+        );
+    }
+
+    #[test]
+    fn review_model_cursor_skips_non_toggleable_rows() {
+        let mut model = ReviewModel::new(sample_review_rows());
+        // First toggleable row is the first session leaf.
+        assert_eq!(model.cursor, 2);
+        model.move_cursor(1);
+        assert_eq!(model.rows[model.cursor].id.as_deref(), Some("s2"));
+        // Both task rows ("2. jj workspace forget", "4. close panes") are
+        // skipped; the next stop is the ws-a group header.
+        model.move_cursor(1);
+        assert_eq!(model.rows[model.cursor].text, "ws-a");
+        model.move_cursor(1);
+        assert_eq!(model.rows[model.cursor].text, "tab-1");
+        model.move_cursor(-1);
+        assert_eq!(model.rows[model.cursor].text, "ws-a");
+        // Even with the cursor forced there, a task row cannot toggle.
+        model.cursor = 5;
+        model.toggle_current();
+        assert_eq!(model.pane_count(), (3, 3), "space on a task row is inert");
+    }
+
+    #[test]
+    fn review_model_global_toggle_clears_and_restores_everything() {
+        let mut model = ReviewModel::new(sample_review_rows());
+        model.toggle_all();
+        assert_eq!(model.session_count(), (0, 2));
+        assert_eq!(model.pane_count(), (0, 3));
+        assert_eq!(
+            model.pane_warning_text().as_deref(),
+            Some("all 3 pane(s) keep running; their cwd will be deleted")
+        );
+        model.toggle_all();
+        assert_eq!(model.session_count(), (2, 2));
+        assert_eq!(model.pane_count(), (3, 3));
+        assert!(model.pane_warning_text().is_none());
+    }
+
+    #[test]
+    fn review_model_counts_and_warning_detect_unchecked_panes() {
+        let rows = sample_review_rows();
+        let first_pane = row_index(&rows, "first");
+        let mut model = ReviewModel::new(rows);
+        model.cursor = first_pane;
+        model.toggle_current();
+        assert_eq!(model.pane_count(), (2, 3));
+        assert_eq!(model.unselected_pane_count(), 1);
+        assert_eq!(
+            model.pane_warning_text().as_deref(),
+            Some("1 pane(s) keep running; their cwd will be deleted")
+        );
+        assert_eq!(model.session_count(), (2, 2), "sessions untouched");
+    }
+
+    #[test]
+    fn review_model_selected_ids_follow_row_order() {
+        let rows = sample_review_rows();
+        let second_session = row_index(&rows, "two");
+        let mut model = ReviewModel::new(rows);
+        model.cursor = second_session;
+        model.toggle_current();
+        assert_eq!(model.selected_session_ids(), vec!["s1"]);
+        assert_eq!(model.selected_pane_ids(), vec!["p1", "p2", "p3"]);
+    }
+
+    #[test]
+    fn review_model_scroll_offset_keeps_cursor_visible() {
+        let mut model = ReviewModel::new(sample_review_rows());
+        assert_eq!(model.scroll_offset(10), 0);
+        assert_eq!(model.scroll_offset(0), 0);
+        // The cursor no longer derives the offset: a manual scroll sticks...
+        model.scroll_by(5, 5, model.rows.len());
+        assert_eq!(model.scroll_offset(5), 5);
+        // ...and moving the cursor re-follows it minimally.
+        model.cursor = 12;
+        model.follow_cursor(5);
+        assert_eq!(model.scroll_offset(5), 8);
+    }
+
+    #[test]
+    fn review_model_scroll_by_clamps_to_content_bounds() {
+        let mut model = ReviewModel::new(sample_review_rows());
+        let rows = model.rows.len();
+        assert_eq!(rows, 13);
+
+        model.scroll_by(3, 5, rows);
+        assert_eq!(model.scroll_offset(5), 3);
+        // Bottom clamp: 13 rows, 5 visible → max offset 8.
+        model.scroll_by(100, 5, rows);
+        assert_eq!(model.scroll_offset(5), 8);
+        // Top clamp.
+        model.scroll_by(-100, 5, rows);
+        assert_eq!(model.scroll_offset(5), 0);
+        // No overflow: everything fits, offset stays 0.
+        model.scroll_by(5, 20, rows);
+        assert_eq!(model.scroll_offset(20), 0);
+        // The getter also clamps a stale stored offset.
+        model.scroll_by(8, 5, rows);
+        assert_eq!(model.scroll_offset(20), 0);
+    }
+
+    #[test]
+    fn review_model_cursor_move_refollows_after_manual_scroll() {
+        let mut model = ReviewModel::new(sample_review_rows());
+        let rows = model.rows.len();
+
+        // Scroll to the bottom, then move the cursor back above the viewport.
+        model.scroll_by(100, 5, rows);
+        assert_eq!(model.scroll_offset(5), 8);
+        model.cursor = 2;
+        model.move_cursor(-1); // 2 is the first toggleable row; cursor stays
+        model.follow_cursor(5);
+        assert_eq!(model.scroll_offset(5), 2);
+
+        // Moving down past the viewport follows the cursor by one step.
+        model.cursor = 7;
+        model.follow_cursor(5);
+        assert_eq!(model.scroll_offset(5), 3);
+    }
+
+    #[test]
+    fn review_rows_render_scrollbar_only_when_content_overflows() {
+        // Fits: 13 rows in a 40-line terminal → no scrollbar arrows.
+        let fits = ReviewModel::new(sample_review_rows());
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_review_dialog(frame, &fits, DialogMode::Review, None, ""))
+            .expect("draw review dialog");
+        let buffer = terminal.backend().buffer();
+        assert!(
+            !buffer_contains(buffer, '▲') && !buffer_contains(buffer, '▼'),
+            "no scrollbar without overflow"
+        );
+
+        // Overflow: 60 rows in the same viewport → scrollbar arrows render.
+        let many = ReviewModel::new(
+            (0..60)
+                .map(|index| ReviewRow::note(format!("line {index}"), 0, RowTone::Dim))
+                .collect(),
+        );
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_review_dialog(frame, &many, DialogMode::Review, None, ""))
+            .expect("draw review dialog");
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer_contains(buffer, '▲') && buffer_contains(buffer, '▼'),
+            "scrollbar arrows must render when the rows overflow"
+        );
+    }
+
+    #[test]
+    fn plan_availability_skips_path_scoped_tasks() {
+        assert_eq!(
+            plan_availability(Some(Path::new("/ws"))),
+            PlanAvailability {
+                migrate: true,
+                forget: true,
+                delete: true,
+                close_panes: true,
+            }
+        );
+        let stale = plan_availability(None);
+        assert!(!stale.migrate && stale.forget && !stale.delete && !stale.close_panes);
+    }
+
+    #[test]
+    fn review_rows_mark_unknown_path_targets_as_skipped() {
+        let rows = build_review_rows(&stale_review_data());
+        let skipped = rows
+            .iter()
+            .filter(|row| row.text == "skipped (workspace path unknown)")
+            .count();
+        assert_eq!(skipped, 3, "migrate, delete and close panes: {rows:#?}");
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row.kind, RowKind::Session | RowKind::Pane)),
+            "no session/pane rows can be scoped without a path"
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row.kind == RowKind::Note && row.text.contains("missing on disk")));
+        assert!(rows
+            .iter()
+            .any(|row| row.kind == RowKind::Check
+                && row.text.contains("clean working copy: skipped")));
+        assert!(rows.iter().any(
+            |row| row.kind == RowKind::Check && row.text.contains("opencode sessions: skipped")
+        ));
+        // Forget is always available and keeps its shared-store note.
+        assert!(rows
+            .iter()
+            .any(|row| row.kind == RowKind::Note && row.text.contains("bookmarks stay")));
+    }
+
+    #[test]
+    fn review_plan_omits_path_scoped_selections_for_unknown_paths() {
+        let model = ReviewModel::new(sample_review_rows());
+        let stale = model.to_plan(None, PathBuf::from("/main"), Some("ws-old".into()));
+        assert_eq!(stale.dir, None);
+        assert!(stale.session_ids.is_empty());
+        assert!(stale.pane_ids.is_empty());
+
+        let known = model.to_plan(Some(PathBuf::from("/ws")), PathBuf::from("/main"), None);
+        assert_eq!(known.workspace_name, None);
+        assert_eq!(known.session_ids, vec!["s1", "s2"]);
+        assert_eq!(known.pane_ids, vec!["p1", "p2", "p3"]);
+    }
+
+    #[test]
+    fn review_blocking_reason_reports_dirty_and_refused_checks() {
+        let mut data = known_review_data(PathBuf::from("/ws"));
+        assert!(review_blocking_reason(&data).is_none());
+
+        data.clean = Some(Ok(vec!["M a.txt".to_string()]));
+        assert!(review_blocking_reason(&data)
+            .expect("dirty blocks")
+            .contains("uncommitted change(s)"));
+
+        data.clean = Some(Err(
+            "cannot check workspace 'ws' (refusing to remove): boom".to_string(),
+        ));
+        let reason = review_blocking_reason(&data).expect("check failure blocks");
+        assert!(reason.starts_with("blocked: cannot check"), "{reason}");
+
+        data.clean = Some(Ok(Vec::new()));
+        data.sessions = SessionPreview::Refused("schema mismatch".to_string());
+        let reason = review_blocking_reason(&data).expect("refused preview blocks");
+        assert!(reason.contains("schema mismatch"), "{reason}");
+
+        // A stale target skips the clean check and has no sessions to block.
+        assert!(review_blocking_reason(&stale_review_data()).is_none());
+    }
+
+    #[test]
+    fn review_data_offers_commit_only_for_a_dirty_known_path() {
+        let mut data = known_review_data(PathBuf::from("/ws"));
+        assert!(!data.can_commit(), "clean check is not a commit case");
+        data.clean = Some(Ok(vec!["M a.txt".to_string()]));
+        assert!(data.can_commit());
+        data.clean = Some(Err("boom".to_string()));
+        assert!(
+            !data.can_commit(),
+            "a failed check is fail-closed, not a commit case"
+        );
+        data.dir = None;
+        assert!(!data.can_commit(), "no path means no commit cwd");
+    }
+
+    #[test]
+    fn group_panes_preserves_first_seen_hierarchy() {
+        let panes = vec![
+            candidate("p1", "w1", "t1"),
+            candidate("p2", "w1", "t1"),
+            candidate("p3", "w1", "t2"),
+            candidate("p4", "w2", "t3"),
+        ];
+        let groups = group_panes(&panes);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "w1");
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[0].1[0].0, "t1");
+        assert_eq!(
+            groups[0].1[0]
+                .1
+                .iter()
+                .map(|pane| pane.info.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p1", "p2"]
+        );
+        assert_eq!(groups[0].1[1].0, "t2");
+        assert_eq!(groups[1].0, "w2");
+    }
+
+    #[test]
+    fn status_state_skips_path_scoped_tasks_for_unknown_paths() {
+        let stale = StatusState::new(None);
+        let state_of = |state: &StatusState, task: StatusTask| {
+            state
+                .items
+                .iter()
+                .find(|item| item.task == task)
+                .map(|item| item.state.clone())
+                .expect("task present")
+        };
+        assert!(matches!(
+            state_of(&stale, StatusTask::Migrate),
+            StatusItemState::Skipped(_)
+        ));
+        assert_eq!(
+            state_of(&stale, StatusTask::Forget),
+            StatusItemState::Pending
+        );
+        assert!(matches!(
+            state_of(&stale, StatusTask::Delete),
+            StatusItemState::Skipped(_)
+        ));
+        assert!(matches!(
+            state_of(&stale, StatusTask::ClosePanes),
+            StatusItemState::Skipped(_)
+        ));
+
+        let known = StatusState::new(Some(Path::new("/ws")));
+        assert!(known
+            .items
+            .iter()
+            .all(|item| item.state == StatusItemState::Pending));
+        assert!(!known.any_failure());
+    }
+
+    #[test]
+    fn status_state_tracks_progress_and_failures() {
+        let mut state = StatusState::new(Some(Path::new("/ws")));
+        state.running(StatusTask::Migrate);
+        state.done(StatusTask::Migrate, "2 session(s) migrated");
+        state.skipped(StatusTask::ClosePanes, "no panes selected");
+        assert!(!state.any_failure());
+
+        state.failed(StatusTask::Forget, "jj workspace forget failed (exit 1)");
+        assert!(state.any_failure());
+        let (task, reason) = state.first_failure().expect("failure recorded");
+        assert_eq!(task, StatusTask::Forget);
+        assert!(reason.contains("forget failed"));
+
+        let migrate = state
+            .items
+            .iter()
+            .find(|item| item.task == StatusTask::Migrate)
+            .expect("migrate item");
+        let (text, tone) = status_row_text(migrate);
+        assert_eq!(tone, RowTone::Ok);
+        assert!(
+            text.starts_with('✓') && text.contains("2 session(s)"),
+            "{text}"
+        );
+
+        state.set_error_log("/state/error.log");
+        assert_eq!(state.error_log.as_deref(), Some("/state/error.log"));
+    }
+
+    #[test]
+    fn review_dialog_renders_sections_and_action_buttons() {
+        let mut data = known_review_data(PathBuf::from("/ws"));
+        data.sessions = SessionPreview::Ready {
+            rows: vec![SessionDisplay {
+                id: "s1".into(),
+                title: "fix the thing".into(),
+                directory: "/ws/src".into(),
+                time_updated: data.now_ms,
+            }],
+            main_repo: data.main_repo.clone(),
+        };
+        data.panes = vec![candidate("pane-1", "w1", "t1")];
+        let model = ReviewModel::new(build_review_rows(&data));
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, ""))
+            .expect("draw review dialog");
+        let buffer = terminal.backend().buffer();
+        for needle in [
+            "Remove jj workspace",
+            "Workspace",
+            "Plan",
+            "Checks",
+            "1. migrate opencode sessions",
+            "2. jj workspace forget",
+            "3. delete directory",
+            "4. close panes",
+            "✓ opencode sessions: 1 bound",
+            "migrate to /main",
+            "remove",
+            "cancel",
+        ] {
+            assert!(
+                !lines_containing(buffer, needle).is_empty(),
+                "review dialog must render {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_rows_render_flush_sections_and_plain_task_rows() {
+        let model = ReviewModel::new(sample_review_rows());
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, ""))
+            .expect("draw review dialog");
+        let buffer = terminal.backend().buffer();
+
+        // Section titles are flush with the panel content edge (wizard style).
+        let plan_y = *lines_containing(buffer, "Plan").first().expect("Plan row");
+        let plan_line = line_text(buffer, plan_y);
+        // `find` returns byte offsets and the panel border is 3 UTF-8 bytes,
+        // so the content edge is border + border char width.
+        let border_x = plan_line.find('│').expect("panel border");
+        let content_x = border_x + '│'.len_utf8();
+        assert_eq!(
+            plan_line.find("Plan"),
+            Some(content_x),
+            "section title must be flush: {plan_line:?}"
+        );
+
+        // Task rows are plain bold text: no cursor slot and no checkbox.
+        let task_y = *lines_containing(buffer, "1. migrate opencode sessions")
+            .first()
+            .expect("task row");
+        let task_line = line_text(buffer, task_y);
+        assert!(
+            !task_line.contains("[x]") && !task_line.contains("[ ]") && !task_line.contains("[-]"),
+            "task row must not render a checkbox: {task_line:?}"
+        );
+        assert!(
+            task_line.find("1. migrate").expect("task text") > content_x,
+            "task rows keep their indentation: {task_line:?}"
+        );
+
+        // Group headers and leaves still carry their checkboxes.
+        for needle in ["ws-a", "first"] {
+            let y = *lines_containing(buffer, needle).first().expect("row");
+            let line = line_text(buffer, y);
+            assert!(line.contains("[x] "), "{needle}: {line:?}");
+        }
+    }
+
+    #[test]
+    fn display_home_path_abbreviates_home_at_component_boundaries() {
+        let home = Path::new("/home/cyc");
+        assert_eq!(
+            display_home_path_with(Path::new("/home/cyc"), Some(home)),
+            "~"
+        );
+        assert_eq!(
+            display_home_path_with(Path::new("/home/cyc/ws"), Some(home)),
+            "~/ws"
+        );
+        assert_eq!(
+            display_home_path_with(Path::new("/home/cyc/ws/src"), Some(home)),
+            "~/ws/src"
+        );
+        assert_eq!(
+            display_home_path_with(Path::new("/home/cycx/ws"), Some(home)),
+            "/home/cycx/ws",
+            "a sibling with the same prefix must stay verbatim"
+        );
+        assert_eq!(
+            display_home_path_with(Path::new("/tmp/ws"), Some(home)),
+            "/tmp/ws"
+        );
+        assert_eq!(
+            display_home_path_with(Path::new("/home/cyc/ws"), None),
+            "/home/cyc/ws",
+            "HOME unset degrades to the plain path"
+        );
+        assert_eq!(
+            display_home_path_with(Path::new("/home/cyc/ws"), Some(Path::new(""))),
+            "/home/cyc/ws",
+            "empty HOME degrades to the plain path"
+        );
+    }
+
+    #[test]
+    fn review_rows_use_dotted_steps_and_a_two_line_opencode_check() {
+        let mut data = known_review_data(PathBuf::from("/ws"));
+        data.sessions = SessionPreview::Ready {
+            rows: vec![SessionDisplay {
+                id: "s1".into(),
+                title: "fix".into(),
+                directory: "/ws".into(),
+                time_updated: data.now_ms,
+            }],
+            main_repo: PathBuf::from("/main"),
+        };
+        let rows = build_review_rows(&data);
+
+        let steps: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.kind == RowKind::Task)
+            .map(|row| row.text.as_str())
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                "1. migrate opencode sessions",
+                "2. jj workspace forget",
+                "3. delete directory",
+                "4. close panes",
+            ]
+        );
+
+        // The opencode check is a one-line verdict plus a dim destination
+        // note on the next row (same convention as preserve:/discard:).
+        let check_index = rows
+            .iter()
+            .position(|row| row.text == "✓ opencode sessions: 1 bound")
+            .expect("one-line check without the destination");
+        assert_eq!(rows[check_index].kind, RowKind::Check);
+        assert_eq!(rows[check_index].tone, RowTone::Ok);
+        let detail = &rows[check_index + 1];
+        assert_eq!(detail.kind, RowKind::Note);
+        assert_eq!(detail.tone, RowTone::Dim);
+        assert_eq!(detail.depth, 2);
+        assert_eq!(detail.text, "migrate to /main");
+    }
+
+    #[test]
+    fn review_rows_render_live_selection_counts() {
+        let mut data = known_review_data(PathBuf::from("/ws"));
+        data.sessions = SessionPreview::Ready {
+            rows: vec![
+                SessionDisplay {
+                    id: "s1".into(),
+                    title: "one".into(),
+                    directory: "/ws".into(),
+                    time_updated: data.now_ms,
+                },
+                SessionDisplay {
+                    id: "s2".into(),
+                    title: "two".into(),
+                    directory: "/ws".into(),
+                    time_updated: data.now_ms,
+                },
+            ],
+            main_repo: data.main_repo.clone(),
+        };
+        data.panes = vec![
+            candidate("pane-1", "w1", "t1"),
+            candidate("pane-2", "w1", "t1"),
+            candidate("pane-3", "w2", "t2"),
+        ];
+        let rows = build_review_rows(&data);
+        let session_count = rows
+            .iter()
+            .position(|row| row.id.as_deref() == Some(SESSION_COUNT_ID))
+            .expect("session count row");
+        let pane_count = rows
+            .iter()
+            .position(|row| row.id.as_deref() == Some(PANE_COUNT_ID))
+            .expect("pane count row");
+        assert!(
+            session_count
+                < rows
+                    .iter()
+                    .position(|row| row.kind == RowKind::Session)
+                    .unwrap(),
+            "count sits above the session leaves"
+        );
+        assert!(
+            pane_count
+                < rows
+                    .iter()
+                    .position(|row| row.kind == RowKind::Pane)
+                    .unwrap(),
+            "count sits above the pane tree"
+        );
+
+        let mut model = ReviewModel::new(rows);
+        assert_eq!(
+            model.session_count_text().as_deref(),
+            Some("2 of 2 selected")
+        );
+        assert_eq!(model.pane_count_text().as_deref(), Some("3 of 3 selected"));
+
+        // Live: a leaf toggle changes the text without rebuilding the rows.
+        model.cursor = model
+            .rows
+            .iter()
+            .position(|row| row.id.as_deref() == Some("s1"))
+            .expect("s1 row");
+        model.toggle_current();
+        assert_eq!(
+            model.session_count_text().as_deref(),
+            Some("1 of 2 selected")
+        );
+        model.cursor = model
+            .rows
+            .iter()
+            .position(|row| row.id.as_deref() == Some("pane-1"))
+            .expect("pane row");
+        model.toggle_current();
+        assert_eq!(model.pane_count_text().as_deref(), Some("2 of 3 selected"));
+
+        // The rendered dialog shows both live counts.
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, ""))
+            .expect("draw review dialog");
+        let buffer = terminal.backend().buffer();
+        assert!(
+            !lines_containing(buffer, "1 of 2 selected").is_empty(),
+            "session count must render"
+        );
+        assert!(
+            !lines_containing(buffer, "2 of 3 selected").is_empty(),
+            "pane count must render"
+        );
+    }
+
+    #[test]
+    fn review_rows_omit_counts_without_leaves() {
+        let stale = build_review_rows(&stale_review_data());
+        assert!(
+            !stale.iter().any(|row| matches!(
+                row.id.as_deref(),
+                Some(SESSION_COUNT_ID) | Some(PANE_COUNT_ID)
+            )),
+            "stale targets have no leaves to count"
+        );
+
+        // Known path but no sessions and no panes: still no count rows.
+        let empty = build_review_rows(&known_review_data(PathBuf::from("/ws")));
+        assert!(!empty.iter().any(|row| matches!(
+            row.id.as_deref(),
+            Some(SESSION_COUNT_ID) | Some(PANE_COUNT_ID)
+        )));
+        let model = ReviewModel::new(empty);
+        assert!(model.session_count_text().is_none());
+        assert!(model.pane_count_text().is_none());
+    }
+
+    #[test]
+    fn picker_scrollbar_renders_only_on_overflow() {
+        let entries = |count: usize| -> Vec<WorkspaceEntry> {
+            (0..count)
+                .map(|index| WorkspaceEntry {
+                    name: format!("ws-{index}"),
+                    root: Some(PathBuf::from(format!("/tmp/ws-{index}"))),
+                })
+                .collect()
+        };
+
+        let fits = PickerState {
+            entries: entries(3),
+            cursor: 0,
+            scroll: 0,
+            error: None,
+        };
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_picker(frame, &fits))
+            .expect("draw picker");
+        let buffer = terminal.backend().buffer();
+        assert!(
+            !buffer_contains(buffer, '▲') && !buffer_contains(buffer, '▼'),
+            "no picker scrollbar without overflow"
+        );
+
+        let many = PickerState {
+            entries: entries(60),
+            cursor: 0,
+            scroll: 0,
+            error: None,
+        };
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_picker(frame, &many))
+            .expect("draw picker");
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer_contains(buffer, '▲') && buffer_contains(buffer, '▼'),
+            "picker scrollbar must render when entries overflow"
+        );
+    }
+
+    #[test]
+    fn status_view_renders_failure_reason_and_log_pointer() {
+        let mut state = StatusState::new(Some(Path::new("/ws")));
+        state.done(StatusTask::Migrate, "1 session migrated");
+        state.failed(StatusTask::Forget, "forget exploded");
+        state.set_error_log("/state/error.log");
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_status(frame, &state, true))
+            .expect("draw status view");
+        let buffer = terminal.backend().buffer();
+        for needle in [
+            "migrate opencode sessions",
+            "1 session migrated",
+            "forget exploded",
+            "/state/error.log",
+        ] {
+            assert!(
+                !lines_containing(buffer, needle).is_empty(),
+                "status view must render {needle:?}"
+            );
+        }
+    }
+
     // --- wizard render tests --------------------------------------------
     //
     // draw_workspace_wizard is a pure function over a Frame; a TestBackend
@@ -3808,6 +7839,13 @@ esac
         (0..buffer.area.height)
             .filter(|&y| line_text(buffer, y).contains(needle))
             .collect()
+    }
+
+    fn buffer_contains(buffer: &ratatui::buffer::Buffer, needle: char) -> bool {
+        buffer
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == needle.to_string())
     }
 
     #[test]

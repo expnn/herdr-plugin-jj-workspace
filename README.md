@@ -43,7 +43,9 @@ A [Herdr](https://herdr.dev) plugin to create and remove [Jujutsu](https://jj-vc
 ## Quickstart
 
 - `prefix+a` or `prefix+shift+a` — name the jj workspace for the focused pane's repository and open it as a new tab in the same workspace
-- `prefix+d` — remove the current jj checkout and close its tab
+- `prefix+d` — open the remove dialog for the focused pane's jj workspace
+  (or pick one from the list when triggered in the main workspace); review
+  the plan, select sessions and panes, then confirm
 
 The wizard uses a single read-only source: the focused pane's directory,
 resolved up to its jj workspace root — secondary workspaces are normalized to
@@ -221,23 +223,59 @@ file pointer into the main workspace's store, so:
   the workspace, then rebase/push from any workspace. The plugin only sets
   the base revision (see [Choosing the base revision](#choosing-the-base-revision));
   it never auto-merges or auto-pushes.
-- **Removing a workspace** runs `jj workspace forget` and deletes the
-  checkout directory. The main workspace is never removed, and a workspace
-  with uncommitted changes is refused: commits and bookmarks are safe in the
-  shared store, but materialized uncommitted changes would be lost.
+- **Removing a workspace** opens an interactive dialog that reviews the
+  plan first — nothing is removed until you confirm. The main workspace is
+  never removed; triggering remove from it lists its secondary workspaces
+  to pick from. Commits and bookmarks are safe in the shared store, but a
+  dirty working copy blocks removal (see
+  [Removing a workspace and opencode sessions](#removing-a-workspace-and-opencode-sessions)).
 
 ### Removing a workspace and opencode sessions
 
-Before deleting anything, `remove` migrates opencode sessions bound to the
-workspace (its root and subdirectories) back to the main repo, so their
-conversation history stays visible and resumable there. The migration is
-fail-closed: if opencode's database cannot be read, its schema changed in an
-unexpected way, or the main repo's opencode project id cannot be resolved,
-the plugin refuses to remove the workspace — nothing is forgotten, deleted or
-closed, and the message says what to fix (typically: open opencode in the
-main repo once, then retry). When opencode is not installed, or no session is
-bound to the workspace, the step is silently skipped and removal proceeds as
-usual.
+`remove` opens an interactive overlay dialog (the same family as the create
+wizard) and removes nothing until you authorize it with `↵`. Triggering it
+from inside a secondary workspace — including a subdirectory, which resolves
+up to the workspace root — reviews that workspace; triggering it from the
+main workspace first lists the repository's secondary workspaces to pick
+from, including stale registrations whose directory is already gone, which
+can still be forgotten. Unlike the old one-shot remove, it never closes the
+whole tab: only the panes you check are closed.
+
+The dialog renders a Plan with a checkbox per item:
+
+1. **migrate opencode sessions** — the sessions bound to the workspace (its
+   root and subdirectories) are listed newest-first and individually
+   selectable, all selected by default; they are migrated back to the main
+   repo so their conversation history stays visible and resumable there.
+2. **`jj workspace forget`** — commits and bookmarks stay safe in the
+   shared store.
+3. **delete directory** — the full checkout path; for a stale registration
+   the directory is already missing, and the step is skipped.
+4. **close panes** — every pane whose cwd or foreground cwd is inside the
+   checkout directory, grouped by Herdr workspace → tab → pane and all
+   selected by default. Only checked panes are closed; unchecked panes keep
+   running (their cwd becomes stale), and Herdr itself closes a tab once its
+   last pane is closed.
+
+The Checks area shows whether the working copy is clean and the opencode
+database is readable. A dirty working copy blocks removal until fixed: the
+dialog prints the exact commands — `jj commit -m "<message>"` (press `c` to
+run it with your message) and `jj restore` (shown but never executed for
+you, since it discards changes).
+
+The migration is fail-closed: if opencode's database cannot be read, its
+schema changed in an unexpected way, or the main repo's opencode project id
+cannot be resolved, the plugin refuses to remove the workspace — nothing is
+forgotten, deleted or closed, and the dialog says what to fix (typically:
+open opencode in the main repo once, then retry). When opencode is not
+installed, or no session is bound to the workspace, the step is skipped and
+removal proceeds as usual.
+
+`↵` authorizes the run: the working copy is re-checked, then the plan
+executes in order — migrate → forget → delete → close — with each step shown
+in a Status view. On success the dialog exits on its own (its overlay pane
+goes with it); if a destructive step fails it stays open with the reason and
+a pointer to `error.log`. `esc` cancels at any point with no side effects.
 
 ### Migrating from `.env`
 
@@ -276,11 +314,13 @@ lost its executable bit (uncommon install). Re-apply it:
 or run `herdr plugin install` again. The pane command also works if invoked as
 `sh <script> …` as a fallback.
 
-**`refusing to remove …: it has uncommitted changes`** — remove protects your
-work: already-committed commits and bookmarks survive a workspace removal,
-but materialized uncommitted changes would be deleted. Commit (`jj commit`)
-or discard (`jj restore`) the changes in that workspace, then run remove
-again.
+**`remove` is blocked by uncommitted changes** — remove protects your work:
+already-committed commits and bookmarks survive a workspace removal, but
+materialized uncommitted changes would be deleted, so the dialog's Checks
+area stays red until the working copy is clean. Press `c` in the dialog to
+run `jj commit -m "<message>"` and continue, or discard the changes yourself
+with `jj restore` (shown in the dialog but never executed for you, since it
+discards work).
 
 **Where to find full error details** — toasts are short-lived and truncated
 by Herdr (240 chars, single line, a few seconds). Every plugin error is also

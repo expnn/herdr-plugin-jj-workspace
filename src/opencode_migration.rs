@@ -8,23 +8,43 @@
 //! project, `directory` to the main repo root, `path` flattened to `''`,
 //! `workspace_id` released to NULL and `time_updated` stamped now.
 //!
+//! The removal dialog previews the rows a migration would rewrite with the
+//! read-only [`inspect_opencode_sessions`] (same discovery chain and range
+//! predicate, SELECTs only) and then migrates an arbitrary subset of the
+//! previewed ids via [`migrate_selected_opencode_sessions`]. An empty
+//! selection skips; ids that disappeared between preview and execution are
+//! reported by the actual updated count (drift is not a failure).
+//!
+//! The DB is located CLI-first (`opencode db path`; the binary is resolved on
+//! PATH plus the well-known install dirs `~/.opencode/bin`, `~/.local/bin`,
+//! `/usr/local/bin`) and falls back to the standard data locations
+//! `$XDG_DATA_HOME/opencode/opencode.db` /
+//! `~/.local/share/opencode/opencode.db`. Preview and execution share that
+//! chain (D12); when neither yields an existing DB the step skips with a
+//! reason naming the tried locations.
+//!
 //! Every failure that could leave data half-written is fail-closed: the
 //! caller refuses to remove the workspace and the user can retry. A missing
 //! opencode binary or an empty match set is a silent skip — the plugin stays
 //! agent-agnostic (design D8).
 //!
 //! Design decisions D1–D10 live in
-//! `openspec/changes/migrate-opencode-sessions-on-remove/design.md`.
+//! `openspec/changes/migrate-opencode-sessions-on-remove/design.md`; D6 and
+//! D12 of `openspec/changes/remove-workspace-dialog/design.md` add preview,
+//! subset selection and PATH-independent DB discovery.
 
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, TransactionBehavior};
 
 /// Result of a migration attempt, mapped by `cmd_remove` to continue /
 /// refuse / report.
+#[derive(Debug)]
 pub enum Outcome {
     /// Nothing to migrate (opencode absent, DB absent, or no matching
     /// sessions). The caller proceeds with the removal.
@@ -34,6 +54,33 @@ pub enum Outcome {
     Refused(String),
     /// N sessions were migrated to `main_repo`.
     Migrated { count: usize, main_repo: PathBuf },
+}
+
+/// One preview row bound to the workspace, in the shape the removal dialog
+/// renders (`title` is `''` when the schema predates the column).
+#[derive(Debug)]
+pub struct SessionRow {
+    pub id: String,
+    pub title: String,
+    pub directory: String,
+    pub time_updated: i64,
+}
+
+/// Read-only preview of the migration, mapped by the dialog to
+/// skip / block / list rows.
+#[derive(Debug)]
+pub enum Inspection {
+    /// opencode absent / DB absent / no matching rows — nothing to migrate.
+    Skipped(String),
+    /// DB open, schema probe or target project resolution failed
+    /// (fail-closed).
+    Refused(String),
+    /// Rows bound to the workspace, newest first, plus the resolved
+    /// destination.
+    Ready {
+        rows: Vec<SessionRow>,
+        main_repo: PathBuf,
+    },
 }
 
 /// Columns the migration reads or writes; probed before any write (D7).
@@ -54,24 +101,68 @@ const PROJECT_REQUIRED_COLUMNS: &[&str] = &["id", "worktree"];
 const WORKSPACE_RANGE: &str =
     "directory = ?1 OR (directory >= ?1 || '/' AND directory < ?1 || '0')";
 
-/// Migrate every opencode session bound to `ws` (root or subdirectory) to
-/// `main_repo`. Discovery failures and an empty match set are skips; DB,
-/// schema, resolution and transaction failures are refusals.
-pub fn migrate_opencode_sessions(ws: &Path, main_repo: &Path) -> Outcome {
-    let opencode = match find_opencode(&crate::path_dirs()) {
-        Some(path) => path,
-        None => return Outcome::Skipped("opencode not found on PATH".into()),
+/// Read-only preview of the migration: enumerate the rows a migration would
+/// rewrite, of which the dialog then migrates a selected subset via
+/// [`migrate_selected_opencode_sessions`]. SELECTs only — never a write.
+/// Discovery absences and an empty match set are skips; DB, schema and target
+/// resolution failures are refusals (the dialog renders them as blocking
+/// checks).
+pub fn inspect_opencode_sessions(ws: &Path, main_repo: &Path) -> Inspection {
+    let db_path = match locate_opencode_db() {
+        Ok(path) => path,
+        Err(reason) => return Inspection::Skipped(reason),
     };
-    let db_path = match discover_db_path(&opencode) {
-        Some(path) => path,
-        None => return Outcome::Skipped("opencode db path unavailable".into()),
+    inspection_from_db(inspect_db(&db_path, ws, main_repo), main_repo)
+}
+
+/// Map an [`inspect_db`] result to the public preview shape. `main_repo` is
+/// already canonical at the call site (`resolve_main_repo`); echoing it keeps
+/// preview and execution pointed at the same destination.
+fn inspection_from_db(
+    result: Result<Option<Vec<SessionRow>>, String>,
+    main_repo: &Path,
+) -> Inspection {
+    match result {
+        Ok(Some(rows)) => Inspection::Ready {
+            rows,
+            main_repo: main_repo.to_path_buf(),
+        },
+        Ok(None) => Inspection::Skipped("no opencode sessions bound to this workspace".into()),
+        Err(message) => Inspection::Refused(message),
+    }
+}
+
+/// Migrate only `selected` session ids (a subset of an [`Inspection::Ready`]
+/// preview). An empty selection skips without touching the DB; a selection
+/// with no rows left in range skips without failing (preview/execution
+/// drift).
+pub fn migrate_selected_opencode_sessions(
+    ws: &Path,
+    main_repo: &Path,
+    selected: &[String],
+) -> Outcome {
+    if selected.is_empty() {
+        return Outcome::Skipped("no sessions selected".into());
+    }
+    let db_path = match locate_opencode_db() {
+        Ok(path) => path,
+        Err(reason) => return Outcome::Skipped(reason),
     };
-    match migrate_db(&db_path, ws, main_repo) {
+    selected_outcome_from_db(
+        migrate_selected_db(&db_path, ws, main_repo, selected),
+        main_repo,
+    )
+}
+
+/// Map a selected-subset [`migrate_selected_db`] result to the public
+/// outcome shape.
+fn selected_outcome_from_db(result: Result<Option<usize>, String>, main_repo: &Path) -> Outcome {
+    match result {
         Ok(Some(count)) => Outcome::Migrated {
             count,
             main_repo: main_repo.to_path_buf(),
         },
-        Ok(None) => Outcome::Skipped("no opencode sessions bound to this workspace".into()),
+        Ok(None) => Outcome::Skipped("no opencode sessions matched the selection".into()),
         Err(message) => Outcome::Refused(message),
     }
 }
@@ -89,23 +180,166 @@ pub fn resolve_main_repo(ws: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Resolve the `opencode` binary on PATH. A missing binary is a skip, not an
-/// error: the plugin stays agent-agnostic (D8).
+/// Environment-driven DB discovery shared by preview and execution (D12):
+/// CLI first, standard locations second. `Err` carries the skip reason
+/// naming every location tried, so a minimal server PATH is diagnosable.
+fn locate_opencode_db() -> Result<PathBuf, String> {
+    let home = home_dir();
+    let path_dirs = crate::path_dirs();
+    let opencode = find_opencode(&path_dirs);
+    let candidates = db_candidates(home.as_deref(), xdg_data_home().as_deref());
+    discover_db_path(opencode.as_deref(), &candidates).ok_or_else(|| {
+        discovery_skip_reason(&path_dirs, opencode.is_some(), &candidates, home.as_deref())
+    })
+}
+
+/// `HOME`, ignored when unset or empty.
+fn home_dir() -> Option<PathBuf> {
+    env_dir("HOME")
+}
+
+/// `XDG_DATA_HOME`, ignored when unset or empty (an empty value means
+/// "unset" per the XDG basedir spec).
+fn xdg_data_home() -> Option<PathBuf> {
+    env_dir("XDG_DATA_HOME")
+}
+
+fn env_dir(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Resolve the `opencode` binary: PATH dirs first, then the well-known
+/// install dirs (D12). A missing binary is a skip, not an error (D8).
 fn find_opencode(path_dirs: &[PathBuf]) -> Option<PathBuf> {
-    path_dirs
-        .iter()
+    find_opencode_in(&opencode_search_dirs(path_dirs, home_dir().as_deref()))
+}
+
+/// Search `dirs` in order for an executable `opencode`. Injectable: tests
+/// pass their own directory list and never read the process environment.
+fn find_opencode_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
         .map(|dir| dir.join("opencode"))
         .find(|candidate| crate::is_executable_file(candidate))
 }
 
-/// Ask opencode for its DB path (`opencode db path`). The CLI only reads the
-/// path — it is never used to write (D1); discovery failures are skips.
-fn discover_db_path(opencode: &Path) -> Option<PathBuf> {
+/// PATH dirs plus the well-known install dirs, deduplicated in order.
+fn opencode_search_dirs(path_dirs: &[PathBuf], home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = path_dirs.to_vec();
+    dirs.extend(fallback_binary_dirs(home));
+    dedupe_paths(&mut dirs);
+    dirs
+}
+
+/// Non-PATH dirs that commonly hold the `opencode` binary. HOME-derived
+/// entries are skipped when HOME is unset.
+fn fallback_binary_dirs(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = home {
+        dirs.push(home.join(".opencode").join("bin"));
+        dirs.push(home.join(".local").join("bin"));
+    }
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs
+}
+
+fn dedupe_paths(paths: &mut Vec<PathBuf>) {
+    let mut unique: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    paths.retain(|path| {
+        if unique.contains(path) {
+            false
+        } else {
+            unique.push(path.clone());
+            true
+        }
+    });
+}
+
+/// Standard opencode DB location: `$XDG_DATA_HOME/opencode/opencode.db` when
+/// `XDG_DATA_HOME` is set, otherwise `$HOME/.local/share/opencode/opencode.db`
+/// (D12). Only one location is consulted — a set-but-empty XDG tree must not
+/// silently fall through to a possibly stale `~/.local/share` DB.
+fn db_candidates(home: Option<&Path>, xdg_data_home: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(xdg) = xdg_data_home {
+        return vec![xdg.join("opencode").join("opencode.db")];
+    }
+    home.map(|home| {
+        vec![home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("opencode.db")]
+    })
+    .unwrap_or_default()
+}
+
+/// Discover the opencode DB: the CLI's `opencode db path` answer first, then
+/// the standard locations; the first existing file wins (D12). `opencode:
+/// None` models a missing binary. The CLI only reads the path — it is never
+/// used to write (D1).
+fn discover_db_path(opencode: Option<&Path>, candidates: &[PathBuf]) -> Option<PathBuf> {
+    if let Some(opencode) = opencode {
+        if let Some(path) = cli_db_path(opencode) {
+            return Some(path);
+        }
+    }
+    candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .cloned()
+}
+
+/// Ask opencode for its DB path (`opencode db path`). A missing binary, a
+/// non-zero exit and output that is not an existing file are all skips.
+fn cli_db_path(opencode: &Path) -> Option<PathBuf> {
     let output = Command::new(opencode).args(["db", "path"]).output().ok()?;
     if !output.status.success() {
         return None;
     }
     db_path_from_output(&output.stdout)
+}
+
+/// Skip reason naming what discovery tried; `~` abbreviates a leading HOME.
+fn discovery_skip_reason(
+    path_dirs: &[PathBuf],
+    binary_found: bool,
+    candidates: &[PathBuf],
+    home: Option<&Path>,
+) -> String {
+    let fallback = format_paths(&fallback_binary_dirs(home), home);
+    let db = if candidates.is_empty() {
+        "no standard DB location (HOME and XDG_DATA_HOME are unset)".to_string()
+    } else {
+        format!("no opencode DB at {}", format_paths(candidates, home))
+    };
+    if binary_found {
+        format!("opencode db path gave no usable DB and {db}")
+    } else {
+        let searched = if path_dirs.is_empty() {
+            fallback
+        } else {
+            format!("PATH + {fallback}")
+        };
+        format!("opencode not found (searched {searched}) and {db}")
+    }
+}
+
+/// Render paths for a user-facing skip reason (`~` for a leading HOME).
+fn format_paths(paths: &[PathBuf], home: Option<&Path>) -> String {
+    paths
+        .iter()
+        .map(|path| display_path(path, home))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn display_path(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 /// Parse `opencode db path` stdout: empty output, or a path that is not an
@@ -124,10 +358,12 @@ fn db_path_from_output(stdout: &[u8]) -> Option<PathBuf> {
     }
 }
 
-/// Open the DB and run the read-only checks before the migration
-/// transaction. `Ok(None)` = no matching sessions (skip); `Err` = fail-closed.
-fn migrate_db(db_path: &Path, ws: &Path, main: &Path) -> Result<Option<usize>, String> {
-    let mut conn = Connection::open(db_path).map_err(|err| {
+/// Open the DB with the exact connection parameters the migration uses and
+/// run the fail-closed schema probe. Shared by preview and migration so a
+/// would-be-working migration is never refused merely because a read-only
+/// open failed.
+fn open_and_probe(db_path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open(db_path).map_err(|err| {
         format!(
             "cannot open the opencode DB (refusing to remove): {err}\n\
              DB path: {}",
@@ -145,13 +381,70 @@ fn migrate_db(db_path: &Path, ws: &Path, main: &Path) -> Result<Option<usize>, S
             format!("cannot configure the opencode DB connection (refusing to remove): {err}")
         })?;
     probe_schema(&conn)?;
-    // Count before resolving the target: zero matching sessions is a skip
-    // even when the main repo's project id cannot be resolved (D8).
+    Ok(conn)
+}
+
+/// Read-only counterpart of the migration: same discovery, schema and
+/// target checks, SELECTs only. `Ok(None)` = no matching sessions (skip);
+/// `Err` = fail-closed (the dialog blocks).
+fn inspect_db(db_path: &Path, ws: &Path, main: &Path) -> Result<Option<Vec<SessionRow>>, String> {
+    let conn = open_and_probe(db_path)?;
+    // Mirror the migration: an empty match set is a skip even when the target
+    // project cannot be resolved.
     if count_sessions(&conn, ws)? == 0 {
         return Ok(None);
     }
+    // A target the migration could not resolve must block the preview too,
+    // so the dialog never offers a migration that will refuse later.
+    resolve_target(&conn, main)?;
+    Ok(Some(select_sessions(&conn, ws)?))
+}
+
+/// The rows a migration would rewrite, newest first. `session.title` is not
+/// part of the fail-closed probe (opencode added it later), so a schema
+/// without it selects a literal `''` — the dialog renders a placeholder.
+fn select_sessions(conn: &Connection, ws: &Path) -> Result<Vec<SessionRow>, String> {
+    let has_title = table_columns(conn, "session")?
+        .iter()
+        .any(|name| name == "title");
+    let title = if has_title { "title" } else { "''" };
+    let ws = ws.to_string_lossy();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT id, {title}, directory, time_updated FROM session \
+             WHERE {WORKSPACE_RANGE} ORDER BY time_updated DESC, id"
+        ))
+        .map_err(|err| format!("cannot enumerate opencode sessions (refusing to remove): {err}"))?;
+    let rows = stmt
+        .query_map(params![ws.as_ref()], |row| {
+            Ok(SessionRow {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                directory: row.get(2)?,
+                time_updated: row.get(3)?,
+            })
+        })
+        .map_err(|err| format!("cannot enumerate opencode sessions (refusing to remove): {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("cannot enumerate opencode sessions (refusing to remove): {err}"))?;
+    Ok(rows)
+}
+
+/// Migrate only the `selected` session ids: rows outside `selected` are
+/// never touched. Zero selected rows left in range is a skip — drift between
+/// preview and execution is not a failure.
+fn migrate_selected_db(
+    db_path: &Path,
+    ws: &Path,
+    main: &Path,
+    selected: &[String],
+) -> Result<Option<usize>, String> {
+    let mut conn = open_and_probe(db_path)?;
+    if count_selected_sessions(&conn, ws, selected)? == 0 {
+        return Ok(None);
+    }
     let target = resolve_target(&conn, main)?;
-    let updated = migrate_in_tx(&mut conn, ws, main, &target)?;
+    let updated = run_migration_tx(&mut conn, ws, main, &target, Some(selected))?;
     Ok(Some(updated))
 }
 
@@ -210,6 +503,41 @@ fn count_sessions(conn: &Connection, ws: &Path) -> Result<usize, String> {
     Ok(count.max(0) as usize)
 }
 
+/// Like [`count_sessions`], but only rows whose id is in `selected`. An empty
+/// selection matches nothing.
+fn count_selected_sessions(
+    conn: &Connection,
+    ws: &Path,
+    selected: &[String],
+) -> Result<usize, String> {
+    if selected.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = id_placeholders(2, selected.len());
+    let mut values = vec![Value::Text(ws.to_string_lossy().into_owned())];
+    values.extend(selected.iter().cloned().map(Value::Text));
+    let count: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM session \
+                 WHERE ({WORKSPACE_RANGE}) AND id IN ({placeholders})"
+            ),
+            params_from_iter(values),
+            |row| row.get(0),
+        )
+        .map_err(|err| format!("cannot enumerate opencode sessions (refusing to remove): {err}"))?;
+    Ok(count.max(0) as usize)
+}
+
+/// Numbered placeholders `?start, ?start+1, …` for a dynamically sized `IN`
+/// list. Ids are always bound as parameters, never interpolated into SQL.
+fn id_placeholders(start: usize, count: usize) -> String {
+    (start..start + count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Resolve the main repo's opencode project id without re-deriving any hash
 /// (D3): pure-jj repo → `'global'`; else the `.git/opencode` memo; else the
 /// `project` row keyed by worktree; else fail-closed with guidance.
@@ -264,31 +592,64 @@ fn project_exists(conn: &Connection, id: &str) -> Result<bool, String> {
     .map_err(|err| format!("cannot query the opencode project table (refusing to remove): {err}"))
 }
 
-/// One immediate write transaction (D2): rewrite every matching session row,
+/// One immediate write transaction (D2): rewrite the matching session rows,
 /// drop stale `project_directory` rows, then commit. Any error rolls back
-/// and the caller refuses the removal; nothing is half-written.
-fn migrate_in_tx(
+/// and the caller refuses the removal; nothing is half-written. `selected`
+/// restricts the session UPDATE to those ids (`None` = every row in range,
+/// `Some(&[])` = nothing to do); `project_directory` cleanup always covers
+/// the full workspace range.
+fn run_migration_tx(
     conn: &mut Connection,
     ws: &Path,
     main: &Path,
     target: &str,
+    selected: Option<&[String]>,
 ) -> Result<usize, String> {
     let ws = ws.to_string_lossy();
     let main = main.to_string_lossy();
     let now_ms = unix_millis();
+    // Placeholders: ?1 range root, ?2 target project, ?3 main repo root,
+    // ?4 timestamp, ?5+ selected ids (bound in this order).
+    let (sql, values) = match selected {
+        Some(ids) if ids.is_empty() => return Ok(0),
+        Some(ids) => {
+            let placeholders = id_placeholders(5, ids.len());
+            let mut values = vec![
+                Value::Text(ws.as_ref().to_string()),
+                Value::Text(target.to_string()),
+                Value::Text(main.as_ref().to_string()),
+                Value::Integer(now_ms),
+            ];
+            values.extend(ids.iter().cloned().map(Value::Text));
+            (
+                format!(
+                    "UPDATE session SET project_id = ?2, directory = ?3, path = '', \
+                     workspace_id = NULL, time_updated = ?4 \
+                     WHERE ({WORKSPACE_RANGE}) AND id IN ({placeholders})"
+                ),
+                values,
+            )
+        }
+        None => (
+            format!(
+                "UPDATE session SET project_id = ?2, directory = ?3, path = '', \
+                 workspace_id = NULL, time_updated = ?4 WHERE {WORKSPACE_RANGE}"
+            ),
+            vec![
+                Value::Text(ws.as_ref().to_string()),
+                Value::Text(target.to_string()),
+                Value::Text(main.as_ref().to_string()),
+                Value::Integer(now_ms),
+            ],
+        ),
+    };
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| {
             format!("cannot start the opencode migration transaction (refusing to remove): {err}")
         })?;
     let updated = tx
-        .execute(
-            &format!(
-                "UPDATE session SET project_id = ?2, directory = ?3, path = '', \
-                 workspace_id = NULL, time_updated = ?4 WHERE {WORKSPACE_RANGE}"
-            ),
-            params![ws.as_ref(), target, main.as_ref(), now_ms],
-        )
+        .execute(&sql, params_from_iter(values))
         .map_err(|err| format!("cannot migrate opencode sessions (refusing to remove): {err}"))?;
     if table_exists(&tx, "project_directory")? {
         tx.execute(
@@ -326,6 +687,7 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Unique per-test temp dir, removed on drop (same pattern as main.rs).
@@ -368,6 +730,7 @@ mod tests {
              );
              CREATE TABLE session (
                  id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL DEFAULT '',
                  project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
                  directory TEXT NOT NULL,
                  path TEXT NOT NULL DEFAULT '',
@@ -399,12 +762,81 @@ mod tests {
         path: &str,
         workspace_id: Option<&str>,
     ) {
+        insert_session_row(conn, id, "", project_id, directory, path, workspace_id, 0);
+    }
+
+    /// Session insert with an explicit title and timestamp (preview tests
+    /// need distinguishable newest-first order).
+    #[allow(clippy::too_many_arguments)]
+    fn insert_session_row(
+        conn: &Connection,
+        id: &str,
+        title: &str,
+        project_id: &str,
+        directory: &str,
+        path: &str,
+        workspace_id: Option<&str>,
+        time_updated: i64,
+    ) {
         conn.execute(
-            "INSERT INTO session (id, project_id, directory, path, workspace_id, time_updated) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-            params![id, project_id, directory, path, workspace_id],
+            "INSERT INTO session \
+             (id, title, project_id, directory, path, workspace_id, time_updated) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                title,
+                project_id,
+                directory,
+                path,
+                workspace_id,
+                time_updated
+            ],
         )
         .expect("insert session");
+    }
+
+    /// The five migration-relevant columns of one session row.
+    fn migration_row(conn: &Connection, id: &str) -> (String, String, String, Option<String>, i64) {
+        conn.query_row(
+            "SELECT project_id, directory, path, workspace_id, time_updated \
+             FROM session WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .expect("session row")
+    }
+
+    /// Every session column, ordered by id, for before/after comparisons.
+    type Snapshot = Vec<(String, String, String, String, String, Option<String>, i64)>;
+
+    fn session_snapshot(conn: &Connection) -> Snapshot {
+        conn.prepare(
+            "SELECT id, title, project_id, directory, path, workspace_id, time_updated \
+             FROM session ORDER BY id",
+        )
+        .expect("prepare snapshot")
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .expect("query snapshot")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect snapshot")
     }
 
     // --- 6.1 enumeration boundaries ----------------------------------------
@@ -534,10 +966,13 @@ mod tests {
         insert_project(&conn, "global", "");
         insert_session(&conn, "other", "global", "/somewhere/else", "", None);
         drop(conn);
-        let outcome = migrate_db(
+        // The only session is out of range, so nothing in the selection
+        // matches and the target must not even be resolved.
+        let outcome = migrate_selected_db(
             &db_path,
             &dir.path().join("workspace"),
             &dir.path().join("main"),
+            &["other".to_string()],
         )
         .expect("no error");
         assert!(outcome.is_none(), "count 0 must skip");
@@ -545,11 +980,11 @@ mod tests {
 
     #[test]
     fn missing_opencode_binary_is_a_skip() {
-        assert!(find_opencode(&[]).is_none());
+        assert!(find_opencode_in(&[]).is_none());
         let dir = TempDir::new();
         // A non-executable file named opencode is not a usable binary.
         fs::write(dir.path().join("opencode"), "not a binary").expect("write decoy");
-        assert!(find_opencode(&[dir.path().to_path_buf()]).is_none());
+        assert!(find_opencode_in(&[dir.path().to_path_buf()]).is_none());
     }
 
     #[test]
@@ -563,6 +998,151 @@ mod tests {
         assert_eq!(
             db_path_from_output(format!("{}\n", db.display()).as_bytes()),
             Some(db)
+        );
+    }
+
+    // --- 6.3b PATH-independent discovery (D12) -----------------------------
+
+    /// Executable stub, used to fake the `opencode` CLI.
+    fn write_executable(path: &Path, script: &str) {
+        fs::write(path, script).expect("write stub");
+        let mut perms = fs::metadata(path).expect("stat stub").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("chmod stub");
+    }
+
+    #[test]
+    fn search_dirs_put_path_first_and_dedupe_fallbacks() {
+        let home = PathBuf::from("/home/tester");
+        let on_path = home.join(".local").join("bin");
+        let dirs = opencode_search_dirs(&[PathBuf::from("/usr/bin"), on_path.clone()], Some(&home));
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/usr/bin"),
+                on_path,
+                home.join(".opencode").join("bin"),
+                PathBuf::from("/usr/local/bin"),
+            ]
+        );
+        // HOME unset: PATH dirs plus the HOME-independent fallback only.
+        assert_eq!(
+            opencode_search_dirs(&[PathBuf::from("/usr/bin")], None),
+            vec![PathBuf::from("/usr/bin"), PathBuf::from("/usr/local/bin")]
+        );
+    }
+
+    #[test]
+    fn find_opencode_prefers_path_dirs_over_fallback_dirs() {
+        let home = TempDir::new();
+        let path_dir = TempDir::new();
+        let fallback = home.path().join(".opencode").join("bin");
+        fs::create_dir_all(&fallback).expect("create fallback dir");
+        write_executable(&path_dir.path().join("opencode"), "#!/bin/sh\nexit 0\n");
+        write_executable(&fallback.join("opencode"), "#!/bin/sh\nexit 0\n");
+        let dirs = opencode_search_dirs(&[path_dir.path().to_path_buf()], Some(home.path()));
+        assert_eq!(
+            find_opencode_in(&dirs),
+            Some(path_dir.path().join("opencode"))
+        );
+        // Without the PATH dir, the well-known fallback dir takes over.
+        let dirs = opencode_search_dirs(&[], Some(home.path()));
+        assert_eq!(find_opencode_in(&dirs), Some(fallback.join("opencode")));
+    }
+
+    #[test]
+    fn discovery_falls_back_to_standard_locations_when_cli_is_absent() {
+        let home = TempDir::new();
+        let xdg = TempDir::new();
+        let xdg_db = xdg.path().join("opencode").join("opencode.db");
+        let home_db = home
+            .path()
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("opencode.db");
+        fs::create_dir_all(xdg_db.parent().expect("xdg parent")).expect("create xdg dir");
+        fs::create_dir_all(home_db.parent().expect("home parent")).expect("create home dir");
+        fs::write(&xdg_db, b"").expect("create xdg db");
+        fs::write(&home_db, b"").expect("create home db");
+
+        // XDG_DATA_HOME set: only that location is consulted.
+        let candidates = db_candidates(Some(home.path()), Some(xdg.path()));
+        assert_eq!(candidates, vec![xdg_db.clone()]);
+        assert_eq!(discover_db_path(None, &candidates), Some(xdg_db.clone()));
+
+        // XDG_DATA_HOME unset: the HOME fallback is used.
+        let candidates = db_candidates(Some(home.path()), None);
+        assert_eq!(candidates, vec![home_db.clone()]);
+        assert_eq!(discover_db_path(None, &candidates), Some(home_db));
+    }
+
+    #[test]
+    fn discovery_falls_back_when_cli_is_unusable() {
+        let dir = TempDir::new();
+        let fallback_db = dir.path().join("fallback.db");
+        fs::write(&fallback_db, b"").expect("create fallback db");
+        let candidates = vec![fallback_db.clone()];
+
+        // Non-zero exit status.
+        let failing = dir.path().join("opencode-fail");
+        write_executable(&failing, "#!/bin/sh\nexit 1\n");
+        assert_eq!(
+            discover_db_path(Some(&failing), &candidates),
+            Some(fallback_db.clone())
+        );
+
+        // Output that does not name an existing file.
+        let bogus = dir.path().join("opencode-bogus");
+        write_executable(&bogus, "#!/bin/sh\necho /no/such/opencode.db\n");
+        assert_eq!(
+            discover_db_path(Some(&bogus), &candidates),
+            Some(fallback_db)
+        );
+    }
+
+    #[test]
+    fn discovery_prefers_cli_reported_db_over_standard_locations() {
+        let dir = TempDir::new();
+        let cli_db = dir.path().join("cli.db");
+        let candidate_db = dir.path().join("candidate.db");
+        fs::write(&cli_db, b"").expect("create cli db");
+        fs::write(&candidate_db, b"").expect("create candidate db");
+        let cli = dir.path().join("opencode-ok");
+        write_executable(&cli, &format!("#!/bin/sh\necho {}\n", cli_db.display()));
+        assert_eq!(discover_db_path(Some(&cli), &[candidate_db]), Some(cli_db));
+    }
+
+    #[test]
+    fn discovery_returns_none_when_no_location_exists() {
+        let dir = TempDir::new();
+        let missing = dir.path().join("missing").join("opencode.db");
+        assert_eq!(discover_db_path(None, &[missing]), None);
+        assert_eq!(discover_db_path(None, &[]), None);
+    }
+
+    #[test]
+    fn skip_reason_names_tried_locations() {
+        let home = PathBuf::from("/home/tester");
+        let path_dirs = vec![PathBuf::from("/usr/bin")];
+        let candidates = db_candidates(Some(&home), None);
+        assert_eq!(
+            discovery_skip_reason(&path_dirs, false, &candidates, Some(&home)),
+            "opencode not found (searched PATH + ~/.opencode/bin, ~/.local/bin, /usr/local/bin) \
+             and no opencode DB at ~/.local/share/opencode/opencode.db"
+        );
+        // A found CLI whose probe failed still names the DB locations tried.
+        let reason = discovery_skip_reason(&path_dirs, true, &candidates, Some(&home));
+        assert!(
+            reason.contains("~/.local/share/opencode/opencode.db"),
+            "{reason}"
+        );
+        // HOME unset: the reason degrades to the locations that remain.
+        let reason = discovery_skip_reason(&[], false, &[], None);
+        assert!(reason.contains("/usr/local/bin"), "{reason}");
+        assert!(
+            reason.contains("HOME and XDG_DATA_HOME are unset"),
+            "{reason}"
         );
     }
 
@@ -601,7 +1181,8 @@ mod tests {
         drop(conn);
 
         let before = unix_millis();
-        let migrated = migrate_db(&db_path, Path::new(ws), Path::new(&main))
+        let selected = vec!["root".to_string(), "sub".to_string()];
+        let migrated = migrate_selected_db(&db_path, Path::new(ws), Path::new(&main), &selected)
             .expect("migration succeeds")
             .expect("sessions matched");
         assert_eq!(migrated, 2);
@@ -669,8 +1250,14 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys=ON")
             .expect("pragma");
         let mut conn = conn;
-        let err = migrate_in_tx(&mut conn, Path::new(ws), Path::new(main), "no-such-project")
-            .expect_err("foreign key must reject an unknown project id");
+        let err = run_migration_tx(
+            &mut conn,
+            Path::new(ws),
+            Path::new(main),
+            "no-such-project",
+            None,
+        )
+        .expect_err("foreign key must reject an unknown project id");
         assert!(err.contains("cannot migrate opencode sessions"), "{err}");
 
         let (project_id, directory): (String, String) = conn
@@ -714,7 +1301,7 @@ mod tests {
         )
         .expect("create trigger");
         let mut conn = conn;
-        let err = migrate_in_tx(&mut conn, Path::new(ws), Path::new(main), "target-id")
+        let err = run_migration_tx(&mut conn, Path::new(ws), Path::new(main), "target-id", None)
             .expect_err("cleanup failure must refuse");
         assert!(err.contains("project_directory"), "{err}");
 
@@ -726,6 +1313,420 @@ mod tests {
             )
             .expect("session row");
         assert_eq!(directory, ws, "the session UPDATE must roll back too");
+    }
+
+    // --- 6.5 inspect preview + subset migration ----------------------------
+
+    /// Whole-DB content snapshot (fixture tables only) for write-freedom
+    /// checks.
+    fn db_snapshot(conn: &Connection) -> (Snapshot, Vec<(String, String)>) {
+        let project_dirs = conn
+            .prepare("SELECT directory, project_id FROM project_directory ORDER BY directory")
+            .expect("prepare project_directory")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query project_directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect project_directory");
+        (session_snapshot(conn), project_dirs)
+    }
+
+    #[test]
+    fn inspect_lists_rows_newest_first_with_fields() {
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let ws = "/home/user/Workspace/main-repo/workspace-feature";
+        let main_path = dir.path().join("main-repo");
+        fs::create_dir_all(main_path.join(".git")).expect("create main .git");
+        let main = main_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).expect("create db");
+        fixture_schema(&conn);
+        insert_project(&conn, "global", "");
+        insert_project(&conn, "target-id", &main);
+        insert_session_row(&conn, "older", "Older session", "global", ws, "", None, 10);
+        insert_session_row(&conn, "tie-b", "Tie B", "global", ws, "", None, 15);
+        insert_session_row(&conn, "tie-a", "Tie A", "global", ws, "", None, 15);
+        insert_session_row(
+            &conn,
+            "newer",
+            "Newer session",
+            "global",
+            &format!("{ws}/pkg"),
+            "",
+            Some("wrk_old"),
+            20,
+        );
+        insert_session_row(
+            &conn,
+            "elsewhere",
+            "Elsewhere",
+            "global",
+            "/somewhere/else",
+            "",
+            None,
+            30,
+        );
+        drop(conn);
+
+        let rows = inspect_db(&db_path, Path::new(ws), &main_path)
+            .expect("inspect succeeds")
+            .expect("matching rows");
+        assert_eq!(rows.len(), 4, "out-of-range rows must not match");
+        assert_eq!(rows[0].id, "newer");
+        assert_eq!(rows[0].title, "Newer session");
+        assert_eq!(rows[0].directory, format!("{ws}/pkg"));
+        assert_eq!(rows[0].time_updated, 20);
+        assert_eq!(rows[1].id, "tie-a", "ties break by ascending id");
+        assert_eq!(rows[2].id, "tie-b");
+        assert_eq!(rows[3].id, "older");
+        assert_eq!(rows[3].title, "Older session");
+        assert_eq!(rows[3].directory, ws);
+        assert_eq!(rows[3].time_updated, 10);
+    }
+
+    #[test]
+    fn inspect_skips_empty_match_before_target_resolution() {
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).expect("create db");
+        fixture_schema(&conn);
+        insert_project(&conn, "global", "");
+        insert_session(&conn, "other", "global", "/somewhere/else", "", None);
+        drop(conn);
+        // `.git` with no cache or project row would make `resolve_target`
+        // refuse, but an empty match set skips first — same order as the
+        // migration, so the preview cannot block on a no-op removal.
+        let main_path = dir.path().join("main-repo");
+        fs::create_dir_all(main_path.join(".git")).expect("create main .git");
+        let outcome = inspect_db(&db_path, &dir.path().join("workspace"), &main_path)
+            .expect("inspect succeeds");
+        assert!(
+            outcome.is_none(),
+            "zero rows must skip even when the target is unresolvable"
+        );
+    }
+
+    #[test]
+    fn inspect_refuses_on_schema_probe_failure() {
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).expect("create db");
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session (
+                 id TEXT PRIMARY KEY,
+                 title TEXT,
+                 project_id TEXT,
+                 directory TEXT,
+                 path TEXT,
+                 time_updated INTEGER
+             );",
+        )
+        .expect("create schema");
+        drop(conn);
+
+        let err = inspect_db(
+            &db_path,
+            Path::new("/tmp/jj-workspace-inspect/ws"),
+            &dir.path().join("main-repo"),
+        )
+        .expect_err("missing session.workspace_id must refuse");
+        assert!(err.contains("session.workspace_id"), "{err}");
+        assert!(err.contains("refusing to remove"), "{err}");
+    }
+
+    #[test]
+    fn inspect_refuses_when_db_cannot_be_opened() {
+        let dir = TempDir::new();
+        let err = inspect_db(
+            dir.path(),
+            Path::new("/tmp/jj-workspace-inspect/ws"),
+            Path::new("/tmp/jj-workspace-inspect/main"),
+        )
+        .expect_err("opening a directory as a DB must refuse");
+        assert!(
+            err.contains("cannot open the opencode DB (refusing to remove)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn inspect_does_not_modify_rows() {
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let ws = "/home/user/Workspace/main-repo/workspace-feature";
+        let main_path = dir.path().join("main-repo");
+        fs::create_dir_all(main_path.join(".git")).expect("create main .git");
+        let main = main_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).expect("create db");
+        fixture_schema(&conn);
+        insert_project(&conn, "global", "");
+        insert_project(&conn, "target-id", &main);
+        insert_session_row(&conn, "root", "Root", "global", ws, "", None, 5);
+        insert_session_row(
+            &conn,
+            "sub",
+            "Sub",
+            "global",
+            &format!("{ws}/sub"),
+            "sub",
+            Some("wrk_old"),
+            7,
+        );
+        conn.execute(
+            "INSERT INTO project_directory (directory, project_id) VALUES (?1, 'global'), (?2, 'global')",
+            params![ws, format!("{ws}/sub")],
+        )
+        .expect("seed project_directory");
+        let before = db_snapshot(&conn);
+        drop(conn);
+
+        let rows = inspect_db(&db_path, Path::new(ws), &main_path)
+            .expect("inspect succeeds")
+            .expect("matching rows");
+        assert_eq!(rows.len(), 2);
+
+        let conn = Connection::open(&db_path).expect("reopen db");
+        assert_eq!(db_snapshot(&conn), before, "preview must not write");
+    }
+
+    #[test]
+    fn inspect_substitutes_empty_title_when_column_is_missing() {
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let ws = "/home/user/Workspace/main-repo/workspace-feature";
+        let main_path = dir.path().join("main-repo");
+        fs::create_dir_all(main_path.join(".git")).expect("create main .git");
+        let main = main_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).expect("create db");
+        // Pre-title opencode schema: probe passes, the preview still answers.
+        conn.execute_batch(
+            "CREATE TABLE project (
+                 id TEXT PRIMARY KEY,
+                 worktree TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE session (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+                 directory TEXT NOT NULL,
+                 path TEXT NOT NULL DEFAULT '',
+                 workspace_id TEXT,
+                 time_updated INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .expect("create schema");
+        insert_project(&conn, "global", "");
+        insert_project(&conn, "target-id", &main);
+        conn.execute(
+            "INSERT INTO session (id, project_id, directory, path, workspace_id, time_updated) \
+             VALUES ('root', 'global', ?1, '', NULL, 3)",
+            params![ws],
+        )
+        .expect("insert session");
+        drop(conn);
+
+        let rows = inspect_db(&db_path, Path::new(ws), &main_path)
+            .expect("inspect succeeds")
+            .expect("matching rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "root");
+        assert_eq!(
+            rows[0].title, "",
+            "a missing title column must select an empty string"
+        );
+    }
+
+    #[test]
+    fn inspection_from_db_builds_the_public_variants() {
+        let rows = vec![SessionRow {
+            id: "s1".into(),
+            title: "T".into(),
+            directory: "/ws".into(),
+            time_updated: 7,
+        }];
+        match inspection_from_db(Ok(Some(rows)), Path::new("/main/repo")) {
+            Inspection::Ready { rows, main_repo } => {
+                assert_eq!(main_repo, PathBuf::from("/main/repo"));
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].id, "s1");
+                assert_eq!(rows[0].title, "T");
+                assert_eq!(rows[0].directory, "/ws");
+                assert_eq!(rows[0].time_updated, 7);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        match inspection_from_db(Ok(None), Path::new("/main/repo")) {
+            Inspection::Skipped(reason) => {
+                assert_eq!(reason, "no opencode sessions bound to this workspace")
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        match inspection_from_db(Err("boom".into()), Path::new("/main/repo")) {
+            Inspection::Refused(reason) => assert_eq!(reason, "boom"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selected_subset_migration_updates_only_selected_rows() {
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let ws = "/home/user/Workspace/main-repo/workspace-feature";
+        let main_path = dir.path().join("main-repo");
+        fs::create_dir_all(main_path.join(".git")).expect("create main .git");
+        let main = main_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).expect("create db");
+        fixture_schema(&conn);
+        insert_project(&conn, "global", "");
+        insert_project(&conn, "target-id", &main);
+        insert_session(&conn, "chosen-a", "global", ws, "", None);
+        insert_session(
+            &conn,
+            "chosen-b",
+            "global",
+            &format!("{ws}/pkg"),
+            "pkg",
+            Some("wrk_old"),
+        );
+        insert_session(
+            &conn,
+            "left-out",
+            "global",
+            &format!("{ws}/other"),
+            "",
+            None,
+        );
+        insert_session(
+            &conn,
+            "sibling",
+            "global",
+            &format!("{ws}_sibling"),
+            "",
+            None,
+        );
+        conn.execute(
+            "INSERT INTO project_directory (directory, project_id) VALUES (?1, 'global'), (?2, 'global'), (?3, 'global'), (?4, 'global')",
+            params![ws, format!("{ws}/pkg"), format!("{ws}/other"), format!("{ws}_sibling")],
+        )
+        .expect("seed project_directory");
+        drop(conn);
+
+        let before = unix_millis();
+        let selected = vec!["chosen-a".to_string(), "chosen-b".to_string()];
+        let migrated = migrate_selected_db(&db_path, Path::new(ws), &main_path, &selected)
+            .expect("migration succeeds")
+            .expect("selected rows matched");
+        assert_eq!(migrated, 2);
+
+        let conn = Connection::open(&db_path).expect("reopen db");
+        let (project_id, directory, path, workspace_id, time_updated) =
+            migration_row(&conn, "chosen-a");
+        assert_eq!(project_id, "target-id");
+        assert_eq!(directory, main);
+        assert_eq!(path, "");
+        assert_eq!(workspace_id, None);
+        assert!(time_updated >= before, "{time_updated} < {before}");
+        let (project_id, directory, path, workspace_id, _) = migration_row(&conn, "chosen-b");
+        assert_eq!(project_id, "target-id");
+        assert_eq!(directory, main);
+        assert_eq!(path, "");
+        assert_eq!(workspace_id, None);
+        // Unselected rows keep every column.
+        let (project_id, directory, path, workspace_id, time_updated) =
+            migration_row(&conn, "left-out");
+        assert_eq!(project_id, "global");
+        assert_eq!(directory, format!("{ws}/other"));
+        assert_eq!(path, "");
+        assert_eq!(workspace_id, None);
+        assert_eq!(time_updated, 0);
+        let (project_id, directory, ..) = migration_row(&conn, "sibling");
+        assert_eq!(project_id, "global");
+        assert_eq!(directory, format!("{ws}_sibling"));
+
+        // project_directory cleanup still covers the whole workspace range.
+        let remaining: Vec<String> = conn
+            .prepare("SELECT directory FROM project_directory ORDER BY directory")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("collect");
+        assert_eq!(remaining, vec![format!("{ws}_sibling")]);
+    }
+
+    #[test]
+    fn empty_selection_skips_without_touching_the_db() {
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let ws = "/home/user/Workspace/main-repo/workspace-feature";
+        let main_path = dir.path().join("main-repo");
+        fs::create_dir_all(main_path.join(".git")).expect("create main .git");
+        let main = main_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).expect("create db");
+        fixture_schema(&conn);
+        insert_project(&conn, "global", "");
+        insert_project(&conn, "target-id", &main);
+        insert_session(&conn, "root", "global", ws, "", None);
+        let before = db_snapshot(&conn);
+        drop(conn);
+
+        // The empty selection short-circuits before PATH discovery, so this
+        // cannot depend on a hosted opencode install either.
+        let outcome = migrate_selected_opencode_sessions(Path::new(ws), &main_path, &[]);
+        match outcome {
+            Outcome::Skipped(reason) => assert_eq!(reason, "no sessions selected"),
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+
+        let conn = Connection::open(&db_path).expect("reopen db");
+        assert_eq!(db_snapshot(&conn), before, "skip must not write");
+    }
+
+    #[test]
+    fn selection_drift_skips_without_failing() {
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let ws = "/home/user/Workspace/main-repo/workspace-feature";
+        let main_path = dir.path().join("main-repo");
+        fs::create_dir_all(main_path.join(".git")).expect("create main .git");
+        let main = main_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).expect("create db");
+        fixture_schema(&conn);
+        insert_project(&conn, "global", "");
+        insert_project(&conn, "target-id", &main);
+        insert_session(&conn, "still-here", "global", ws, "", None);
+        let before = db_snapshot(&conn);
+        drop(conn);
+
+        // The preview listed ids that are gone (or out of range) by the time
+        // the dialog executes: skip, never fail.
+        let selected = vec!["gone-1".to_string(), "elsewhere".to_string()];
+        let outcome = migrate_selected_db(&db_path, Path::new(ws), &main_path, &selected)
+            .expect("drift is not a failure");
+        assert!(outcome.is_none(), "no selected rows left must skip");
+
+        let conn = Connection::open(&db_path).expect("reopen db");
+        assert_eq!(db_snapshot(&conn), before);
+    }
+
+    #[test]
+    fn selected_outcome_from_db_reports_counts_and_selection_drift() {
+        match selected_outcome_from_db(Ok(Some(3)), Path::new("/main/repo")) {
+            Outcome::Migrated { count, main_repo } => {
+                assert_eq!(count, 3);
+                assert_eq!(main_repo, PathBuf::from("/main/repo"));
+            }
+            other => panic!("expected Migrated, got {other:?}"),
+        }
+        match selected_outcome_from_db(Ok(None), Path::new("/main/repo")) {
+            Outcome::Skipped(reason) => {
+                assert_eq!(reason, "no opencode sessions matched the selection")
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        match selected_outcome_from_db(Err("boom".into()), Path::new("/main/repo")) {
+            Outcome::Refused(reason) => assert_eq!(reason, "boom"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
     }
 
     // --- 6.7 main repo root resolution -------------------------------------
