@@ -1,21 +1,4 @@
-# workspace-setup-script Specification
-
-## Purpose
-TBD - created by archiving change right-pane-script. Update Purpose after archive.
-## Requirements
-### Requirement: setup 脚本随插件分发
-插件 SHALL 在仓库 `scripts/setup-workspace.sh` 提供静态 setup 脚本（`#!/bin/sh`，git 可执行位 100755），随 `plugin install` 与 `plugin link` 分发。脚本 MUST NOT 依赖生成逻辑或临时文件：其内容在插件版本内恒定。
-
-#### Scenario: 脚本随安装可用
-- **WHEN** 用户通过 `plugin install` 或 `plugin link` 安装插件
-- **THEN** `<plugin_root>/scripts/setup-workspace.sh` 存在且可执行
-
-### Requirement: 脚本自定位插件可执行文件
-脚本 SHALL 经 `$0` 推导插件根目录并在 `<plugin_root>/target/release/jj-workspace` 定位插件可执行文件，用于后台启动 finish-tab 监视器。插件 exe MUST NOT 出现在脚本参数中。
-
-#### Scenario: finish-tab 经自定位 exe 启动
-- **WHEN** wizard 以绝对路径调用脚本并传入 workspace/tab/pane ID
-- **THEN** 脚本以 `<plugin_root>/target/release/jj-workspace` 为 exe 后台启动 finish-tab（重定向与后台语义与改造前一致）
+## MODIFIED Requirements
 
 ### Requirement: 脚本签名与调用等价性
 脚本签名 SHALL 为 `setup-workspace.sh <jj路径> <base-rev> <书签名> <workspace-id> <tab-id> <pane-id> [前导参数...]`。脚本 MUST 以 `"$JJ_EXE" "$@" <子命令>` 的形态执行每次 jj 调用：尾部可变参（argv 形态 `jj.command` 的前导参数）展开为零个或多个词插入子命令之前。脚本调用形态 MUST 与插件进程内 `Command::new(exe).args(extras).args(subcmd)` 等价；string 形态（无前导参数）时 MUST 退化为裸 `"$JJ_EXE" <子命令>`。唯一例外为主仓库上下文解析调用：该调用 MUST 在 `"$JJ_EXE" "$@"` 之后、子命令之前追加全局选项 `-R <主仓库根> --ignore-working-copy`，其余调用 MUST NOT 追加额外全局选项。
@@ -47,12 +30,7 @@ TBD - created by archiving change right-pane-script. Update Purpose after archiv
 - **WHEN** 假 jj 在 `rebase` 子命令上失败
 - **THEN** 脚本非零退出
 
-### Requirement: pane 命令为单行脚本调用
-wizard 生成的右侧 pane 命令 SHALL 为一行脚本调用（脚本绝对路径 + 逐参数 `shell_quote`），MUST NOT 包含拼接的 jj 命令序列、`sh_c_escape` 转义内容或对 pane shell PATH 的依赖。脚本路径 MUST 为绝对路径（基于 `HERDR_PLUGIN_ROOT`）。
-
-#### Scenario: 一行调用
-- **WHEN** wizard 创建 jj 工作区
-- **THEN** 右侧 pane 收到 `nohup <脚本绝对路径> '<jj路径>' '<base-rev>' '<书签名>' '<ws>' '<t>' '<p>' [<'前导参数'>…]` 形态的单行命令，其中不含任何 `&&` 链或子 shell 组
+## ADDED Requirements
 
 ### Requirement: base revset 在主仓库上下文重解析
 脚本 SHALL 在 `jj git fetch` 之后、`rebase` 之前推导主仓库根并以主仓库上下文重解析 base revset：主仓库根 SHALL 由本工作区 `.jj/repo` 指针推导（指针相对 `.jj/` 解析、绝对路径原样使用，结果规范化；脚本签名不变、无新参数）；解析 SHALL 以 `jj -R <主仓库根> --ignore-working-copy log -r <base-rev> --no-graph -T 'commit_id ++ "\n"'`（每 commit 一行）进行，脚本 SHALL 将多行结果连接为 ` | ` 分隔的单一 union revset；解析结果非空时 `rebase -s @ -d` 的目标 MUST 为该 union（单参数），解析为空或失败时跳过（见失败语义）。`jj git fetch` 的位置与形态（副工作区、全量拉取）MUST 不变。
@@ -68,4 +46,3 @@ wizard 生成的右侧 pane 命令 SHALL 为一行脚本调用（脚本绝对路
 #### Scenario: 多 commit 解析以 union 传入
 - **WHEN** base revset 在主仓库上下文解析出多个 commit（如 `main@origin | dev@origin`）
 - **THEN** 脚本执行 `rebase -s @ -d "<id1> | <id2>"`（单一 revset 参数，保留 merge-parents 语义）
-

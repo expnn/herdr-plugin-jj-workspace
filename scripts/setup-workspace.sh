@@ -15,7 +15,12 @@
 #   3. create the workspace bookmark:  jj bookmark create <name> -r @
 #      (failure is a warning only — the workspace still exists)
 #   4. fetch from the remote:          jj git fetch
-#   5. rebase the working-copy commit: jj rebase -s @ -d <base-rev>
+#   5. re-resolve the base revset in the MAIN repository's context (the root
+#      derived from this workspace's `.jj/repo` pointer, mirroring the
+#      plugin's repo_root()) and rebase the working-copy commit onto the
+#      resolved commit id(s): jj rebase -s @ -d <resolved ids>. A resolution
+#      failure or an empty result is a warning only — rebase is skipped and
+#      the script still exits 0.
 #
 # The plugin executable is located relative to this script
 # (<plugin_root>/target/release/jj-workspace — the same layout the plugin
@@ -53,5 +58,30 @@ set -ex
 "$JJ_EXE" "$@" bookmark create "$NAME" -r @ ||
     printf '%s\n' "warning: could not create bookmark $NAME (workspace still created)" >&2
 "$JJ_EXE" "$@" git fetch
-"$JJ_EXE" "$@" rebase -s @ -d "$BASE_REV"
+
+# Re-resolve the base revset in the MAIN repository's working-copy context
+# (the same context `workspace add -r` used). The `.jj/repo` pointer mirrors
+# the plugin's repo_root(): relative to `.jj/`, absolute used as-is.
+REPO_PTR=$(cat .jj/repo 2>/dev/null) || REPO_PTR=""
+MAIN_ROOT=""
+case "$REPO_PTR" in
+    /*) MAIN_ROOT=$(CDPATH= cd -- "$(dirname -- "$REPO_PTR")/.." 2>/dev/null && pwd -P) || MAIN_ROOT="" ;;
+    "") ;;
+    *)  MAIN_ROOT=$(CDPATH= cd -- ".jj/$(dirname -- "$REPO_PTR")/.." 2>/dev/null && pwd -P) || MAIN_ROOT="" ;;
+esac
+DEST_REV=""
+if [ -n "$MAIN_ROOT" ]; then
+    # One commit id per line (`commit_id ++ "\n"`); `awk` joins the lines
+    # into a single ` | `-separated union revset. (`separate(" | ", commit_id)`
+    # would NOT join revisions on jj 0.45.1 — the log template is evaluated
+    # per revision, so the join happens here instead.)
+    DEST_REV=$("$JJ_EXE" "$@" -R "$MAIN_ROOT" --ignore-working-copy log \
+        -r "$BASE_REV" --no-graph -T 'commit_id ++ "\n"' 2>/dev/null \
+        | awk '{ printf "%s%s", sep, $0; sep=" | " }') || DEST_REV=""
+fi
+if [ -n "$DEST_REV" ]; then
+    "$JJ_EXE" "$@" rebase -s @ -d "$DEST_REV"
+else
+    printf '%s\n' "warning: could not resolve base revset '$BASE_REV' in the main repository context; skipping rebase" >&2
+fi
 

@@ -677,9 +677,11 @@ fn resolve_base_rev(config: &Config, jj: &ResolvedJj, repo: &Path) -> Result<Str
 /// Determine the final base revision at wizard submit time for the single jj
 /// source: an untouched base field (dirty = false) is re-evaluated from the
 /// resolution chain for that source; a user-edited value (dirty = true) is
-/// validated against the repo with `jj log -r <expr>` (a cheap parse-only
-/// check with zero output). Failure keeps the wizard open with jj's own
-/// error message.
+/// validated against the repo with `jj log -r <expr>` (a cheap parse check
+/// with `--limit 1`). A revset that resolves to no commits is rejected too
+/// (empty stdout), so an empty-set expression like `none()` can never reach
+/// `jj workspace add` and leave a half-finished workspace behind. Failure
+/// keeps the wizard open with jj's own error message.
 fn wizard_final_base_rev(
     config: &Config,
     jj: &ResolvedJj,
@@ -703,8 +705,11 @@ fn wizard_final_base_rev(
 }
 
 /// Pre-validate a revset against the source repo: `jj log -r <value>` parses
-/// and resolves it; `--limit 0` keeps it fast and pager-free. Failure carries
-/// jj's native message into the wizard error line.
+/// and resolves it; `--limit 1` keeps it fast and pager-free. Exit 0 with
+/// empty stdout means the revset resolved to no commits (e.g. `none()`),
+/// which is rejected here so `jj workspace add` never registers a
+/// half-finished workspace. Non-zero exit carries jj's native message into
+/// the wizard error line.
 fn validate_revset(jj: &ResolvedJj, repo: &Path, value: &str) -> Result<(), String> {
     let mut validate = Command::new(&jj.executable);
     validate.current_dir(repo).args(&jj.extra_args).args([
@@ -713,11 +718,17 @@ fn validate_revset(jj: &ResolvedJj, repo: &Path, value: &str) -> Result<(), Stri
         value,
         "--no-graph",
         "--limit",
-        "0",
+        "1",
         "--no-pager",
     ]);
     match validate.output() {
-        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) if output.status.success() => {
+            if output.stdout.is_empty() {
+                Err(format!("base revset resolves to no commits: {value}"))
+            } else {
+                Ok(())
+            }
+        }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             Err(if stderr.is_empty() {
@@ -2695,14 +2706,20 @@ mod tests {
     /// Runs the shipped setup script inside a fake plugin layout
     /// (`<root>/scripts/setup-workspace.sh` + `<root>/target/release/jj-workspace`
     /// + a fake `jj` on PATH) so both the script's self-located plugin exe and
-    /// its jj invocations are asserted against real execution.
+    /// its jj invocations are asserted against real execution. The script runs
+    /// with cwd = `<root>/dest`, a secondary workspace whose `.jj/repo` pointer
+    /// (`../../main/.jj/repo`) resolves to `<root>/main` (created so the
+    /// pointer derivation does not degrade). Returns the canonicalized main
+    /// root so callers can assert the resolve call's `-R` argument.
     #[cfg(unix)]
     fn run_setup_script(
         bookmark_name: &str,
         base_rev: &str,
         fail_on: &str,
         leading_args: &[&str],
-    ) -> (std::process::Output, Vec<String>, Vec<String>) {
+        resolve_mode: &str,
+        resolve_output: Option<&str>,
+    ) -> (std::process::Output, Vec<String>, Vec<String>, String) {
         use std::os::unix::fs::PermissionsExt;
 
         let nanos = std::time::SystemTime::now()
@@ -2714,6 +2731,21 @@ mod tests {
         std::fs::create_dir_all(root.join("scripts")).expect("create scripts dir");
         std::fs::create_dir_all(root.join("target/release")).expect("create target dir");
         std::fs::create_dir_all(root.join("bin")).expect("create bin dir");
+        // The script's cwd is the fresh secondary workspace: `dest` carries a
+        // `.jj/repo` relative pointer to the MAIN repo (`main`), which must
+        // exist — the script's `cd` target cannot be missing or the pointer
+        // derivation silently degrades.
+        std::fs::create_dir_all(root.join("dest/.jj")).expect("create dest dir");
+        std::fs::create_dir_all(root.join("main")).expect("create main dir");
+        std::fs::write(root.join("dest/.jj/repo"), "../../main/.jj/repo\n")
+            .expect("write repo pointer");
+        // Canonicalized before the cleanup below: `/tmp` may itself be a
+        // symlink (macOS), and the script normalizes with `pwd -P`, so the
+        // expected `-R` argument is the physical path.
+        let main_root = std::fs::canonicalize(root.join("main"))
+            .expect("canonicalize main root")
+            .display()
+            .to_string();
 
         std::fs::copy(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-workspace.sh"),
@@ -2736,19 +2768,34 @@ mod tests {
         std::fs::set_permissions(&plugin_exe, std::fs::Permissions::from_mode(0o755))
             .expect("make fake plugin exe executable");
 
-        // Fake jj: logs argv, fails on a chosen subcommand.
+        // Fake jj: logs argv, fails on a chosen subcommand, and answers the
+        // `log` subcommand (the MAIN-context resolve call) per
+        // JJ_FAKE_RESOLVE_MODE / JJ_FAKE_RESOLVE_OUTPUT. The subcommand is
+        // matched anywhere in argv: the resolve call's first argument is the
+        // global `-R`, so `$1` is not the subcommand on that call.
         let jj_log = root.join("jj.log");
         let jj = root.join("bin/jj");
         std::fs::write(
             &jj,
             format!(
                 "#!/bin/sh\n\
-                 echo \"$@\" >> \"$JJ_FAKE_LOG\"\n\
-                 case \"$1\" in\n\
+                 printf '%s\\n' \"$*\" >> \"$JJ_FAKE_LOG\"\n\
+                 for a in \"$@\"; do\n\
+                   case \"$a\" in\n\
+                     sparse|bookmark|fetch|rebase|log) SUB=\"$a\" ;;\n\
+                   esac\n\
+                 done\n\
+                 case \"$SUB\" in\n\
                    {fail_on}) exit 1 ;;\n\
-                   sparse|bookmark|fetch|rebase) exit 0 ;;\n\
-                   *) exit 0 ;;\n\
-                 esac\n"
+                   log)\n\
+                     case \"$JJ_FAKE_RESOLVE_MODE\" in\n\
+                       empty) exit 0 ;;\n\
+                       fail) exit 1 ;;\n\
+                       *) echo \"${{JJ_FAKE_RESOLVE_OUTPUT:-1111111111111111111111111111111111111111}}\" ;;\n\
+                     esac\n\
+                     exit 0 ;;\n\
+                 esac\n\
+                 exit 0\n"
             ),
         )
         .expect("write fake jj");
@@ -2771,8 +2818,13 @@ mod tests {
         for arg in leading_args {
             command.arg(arg);
         }
+        if let Some(output) = resolve_output {
+            command.env("JJ_FAKE_RESOLVE_OUTPUT", output);
+        }
         let output = command
+            .current_dir(root.join("dest"))
             .env("JJ_FAKE_LOG", &jj_log)
+            .env("JJ_FAKE_RESOLVE_MODE", resolve_mode)
             .env("FINISH_LOG", &finish_log)
             .output()
             .expect("run setup script");
@@ -2791,21 +2843,25 @@ mod tests {
             })
             .unwrap_or_default();
         let _ = std::fs::remove_dir_all(&root);
-        (output, jj_lines, finish_lines)
+        (output, jj_lines, finish_lines, main_root)
     }
 
     #[test]
     #[cfg(unix)]
     fn setup_runs_materialize_bookmark_fetch_rebase_in_order() {
-        let (output, log, finish) = run_setup_script("plain-name", "trunk()", "__never__", &[]);
+        let (output, log, finish, main_root) =
+            run_setup_script("plain-name", "trunk()", "__never__", &[], "ok", None);
         assert!(output.status.success());
         assert_eq!(
             log,
             vec![
-                "sparse set --clear --add .",
-                "bookmark create plain-name -r @",
-                "git fetch",
-                "rebase -s @ -d trunk()",
+                "sparse set --clear --add .".to_string(),
+                "bookmark create plain-name -r @".to_string(),
+                "git fetch".to_string(),
+                format!(
+                    "-R {main_root} --ignore-working-copy log -r trunk() --no-graph -T commit_id ++ \"\\n\""
+                ),
+                "rebase -s @ -d 1111111111111111111111111111111111111111".to_string(),
             ]
         );
         // The plugin exe was self-located via the script's `$0` layout.
@@ -2814,8 +2870,26 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn setup_derives_main_root_from_repo_pointer() {
+        // The relative `.jj/repo` pointer (`../../main/.jj/repo` from
+        // `dest/.jj`) must resolve to the canonical `<root>/main` path used
+        // as the resolve call's `-R` argument — the same mechanism the
+        // plugin's repo_root() relies on.
+        let (output, log, _, main_root) =
+            run_setup_script("plain-name", "trunk()", "__never__", &[], "ok", None);
+        assert!(output.status.success());
+        assert!(
+            log.iter()
+                .any(|line| line.starts_with(&format!("-R {main_root} "))),
+            "resolve call must target the derived main root: {log:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn setup_materialization_failure_stops_the_chain() {
-        let (output, log, _) = run_setup_script("workspace/x", "trunk()", "sparse", &[]);
+        let (output, log, _, _) =
+            run_setup_script("workspace/x", "trunk()", "sparse", &[], "ok", None);
         assert!(!output.status.success());
         assert_eq!(log, vec!["sparse set --clear --add ."]);
     }
@@ -2823,9 +2897,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn setup_bookmark_failure_warns_and_keeps_updating() {
-        let (output, log, _) = run_setup_script("workspace/fix-api", "trunk()", "bookmark", &[]);
+        let (output, log, _, main_root) =
+            run_setup_script("workspace/fix-api", "trunk()", "bookmark", &[], "ok", None);
         // The `|| printf` fallback makes the bookmark step succeed, so
-        // fetch/rebase still run and the whole script exits 0.
+        // fetch/resolve/rebase still run and the whole script exits 0.
         assert!(output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -2837,10 +2912,13 @@ mod tests {
         assert_eq!(
             log,
             vec![
-                "sparse set --clear --add .",
-                "bookmark create workspace/fix-api -r @",
-                "git fetch",
-                "rebase -s @ -d trunk()",
+                "sparse set --clear --add .".to_string(),
+                "bookmark create workspace/fix-api -r @".to_string(),
+                "git fetch".to_string(),
+                format!(
+                    "-R {main_root} --ignore-working-copy log -r trunk() --no-graph -T commit_id ++ \"\\n\""
+                ),
+                "rebase -s @ -d 1111111111111111111111111111111111111111".to_string(),
             ]
         );
     }
@@ -2848,15 +2926,19 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn setup_preserves_single_quotes_in_bookmark_names() {
-        let (output, log, _) = run_setup_script("it's-final", "trunk()", "__never__", &[]);
+        let (output, log, _, main_root) =
+            run_setup_script("it's-final", "trunk()", "__never__", &[], "ok", None);
         assert!(output.status.success());
         assert_eq!(
             log,
             vec![
-                "sparse set --clear --add .",
-                "bookmark create it's-final -r @",
-                "git fetch",
-                "rebase -s @ -d trunk()",
+                "sparse set --clear --add .".to_string(),
+                "bookmark create it's-final -r @".to_string(),
+                "git fetch".to_string(),
+                format!(
+                    "-R {main_root} --ignore-working-copy log -r trunk() --no-graph -T commit_id ++ \"\\n\""
+                ),
+                "rebase -s @ -d 1111111111111111111111111111111111111111".to_string(),
             ]
         );
     }
@@ -2865,55 +2947,150 @@ mod tests {
     #[cfg(unix)]
     fn setup_propagates_leading_args_before_each_subcommand() {
         // argv-form `jj.command` leading arguments ride as trailing script
-        // arguments and must be inserted before every jj subcommand.
-        let (output, log, _) =
-            run_setup_script("plain-name", "trunk()", "__never__", &["--at-op", "@-"]);
+        // arguments and must be inserted before every jj subcommand — the
+        // resolve call gets them before its `-R` global option.
+        let (output, log, _, main_root) =
+            run_setup_script("plain-name", "trunk()", "__never__", &["--at-op", "@-"], "ok", None);
         assert!(output.status.success());
         assert_eq!(
             log,
             vec![
-                "--at-op @- sparse set --clear --add .",
-                "--at-op @- bookmark create plain-name -r @",
-                "--at-op @- git fetch",
-                "--at-op @- rebase -s @ -d trunk()",
+                "--at-op @- sparse set --clear --add .".to_string(),
+                "--at-op @- bookmark create plain-name -r @".to_string(),
+                "--at-op @- git fetch".to_string(),
+                format!(
+                    "--at-op @- -R {main_root} --ignore-working-copy log -r trunk() --no-graph -T commit_id ++ \"\\n\""
+                ),
+                "--at-op @- rebase -s @ -d 1111111111111111111111111111111111111111".to_string(),
             ]
         );
     }
 
     #[test]
     #[cfg(unix)]
-    fn setup_passes_base_rev_to_rebase() {
-        // The base-rev argument flows through to the rebase destination
-        // (parameterized by per-repo-base-rev; here it is whatever was passed).
-        let (output, log, _) = run_setup_script("w", "dev@origin", "__never__", &[]);
+    fn setup_passes_base_rev_to_resolution() {
+        // The base-rev argument flows into the MAIN-context resolve call; the
+        // rebase destination is the resolved commit id, not the raw revset.
+        let (output, log, _, _) = run_setup_script("w", "dev@origin", "__never__", &[], "ok", None);
         assert!(output.status.success());
         assert!(
-            log.iter().any(|line| line == "rebase -s @ -d dev@origin"),
-            "rebase should target the passed base-rev: {log:?}"
+            log.iter().any(|line| line.contains("log -r dev@origin")),
+            "resolve call must receive the full base revset: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|line| line == "rebase -s @ -d 1111111111111111111111111111111111111111"),
+            "rebase must target the resolved commit id: {log:?}"
         );
     }
 
     #[test]
     #[cfg(unix)]
-    fn setup_passes_revsets_with_spaces_and_quotes() {
+    fn setup_passes_revsets_with_spaces_and_quotes_to_resolution() {
         // Revsets are shell-quoted per argument by the wizard, so spaces and
-        // single quotes survive the pane shell and arrive as one argv word.
-        let (output, log, _) =
-            run_setup_script("w", "trunk() | remote_bookmark(dev)", "__never__", &[]);
+        // single quotes survive the pane shell and arrive as one argv word —
+        // the MAIN-context resolve call must receive the complete revset.
+        let (output, log, _, _) = run_setup_script(
+            "w",
+            "trunk() | remote_bookmark(dev)",
+            "__never__",
+            &[],
+            "ok",
+            None,
+        );
         assert!(output.status.success());
         assert!(
             log.iter()
-                .any(|line| line == "rebase -s @ -d trunk() | remote_bookmark(dev)"),
-            "space-containing revset must survive: {log:?}"
+                .any(|line| line.contains("log -r trunk() | remote_bookmark(dev)")),
+            "space-containing revset must reach the resolve call: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|line| line == "rebase -s @ -d 1111111111111111111111111111111111111111"),
+            "rebase must target the resolved commit id: {log:?}"
         );
 
-        let (output, log, _) = run_setup_script("w", "description(\"fix'it\")", "__never__", &[]);
+        let (output, log, _, _) =
+            run_setup_script("w", "description(\"fix'it\")", "__never__", &[], "ok", None);
         assert!(output.status.success());
         assert!(
             log.iter()
-                .any(|line| line == "rebase -s @ -d description(\"fix'it\")"),
-            "quote-containing revset must survive: {log:?}"
+                .any(|line| line.contains("log -r description(\"fix'it\")")),
+            "quote-containing revset must reach the resolve call: {log:?}"
         );
+        assert!(
+            log.iter()
+                .any(|line| line == "rebase -s @ -d 1111111111111111111111111111111111111111"),
+            "rebase must target the resolved commit id: {log:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_resolution_failure_warns_and_skips_rebase() {
+        // A non-zero resolve call is a real reachable state (e.g. a remote
+        // branch deleted after fetch): warn on stderr, skip rebase, exit 0.
+        let (output, log, _, _) = run_setup_script("w", "dev@origin", "__never__", &[], "fail", None);
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("warning: could not resolve base revset 'dev@origin'"),
+            "stderr should carry the resolve warning: {stderr}"
+        );
+        assert_eq!(log.len(), 4, "no rebase call after a failed resolve: {log:?}");
+        assert!(!log.iter().any(|line| line.starts_with("rebase")), "{log:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_empty_resolution_warns_and_skips_rebase() {
+        // Exit 0 with empty stdout = the revset resolved to no commits: same
+        // degradation path (warn, skip rebase, exit 0).
+        let (output, log, _, _) = run_setup_script("w", "none()", "__never__", &[], "empty", None);
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("warning: could not resolve base revset 'none()'"),
+            "stderr should carry the resolve warning: {stderr}"
+        );
+        assert_eq!(log.len(), 4, "no rebase call after an empty resolve: {log:?}");
+        assert!(!log.iter().any(|line| line.starts_with("rebase")), "{log:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_union_resolution_rebases_to_single_union_arg() {
+        // Multiple commits resolve to one commit id per line (as real jj
+        // renders with the `commit_id ++ "\n"` template); the script joins
+        // them into a SINGLE ` | `-separated `-d` argument (merge-parents
+        // semantics preserved).
+        let (output, log, _, _) = run_setup_script(
+            "w",
+            "main@origin | dev@origin",
+            "__never__",
+            &[],
+            "ok",
+            Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+        );
+        assert!(output.status.success());
+        assert!(
+            log.iter().any(|line| {
+                line == "rebase -s @ -d aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }),
+            "union must arrive as one -d argument: {log:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_rebase_failure_still_fails() {
+        // Rebase failing keeps the script's existing hard-fail semantics.
+        let (output, log, _, _) = run_setup_script("w", "trunk()", "rebase", &[], "ok", None);
+        assert!(!output.status.success());
+        assert_eq!(log.len(), 5, "all five steps ran before the rebase failure: {log:?}");
+        assert!(log.last().unwrap().starts_with("rebase"), "{log:?}");
     }
 
     // --- name field component-level editing (workspace-wizard: name 字段组件级编辑)
@@ -3191,7 +3368,13 @@ mod tests {
     #[cfg(unix)]
     fn wizard_final_base_rev_validates_edited_values() {
         let dir = TempDir::new();
-        let ok = make_fake_jj(dir.path(), "ok-jj", "exit 0\n");
+        // The ok fake jj must emit SOMETHING on the log call: exit 0 with
+        // empty stdout now means "resolves to no commits" and is rejected.
+        let ok = make_fake_jj(
+            dir.path(),
+            "ok-jj",
+            "echo 1111111111111111111111111111111111111111\n",
+        );
         let bad = make_fake_jj(
             dir.path(),
             "bad-jj",
@@ -3206,6 +3389,21 @@ mod tests {
         let err = wizard_final_base_rev(&config, &bad, dir.path(), "dev@origin", true)
             .expect_err("invalid revset must fail");
         assert!(err.contains("doesn't exist"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wizard_final_base_rev_rejects_empty_resolution() {
+        // Exit 0 with empty stdout = the revset resolved to no commits (e.g.
+        // `none()`): must be rejected so `jj workspace add` never registers a
+        // half-finished workspace.
+        let dir = TempDir::new();
+        let jj = make_fake_jj(dir.path(), "empty-jj", "exit 0\n");
+        let config = Config::default();
+        let err = wizard_final_base_rev(&config, &jj, dir.path(), "none()", true)
+            .expect_err("empty resolution must fail");
+        assert!(err.contains("base revset"), "{err}");
+        assert!(err.contains("no commits"), "{err}");
     }
 
     #[test]

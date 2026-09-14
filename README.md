@@ -64,8 +64,10 @@ cross-agent default covering 15 mainstream agents — see
 `agent.bootstrap_paths` below), and opens its tab. The right terminal then
 runs `scripts/setup-workspace.sh` (a plain POSIX shell script shipped with
 the plugin — `cat` it any time to see exactly what it does): it materializes
-the full checkout, creates the bookmark, runs `jj git fetch`, and rebases the
-new working-copy commit onto the base revision while the agent starts on the
+the full checkout, creates the bookmark, runs `jj git fetch`, then re-resolves
+the base revision in the main repository's working-copy context and rebases
+the new working-copy commit onto the resolved commit (a warning skips the
+rebase if the base can no longer be resolved) while the agent starts on the
 left.
 
 The setup script runs under `/bin/sh`, so it works no matter which interactive
@@ -179,10 +181,12 @@ repository in this order:
 The wizard shows the resolved value in the **base** field (press `Tab` to
 reach it) and lets you override it per run with any jj revset expression. Typed values are
 validated against the source repository before the workspace is created
-(`jj log -r <expr> --no-graph --limit 0`), and an invalid expression keeps the
-wizard open with jj's own error message. The same resolved revision is used
-as the right-pane rebase destination, so `workspace add -r` and the setup
-script's `rebase -d` always agree.
+(`jj log -r <expr> --no-graph --limit 1`): an invalid expression, or one that
+resolves to no commits, keeps the wizard open with an error message. The same
+value drives `workspace add -r`; after `jj git fetch`, the setup script
+re-resolves it in the main repository's working-copy context (via the
+workspace's `.jj/repo` pointer) and rebases onto the resolved commit(s), so
+both steps always evaluate the base the same way.
 
 ### Agent startup handling
 
