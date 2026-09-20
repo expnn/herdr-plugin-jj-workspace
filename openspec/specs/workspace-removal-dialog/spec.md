@@ -95,6 +95,26 @@ session 列表与 pane 列表 SHALL 默认全选；`↑↓` 在可切换行间�
 - **WHEN** 工作副本脏且用户查看指引
 - **THEN** `jj restore` 仅作为文本展示，不存在任何触发其执行的按键路径
 
+### Requirement: commit message 输入的光标编辑
+
+remove 对话框 commit 子态的 message 输入框 SHALL 支持单行光标编辑：字符在光标处插入、Backspace 删除光标前一字符、`Delete` 删除光标处字符、`←`/`→` 左右移动一个字符位置、`Home`/`End` 移至行首/行尾；光标 SHALL 以块字符渲染于光标所在位置。进入 commit 子态 SHALL 仍清空 message 并将光标置于起始位置；`Esc` 返回 review 并清空 message 的既有行为不变；提交与校验语义（非空校验、`jj commit -m`）SHALL 保持不变。
+
+#### Scenario: 光标处插入
+- **WHEN** message 为 `fx` 且光标位于 `x` 之前，用户输入 `i`
+- **THEN** message 变为 `fix`
+
+#### Scenario: 前向删除
+- **WHEN** message 为 `fixx` 且光标位于最后一个 `x` 之前，用户按一次 `Delete`
+- **THEN** message 变为 `fix`
+
+#### Scenario: 行首插入
+- **WHEN** message 为 `fix bug`（光标在末尾），用户按 `Home` 后输入 `wip: `
+- **THEN** message 变为 `wip: fix bug`
+
+#### Scenario: 进入子态清空且光标在起始
+- **WHEN** 用户从 review 按 `c` 进入 commit 子态
+- **THEN** message 为空、光标位于起始位置，输入从第一个字符开始
+
 ### Requirement: 授权执行与 Status 视图
 
 `↵` 授权后对话框 SHALL 切换到 Status 视图，按序推进并逐项展示任务状态（迁移 → forget → 删除目录 → 关闭所选 pane）；执行前 SHALL 复检工作副本干净，失败则回到审阅并显示原因，MUST NOT 执行任何步骤。全部成功时 SHALL 自动退出（自身 pane 随进程退出关闭）；任一破坏性步骤（迁移 / forget / 删除目录）失败时 SHALL 停留在 Status 视图，显示失败步骤、已完成/未执行说明与 error.log 指针，按键关闭；逐个关闭 pane 失败 SHALL 仅作警示（不阻断后续 pane 的关闭与退出）。成功执行时 MUST NOT 调用 `herdr tab close`——tab/workspace 的关闭由 herdr 的「最后一个 pane 关闭即关 tab」级联决定。

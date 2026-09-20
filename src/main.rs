@@ -68,7 +68,9 @@ struct WizardView<'a> {
     source: &'a str,
     field: WizardField,
     name: &'a str,
+    name_cursor: usize,
     base: &'a str,
+    base_cursor: usize,
     root: &'a Path,
     error: Option<&'a str>,
 }
@@ -98,40 +100,187 @@ enum NameEditState {
     Free,
 }
 
-/// A name-field keypress reducible through `apply_name_key`.
-enum NameKey {
-    Char(char),
-    Backspace,
+/// A single-line text buffer with an explicit char-index cursor. Shared by
+/// the wizard's name/base fields and the remove dialog's commit message so
+/// all three follow one editing contract; the name field wraps it in its
+/// component-level state machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LineEdit {
+    text: String,
+    /// Char index into `text` (`0..=char count`), never a byte index:
+    /// insert/delete must not split a multi-byte character.
+    cursor: usize,
 }
 
-/// Apply a keypress to the name field (component-level state machine):
+impl LineEdit {
+    /// A line with the cursor parked at the end.
+    fn new(text: String) -> Self {
+        let cursor = text.chars().count();
+        Self { text, cursor }
+    }
+
+    /// Byte offset of the cursor; an out-of-range cursor clamps to the end.
+    fn byte_offset(&self) -> usize {
+        self.text
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(offset, _)| offset)
+            .unwrap_or(self.text.len())
+    }
+
+    fn char_count(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    /// Replace the whole text and park the cursor at the end.
+    fn set_text(&mut self, text: String) {
+        self.cursor = text.chars().count();
+        self.text = text;
+    }
+
+    /// Clear the text and move the cursor to the start.
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    /// Insert `c` at the cursor and advance it past the new char.
+    fn insert_char(&mut self, c: char) {
+        let offset = self.byte_offset();
+        self.text.insert(offset, c);
+        self.cursor += 1;
+    }
+
+    /// Delete the char before the cursor (no-op at the start).
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = self.byte_offset();
+        let start = self.text[..end]
+            .char_indices()
+            .next_back()
+            .map(|(offset, _)| offset)
+            .unwrap_or(0);
+        self.text.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    /// Delete the char at the cursor (no-op at the end).
+    fn delete(&mut self) {
+        let start = self.byte_offset();
+        if start >= self.text.len() {
+            return;
+        }
+        let end = start
+            + self.text[start..]
+                .chars()
+                .next()
+                .map_or(0, char::len_utf8);
+        self.text.replace_range(start..end, "");
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor < self.char_count() {
+            self.cursor += 1;
+        }
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.char_count();
+    }
+}
+
+/// A single-line editing keypress, applied by `apply_line_key`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditKey {
+    Char(char),
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+}
+
+/// The shared single-line editing primitive: every key acts at the cursor.
+fn apply_line_key(line: &mut LineEdit, key: EditKey) {
+    match key {
+        EditKey::Char(c) => line.insert_char(c),
+        EditKey::Backspace => line.backspace(),
+        EditKey::Delete => line.delete(),
+        EditKey::Left => line.move_left(),
+        EditKey::Right => line.move_right(),
+        EditKey::Home => line.home(),
+        EditKey::End => line.end(),
+    }
+}
+
+/// Map a navigation keycode to its editing action; `None` for other keys.
+fn line_nav_key(code: KeyCode) -> Option<EditKey> {
+    match code {
+        KeyCode::Left => Some(EditKey::Left),
+        KeyCode::Right => Some(EditKey::Right),
+        KeyCode::Home => Some(EditKey::Home),
+        KeyCode::End => Some(EditKey::End),
+        KeyCode::Delete => Some(EditKey::Delete),
+        _ => None,
+    }
+}
+
+/// Visible text of a single-line field: focused fields insert the block
+/// cursor at the cursor's char boundary, unfocused fields render plain.
+fn render_line_with_cursor(text: &str, cursor: usize, focused: bool) -> String {
+    if !focused {
+        return text.to_string();
+    }
+    let offset = text
+        .char_indices()
+        .nth(cursor)
+        .map(|(offset, _)| offset)
+        .unwrap_or(text.len());
+    format!("{}█{}", &text[..offset], &text[offset..])
+}
+
+/// Apply a keypress to the name field (component-level state machine wrapping
+/// the shared line-edit primitive):
 /// - Fresh + Char    → keep prefix, replace slug, then Free
 /// - Fresh + Bksp    → drop slug, keep prefix (→ Prefixed)
 /// - Prefixed + Char → append after prefix (→ Free)
 /// - Prefixed + Bksp → clear whole name (→ Free)
-/// - Free + Char     → append
-/// - Free + Bksp     → pop one char
+/// - Free + any key  → delegate to `apply_line_key`
+/// - Fresh/Prefixed + any navigation key → text untouched, cursor moves, Free
 ///
 /// The prefix is derived from the current name via the last `/`, never
 /// hardcoded, so user-typed multi-segment names edit per-character.
-fn apply_name_key(name: &mut String, state: &mut NameEditState, key: NameKey) {
+fn apply_name_key(name: &mut LineEdit, state: &mut NameEditState, key: EditKey) {
     match key {
-        NameKey::Char(c) => {
+        EditKey::Char(c) => {
             if *state == NameEditState::Fresh {
                 // Replace the slug part, keep the prefix (everything up to
                 // and including the last '/').
-                match name.rfind('/') {
-                    Some(slash) => name.truncate(slash + 1),
-                    None => name.clear(),
-                }
+                let prefix = match name.text.rfind('/') {
+                    Some(slash) => name.text[..slash + 1].to_string(),
+                    None => String::new(),
+                };
+                name.set_text(prefix);
             }
-            name.push(c);
+            name.insert_char(c);
             *state = NameEditState::Free;
         }
-        NameKey::Backspace => match *state {
-            NameEditState::Fresh => match name.rfind('/') {
+        EditKey::Backspace => match *state {
+            NameEditState::Fresh => match name.text.rfind('/') {
                 Some(slash) => {
-                    name.truncate(slash + 1);
+                    let prefix = name.text[..slash + 1].to_string();
+                    name.set_text(prefix);
                     *state = NameEditState::Prefixed;
                 }
                 None => {
@@ -143,10 +292,38 @@ fn apply_name_key(name: &mut String, state: &mut NameEditState, key: NameKey) {
                 name.clear();
                 *state = NameEditState::Free;
             }
-            NameEditState::Free => {
-                name.pop();
-            }
+            NameEditState::Free => name.backspace(),
         },
+        // Any navigation key exits an anchor state without touching the
+        // text: the safety valve only ever fails toward per-char editing.
+        // The rule is "any nav key press", not "the cursor actually moved".
+        EditKey::Delete | EditKey::Left | EditKey::Right | EditKey::Home | EditKey::End => {
+            *state = NameEditState::Free;
+            apply_line_key(name, key);
+        }
+    }
+}
+
+/// Apply a keypress to the wizard's base field. `replace_on_type` mirrors the
+/// name field's component semantics: the first Char/Backspace clears the
+/// prefilled value before applying, while any navigation key cancels the
+/// anchor without touching the text. Returns whether the key dirtied the
+/// field (navigation never does).
+fn apply_base_key(base: &mut LineEdit, replace_on_type: &mut bool, key: EditKey) -> bool {
+    match key {
+        EditKey::Char(_) | EditKey::Backspace => {
+            if *replace_on_type {
+                base.clear();
+                *replace_on_type = false;
+            }
+            apply_line_key(base, key);
+            true
+        }
+        _ => {
+            *replace_on_type = false;
+            apply_line_key(base, key);
+            false
+        }
     }
 }
 
@@ -2129,8 +2306,8 @@ fn run_workspace_wizard(
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let mut field = WizardField::Name;
-    let mut name = initial_name;
-    let mut base = initial_base;
+    let mut name = LineEdit::new(initial_name);
+    let mut base = LineEdit::new(initial_base);
     let mut name_edit_state = NameEditState::Fresh;
     let mut base_replace_on_type = true;
     let mut base_dirty = false;
@@ -2143,8 +2320,10 @@ fn run_workspace_wizard(
                 &WizardView {
                     source: &source.path,
                     field,
-                    name: &name,
-                    base: &base,
+                    name: &name.text,
+                    name_cursor: name.cursor,
+                    base: &base.text,
+                    base_cursor: base.cursor,
                     root,
                     error: error.as_deref(),
                 },
@@ -2159,7 +2338,7 @@ fn run_workspace_wizard(
                     error = None;
                 }
                 KeyCode::Enter => {
-                    if !valid_branch(&name) {
+                    if !valid_branch(&name.text) {
                         error = Some("name must match [A-Za-z0-9._/-]".into());
                         continue;
                     }
@@ -2167,7 +2346,7 @@ fn run_workspace_wizard(
                         error = Some(format!("folder does not exist: {}", source.path));
                         continue;
                     }
-                    let checkout = workspace_destination(root, &source.path, &name);
+                    let checkout = workspace_destination(root, &source.path, &name.text);
                     if checkout.exists() {
                         error = Some(format!("checkout already exists: {}", checkout.display()));
                         continue;
@@ -2180,7 +2359,7 @@ fn run_workspace_wizard(
                         config,
                         jj,
                         Path::new(&source.path),
-                        &base,
+                        &base.text,
                         base_dirty,
                     ) {
                         Ok(value) => value,
@@ -2191,12 +2370,12 @@ fn run_workspace_wizard(
                     };
                     break Some(WizardResult {
                         source: source.clone(),
-                        name: name.clone(),
+                        name: name.text.clone(),
                         base_rev,
                     });
                 }
                 KeyCode::Backspace if field == WizardField::Name => {
-                    apply_name_key(&mut name, &mut name_edit_state, NameKey::Backspace);
+                    apply_name_key(&mut name, &mut name_edit_state, EditKey::Backspace);
                     error = None;
                 }
                 KeyCode::Char(c)
@@ -2204,17 +2383,23 @@ fn run_workspace_wizard(
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                         && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
-                    apply_name_key(&mut name, &mut name_edit_state, NameKey::Char(c));
+                    apply_name_key(&mut name, &mut name_edit_state, EditKey::Char(c));
+                    error = None;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End | KeyCode::Delete
+                    if field == WizardField::Name
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(nav) = line_nav_key(key.code) {
+                        apply_name_key(&mut name, &mut name_edit_state, nav);
+                    }
                     error = None;
                 }
                 KeyCode::Backspace if field == WizardField::Base => {
-                    if base_replace_on_type {
-                        base.clear();
-                        base_replace_on_type = false;
-                    } else {
-                        base.pop();
-                    }
-                    base_dirty = true;
+                    let dirty =
+                        apply_base_key(&mut base, &mut base_replace_on_type, EditKey::Backspace);
+                    base_dirty |= dirty;
                     error = None;
                 }
                 KeyCode::Char(c)
@@ -2222,12 +2407,19 @@ fn run_workspace_wizard(
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                         && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
-                    if base_replace_on_type {
-                        base.clear();
-                        base_replace_on_type = false;
+                    let dirty =
+                        apply_base_key(&mut base, &mut base_replace_on_type, EditKey::Char(c));
+                    base_dirty |= dirty;
+                    error = None;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End | KeyCode::Delete
+                    if field == WizardField::Base
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(nav) = line_nav_key(key.code) {
+                        apply_base_key(&mut base, &mut base_replace_on_type, nav);
                     }
-                    base.push(c);
-                    base_dirty = true;
                     error = None;
                 }
                 _ => {}
@@ -2279,7 +2471,9 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         source,
         field,
         name,
+        name_cursor,
         base,
+        base_cursor,
         root,
         error,
     } = *view;
@@ -2322,14 +2516,12 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         &p,
     );
     y += 1;
-    let name_cursor = if field == WizardField::Name {
-        "█"
-    } else {
-        ""
-    };
     frame.render_widget(
-        Paragraph::new(format!("{pad}{name}{name_cursor}"))
-            .style(Style::default().fg(p.text).bg(p.surface0)),
+        Paragraph::new(format!(
+            "{pad}{}",
+            render_line_with_cursor(name, name_cursor, field == WizardField::Name)
+        ))
+        .style(Style::default().fg(p.text).bg(p.surface0)),
         Rect::new(inner.x, y, inner.width, 1),
     );
     y += 1;
@@ -2344,14 +2536,12 @@ fn draw_workspace_wizard(frame: &mut Frame, view: &WizardView<'_>) {
         &p,
     );
     y += 1;
-    let base_cursor = if field == WizardField::Base {
-        "█"
-    } else {
-        ""
-    };
     frame.render_widget(
-        Paragraph::new(format!("{pad}{base}{base_cursor}"))
-            .style(Style::default().fg(p.text).bg(p.surface0)),
+        Paragraph::new(format!(
+            "{pad}{}",
+            render_line_with_cursor(base, base_cursor, field == WizardField::Base)
+        ))
+        .style(Style::default().fg(p.text).bg(p.surface0)),
         Rect::new(inner.x, y, inner.width, 1),
     );
     y += 1;
@@ -3725,6 +3915,7 @@ fn draw_review_dialog(
     mode: DialogMode,
     error: Option<&str>,
     commit_message: &str,
+    commit_cursor: usize,
 ) {
     let p = catppuccin();
     let area = frame.area();
@@ -3789,7 +3980,10 @@ fn draw_review_dialog(
     // Blocked/error/commit line, always directly above the buttons.
     let (status_text, status_style) = match mode {
         DialogMode::Commit => (
-            format!("c commit> {commit_message}█"),
+            format!(
+                "c commit> {}",
+                render_line_with_cursor(commit_message, commit_cursor, true)
+            ),
             Style::default().fg(p.text),
         ),
         DialogMode::Review => match error {
@@ -4123,7 +4317,7 @@ fn run_remove_dialog(jj: &ResolvedJj, target: &RemoveTarget, herdr: &str) -> Rev
 
     let mut mode = DialogMode::Review;
     let mut error: Option<String> = None;
-    let mut commit_message = String::new();
+    let mut commit_message = LineEdit::new(String::new());
 
     let outcome = loop {
         let view_height = terminal
@@ -4133,7 +4327,14 @@ fn run_remove_dialog(jj: &ResolvedJj, target: &RemoveTarget, herdr: &str) -> Rev
             })
             .unwrap_or(0);
         let _ = terminal.draw(|frame| {
-            draw_review_dialog(frame, &model, mode, error.as_deref(), &commit_message)
+            draw_review_dialog(
+                frame,
+                &model,
+                mode,
+                error.as_deref(),
+                &commit_message.text,
+                commit_message.cursor,
+            )
         });
         match event::read() {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match key.code {
@@ -4173,7 +4374,7 @@ fn run_remove_dialog(jj: &ResolvedJj, target: &RemoveTarget, herdr: &str) -> Rev
                     error = None;
                 }
                 KeyCode::Backspace if mode == DialogMode::Commit => {
-                    commit_message.pop();
+                    commit_message.backspace();
                     error = None;
                 }
                 KeyCode::Char(c)
@@ -4181,7 +4382,17 @@ fn run_remove_dialog(jj: &ResolvedJj, target: &RemoveTarget, herdr: &str) -> Rev
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                         && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
-                    commit_message.push(c);
+                    apply_line_key(&mut commit_message, EditKey::Char(c));
+                    error = None;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End | KeyCode::Delete
+                    if mode == DialogMode::Commit
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(nav) = line_nav_key(key.code) {
+                        apply_line_key(&mut commit_message, nav);
+                    }
                     error = None;
                 }
                 KeyCode::Enter => match mode {
@@ -4207,7 +4418,7 @@ fn run_remove_dialog(jj: &ResolvedJj, target: &RemoveTarget, herdr: &str) -> Rev
                         }
                     }
                     DialogMode::Commit => {
-                        if commit_message.trim().is_empty() {
+                        if commit_message.text.trim().is_empty() {
                             mode = DialogMode::Review;
                             error = Some("commit message must not be empty".to_string());
                             continue;
@@ -4217,7 +4428,7 @@ fn run_remove_dialog(jj: &ResolvedJj, target: &RemoveTarget, herdr: &str) -> Rev
                             error = Some("cannot commit: workspace path unknown".to_string());
                             continue;
                         };
-                        match jj_commit(jj, &dir, &commit_message) {
+                        match jj_commit(jj, &dir, &commit_message.text) {
                             Ok(()) => {
                                 data.clean = Some(workspace_change_lines(jj, &dir));
                                 model.replace_rows(build_review_rows(&data));
@@ -5651,20 +5862,152 @@ mod tests {
         assert!(log.last().unwrap().starts_with("rebase"), "{log:?}");
     }
 
+    // --- shared single-line cursor editing (wizard-field-cursor) ---------
+
+    /// A `LineEdit` with an explicit cursor for boundary cases.
+    fn line_edit(text: &str, cursor: usize) -> LineEdit {
+        LineEdit {
+            text: text.to_string(),
+            cursor,
+        }
+    }
+
+    #[test]
+    fn line_edit_inserts_at_start_middle_and_end() {
+        let mut start = line_edit("bc", 0);
+        apply_line_key(&mut start, EditKey::Char('a'));
+        assert_eq!((start.text.as_str(), start.cursor), ("abc", 1));
+
+        let mut middle = line_edit("workspace/fx", 11);
+        apply_line_key(&mut middle, EditKey::Char('i'));
+        assert_eq!((middle.text.as_str(), middle.cursor), ("workspace/fix", 12));
+
+        let mut end = LineEdit::new("ab".to_string());
+        apply_line_key(&mut end, EditKey::Char('c'));
+        assert_eq!((end.text.as_str(), end.cursor), ("abc", 3));
+    }
+
+    #[test]
+    fn line_edit_backspace_deletes_before_the_cursor() {
+        let mut empty = LineEdit::new(String::new());
+        apply_line_key(&mut empty, EditKey::Backspace);
+        assert_eq!((empty.text.as_str(), empty.cursor), ("", 0));
+
+        let mut start = line_edit("ab", 0);
+        apply_line_key(&mut start, EditKey::Backspace);
+        assert_eq!((start.text.as_str(), start.cursor), ("ab", 0));
+
+        let mut middle = line_edit("abc", 1);
+        apply_line_key(&mut middle, EditKey::Backspace);
+        assert_eq!((middle.text.as_str(), middle.cursor), ("bc", 0));
+
+        let mut end = LineEdit::new("abc".to_string());
+        apply_line_key(&mut end, EditKey::Backspace);
+        assert_eq!((end.text.as_str(), end.cursor), ("ab", 2));
+    }
+
+    #[test]
+    fn line_edit_delete_removes_at_the_cursor() {
+        let mut empty = LineEdit::new(String::new());
+        apply_line_key(&mut empty, EditKey::Delete);
+        assert_eq!((empty.text.as_str(), empty.cursor), ("", 0));
+
+        let mut end = LineEdit::new("ab".to_string());
+        apply_line_key(&mut end, EditKey::Delete);
+        assert_eq!((end.text.as_str(), end.cursor), ("ab", 2));
+
+        let mut middle = line_edit("abc", 1);
+        apply_line_key(&mut middle, EditKey::Delete);
+        assert_eq!((middle.text.as_str(), middle.cursor), ("ac", 1));
+    }
+
+    #[test]
+    fn line_edit_movement_clamps_at_the_boundaries() {
+        let mut edit = line_edit("ab", 1);
+        apply_line_key(&mut edit, EditKey::Left);
+        assert_eq!(edit.cursor, 0);
+        apply_line_key(&mut edit, EditKey::Left);
+        assert_eq!(edit.cursor, 0, "left at the start stays put");
+        apply_line_key(&mut edit, EditKey::End);
+        assert_eq!(edit.cursor, 2);
+        apply_line_key(&mut edit, EditKey::Right);
+        assert_eq!(edit.cursor, 2, "right at the end stays put");
+        apply_line_key(&mut edit, EditKey::Home);
+        assert_eq!(edit.cursor, 0);
+    }
+
+    #[test]
+    fn line_edit_multibyte_chars_never_split_utf8() {
+        // CJK: 3 chars, 9 bytes. Char-index insert/delete must stay on
+        // boundaries (byte-index editing would panic here).
+        let mut edit = line_edit("工作区", 1);
+        apply_line_key(&mut edit, EditKey::Char('x'));
+        assert_eq!((edit.text.as_str(), edit.cursor), ("工x作区", 2));
+        apply_line_key(&mut edit, EditKey::Backspace);
+        assert_eq!((edit.text.as_str(), edit.cursor), ("工作区", 1));
+        apply_line_key(&mut edit, EditKey::Delete);
+        assert_eq!((edit.text.as_str(), edit.cursor), ("工区", 1));
+        apply_line_key(&mut edit, EditKey::Home);
+        apply_line_key(&mut edit, EditKey::Delete);
+        assert_eq!((edit.text.as_str(), edit.cursor), ("区", 0));
+
+        // An astral-plane emoji is one `char` too.
+        let mut emoji = line_edit("a😀b", 1);
+        apply_line_key(&mut emoji, EditKey::Delete);
+        assert_eq!(emoji.text, "ab");
+    }
+
+    #[test]
+    fn cursor_render_inserts_the_block_at_the_cursor_boundary() {
+        assert_eq!(
+            render_line_with_cursor("workspace/fix", 12, true),
+            "workspace/fi█x"
+        );
+        assert_eq!(
+            render_line_with_cursor("workspace/fix", 0, true),
+            "█workspace/fix"
+        );
+        assert_eq!(
+            render_line_with_cursor("workspace/fix", 13, true),
+            "workspace/fix█"
+        );
+    }
+
+    #[test]
+    fn cursor_render_is_plain_when_unfocused() {
+        let rendered = render_line_with_cursor("workspace/fix", 12, false);
+        assert_eq!(rendered, "workspace/fix");
+        assert!(!rendered.contains('█'), "unfocused fields render no block");
+    }
+
     // --- name field component-level editing (workspace-wizard: name 字段组件级编辑)
 
     fn name_char(name: &str, state: NameEditState, c: char) -> (String, NameEditState) {
-        let mut n = name.to_string();
+        let mut n = LineEdit::new(name.to_string());
         let mut s = state;
-        apply_name_key(&mut n, &mut s, NameKey::Char(c));
-        (n, s)
+        apply_name_key(&mut n, &mut s, EditKey::Char(c));
+        (n.text, s)
     }
 
     fn name_backspace(name: &str, state: NameEditState) -> (String, NameEditState) {
-        let mut n = name.to_string();
+        let mut n = LineEdit::new(name.to_string());
         let mut s = state;
-        apply_name_key(&mut n, &mut s, NameKey::Backspace);
-        (n, s)
+        apply_name_key(&mut n, &mut s, EditKey::Backspace);
+        (n.text, s)
+    }
+
+    /// Applies one key to a name field with an explicit cursor; returns
+    /// `(text, cursor, state)`.
+    fn name_key(
+        name: &str,
+        cursor: usize,
+        state: NameEditState,
+        key: EditKey,
+    ) -> (String, usize, NameEditState) {
+        let mut n = line_edit(name, cursor);
+        let mut s = state;
+        apply_name_key(&mut n, &mut s, key);
+        (n.text, n.cursor, s)
     }
 
     #[test]
@@ -5732,6 +6075,191 @@ mod tests {
         let (n, s) = name_backspace("default", NameEditState::Fresh);
         assert_eq!(n, "");
         assert_eq!(s, NameEditState::Free);
+    }
+
+    #[test]
+    fn name_navigation_exits_fresh_without_touching_the_default_name() {
+        for key in [
+            EditKey::Left,
+            EditKey::Right,
+            EditKey::Home,
+            EditKey::End,
+            EditKey::Delete,
+        ] {
+            let (n, _, s) = name_key("workspace/brave-river-0000", 26, NameEditState::Fresh, key);
+            assert_eq!(n, "workspace/brave-river-0000", "{key:?} must not edit text");
+            assert_eq!(s, NameEditState::Free, "{key:?} exits the Fresh anchor");
+        }
+    }
+
+    #[test]
+    fn name_navigation_then_backspace_deletes_one_char_only() {
+        // The spec's safety case: leaving the Fresh anchor by navigation
+        // disarms the whole-slug delete for good.
+        let (n, c, s) =
+            name_key("workspace/brave-river-0000", 26, NameEditState::Fresh, EditKey::Left);
+        assert_eq!(
+            (n.as_str(), c, s),
+            ("workspace/brave-river-0000", 25, NameEditState::Free)
+        );
+        let (n, c, s) = name_key(&n, c, s, EditKey::Backspace);
+        assert_eq!(
+            (n.as_str(), c, s),
+            ("workspace/brave-river-000", 24, NameEditState::Free)
+        );
+    }
+
+    #[test]
+    fn name_navigation_exits_prefixed_without_touching_the_prefix() {
+        let (n, _, s) = name_key("workspace/", 10, NameEditState::Prefixed, EditKey::Delete);
+        assert_eq!(n, "workspace/");
+        assert_eq!(s, NameEditState::Free);
+    }
+
+    #[test]
+    fn name_free_mid_cursor_inserts_at_the_cursor() {
+        let (n, c, s) = name_key("workspace/fx", 11, NameEditState::Free, EditKey::Char('i'));
+        assert_eq!((n.as_str(), c, s), ("workspace/fix", 12, NameEditState::Free));
+    }
+
+    #[test]
+    fn name_free_delete_removes_the_char_at_the_cursor() {
+        // Cursor before 'x' (index 12): Delete drops that 'x'.
+        let (n, c, s) = name_key("workspace/fix", 12, NameEditState::Free, EditKey::Delete);
+        assert_eq!((n.as_str(), c, s), ("workspace/fi", 12, NameEditState::Free));
+    }
+
+    #[test]
+    fn name_free_home_then_insert_prepends() {
+        let (n, c, s) = name_key("workspace/fix", 13, NameEditState::Free, EditKey::Home);
+        assert_eq!((n.as_str(), c), ("workspace/fix", 0));
+        let (n, c, s) = name_key(&n, c, s, EditKey::Char('a'));
+        assert_eq!((n.as_str(), c, s), ("aworkspace/fix", 1, NameEditState::Free));
+    }
+
+    // --- base field cursor editing (workspace-wizard: base 字段光标编辑) ---
+
+    #[test]
+    fn base_first_keystroke_replaces_the_prefilled_value() {
+        let mut base = LineEdit::new("trunk()".to_string());
+        let mut replace = true;
+        let dirty = apply_base_key(&mut base, &mut replace, EditKey::Char('d'));
+        assert_eq!((base.text.as_str(), base.cursor), ("d", 1));
+        assert!(dirty, "typing dirties the base field");
+        assert!(!replace, "the replace anchor is consumed");
+    }
+
+    #[test]
+    fn base_navigation_cancels_replace_and_keeps_the_text() {
+        let mut base = LineEdit::new("trunk()".to_string());
+        let mut replace = true;
+        let dirty = apply_base_key(&mut base, &mut replace, EditKey::Left);
+        assert_eq!(base.text, "trunk()", "navigation must not edit the text");
+        assert_eq!(base.cursor, 6);
+        assert!(!dirty, "navigation must not dirty the base field");
+        assert!(!replace, "navigation cancels the replace anchor");
+
+        // The next keystroke inserts at the cursor instead of clearing.
+        let dirty = apply_base_key(&mut base, &mut replace, EditKey::Char('d'));
+        assert_eq!((base.text.as_str(), base.cursor), ("trunk(d)", 7));
+        assert!(dirty);
+    }
+
+    #[test]
+    fn base_navigation_then_backspace_deletes_one_char() {
+        // One Left parks the cursor before the final ')' — Backspace drops
+        // only '(' instead of clearing the whole prefilled value.
+        let mut base = LineEdit::new("trunk()".to_string());
+        let mut replace = true;
+        apply_base_key(&mut base, &mut replace, EditKey::Left);
+        apply_base_key(&mut base, &mut replace, EditKey::Backspace);
+        assert_eq!(base.text, "trunk)");
+        assert!(!replace);
+    }
+
+    #[test]
+    fn base_two_lefts_then_backspace_deletes_the_char_before_the_cursor() {
+        // Two Lefts park the cursor before 'k' (tasks.md's `trun()`
+        // illustration); the delete is exactly one char either way.
+        let mut base = LineEdit::new("trunk()".to_string());
+        let mut replace = true;
+        apply_base_key(&mut base, &mut replace, EditKey::Left);
+        apply_base_key(&mut base, &mut replace, EditKey::Left);
+        assert_eq!(base.cursor, 5);
+        apply_base_key(&mut base, &mut replace, EditKey::Backspace);
+        assert_eq!(base.text, "trun()");
+        assert!(!replace);
+    }
+
+    #[test]
+    fn base_home_then_delete_removes_the_first_char() {
+        let mut base = LineEdit::new("trunk()".to_string());
+        let mut replace = true;
+        apply_base_key(&mut base, &mut replace, EditKey::Home);
+        apply_base_key(&mut base, &mut replace, EditKey::Delete);
+        assert_eq!(base.text, "runk()");
+        assert!(!replace);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn base_navigation_only_still_resolves_via_the_chain() {
+        // Navigation cancels replace-on-type without dirtying the field, so
+        // submit re-evaluates the resolution chain.
+        let mut base = LineEdit::new("trunk()".to_string());
+        let mut replace = true;
+        assert!(!apply_base_key(&mut base, &mut replace, EditKey::Left));
+        assert!(!apply_base_key(&mut base, &mut replace, EditKey::Right));
+        assert_eq!(base.text, "trunk()");
+
+        let dir = TempDir::new();
+        let jj = make_fake_jj(dir.path(), "jj", "echo repo-value\n");
+        let config = Config::default();
+        assert_eq!(
+            wizard_final_base_rev(&config, &jj, dir.path(), &base.text, false)
+                .expect("untouched field resolves lazily"),
+            "repo-value"
+        );
+    }
+
+    // --- remove dialog commit message cursor editing (workspace-removal-dialog)
+
+    #[test]
+    fn commit_message_inserts_at_the_cursor() {
+        let mut message = line_edit("fx", 1);
+        apply_line_key(&mut message, EditKey::Char('i'));
+        assert_eq!((message.text.as_str(), message.cursor), ("fix", 2));
+    }
+
+    #[test]
+    fn commit_message_delete_removes_the_char_at_the_cursor() {
+        let mut message = line_edit("fixx", 3);
+        apply_line_key(&mut message, EditKey::Delete);
+        assert_eq!((message.text.as_str(), message.cursor), ("fix", 3));
+    }
+
+    #[test]
+    fn commit_message_home_then_insert_prepends() {
+        let mut message = LineEdit::new("fix bug".to_string());
+        apply_line_key(&mut message, EditKey::Home);
+        for c in "wip: ".chars() {
+            apply_line_key(&mut message, EditKey::Char(c));
+        }
+        assert_eq!(
+            (message.text.as_str(), message.cursor),
+            ("wip: fix bug", 5)
+        );
+    }
+
+    #[test]
+    fn commit_substate_clears_the_message_and_parks_the_cursor_at_the_start() {
+        // Entering the sub-state resets the line (the event loop calls
+        // `clear()`), so typing starts from the first character.
+        let mut message = LineEdit::new("stale".to_string());
+        message.clear();
+        assert_eq!((message.text.as_str(), message.cursor), ("", 0));
+        apply_line_key(&mut message, EditKey::Char('f'));
+        assert_eq!((message.text.as_str(), message.cursor), ("f", 1));
     }
 
     #[test]
@@ -7220,7 +7748,7 @@ pwd > "$D/cwd"
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw_review_dialog(frame, &fits, DialogMode::Review, None, ""))
+            .draw(|frame| draw_review_dialog(frame, &fits, DialogMode::Review, None, "", 0))
             .expect("draw review dialog");
         let buffer = terminal.backend().buffer();
         assert!(
@@ -7237,7 +7765,7 @@ pwd > "$D/cwd"
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw_review_dialog(frame, &many, DialogMode::Review, None, ""))
+            .draw(|frame| draw_review_dialog(frame, &many, DialogMode::Review, None, "", 0))
             .expect("draw review dialog");
         let buffer = terminal.backend().buffer();
         assert!(
@@ -7453,7 +7981,7 @@ pwd > "$D/cwd"
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, ""))
+            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, "", 0))
             .expect("draw review dialog");
         let buffer = terminal.backend().buffer();
         for needle in [
@@ -7483,7 +8011,7 @@ pwd > "$D/cwd"
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, ""))
+            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, "", 0))
             .expect("draw review dialog");
         let buffer = terminal.backend().buffer();
 
@@ -7683,7 +8211,7 @@ pwd > "$D/cwd"
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, ""))
+            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, "", 0))
             .expect("draw review dialog");
         let buffer = terminal.backend().buffer();
         assert!(
@@ -7809,7 +8337,9 @@ pwd > "$D/cwd"
             source,
             field,
             name,
+            name_cursor: name.chars().count(),
             base,
+            base_cursor: base.chars().count(),
             root: Path::new("/tmp/wizard-root"),
             error,
         }
@@ -8010,6 +8540,76 @@ pwd > "$D/cwd"
                 "read-only title {text:?} must stay subtext0"
             );
         }
+    }
+
+    /// Renders the wizard with explicit field cursors for block-placement
+    /// assertions on the focused field.
+    fn render_wizard_with_cursors(
+        field: WizardField,
+        name: &str,
+        name_cursor: usize,
+        base: &str,
+        base_cursor: usize,
+    ) -> ratatui::buffer::Buffer {
+        render_wizard(WizardView {
+            source: "/tmp/alpha",
+            field,
+            name,
+            name_cursor,
+            base,
+            base_cursor,
+            root: Path::new("/tmp/wizard-root"),
+            error: None,
+        })
+    }
+
+    #[test]
+    fn wizard_renders_name_cursor_block_at_the_cursor_position() {
+        let buffer =
+            render_wizard_with_cursors(WizardField::Name, "workspace/fix", 12, "trunk()", 7);
+        let name_y = lines_containing(&buffer, "New Workspace Name")[0] + 1;
+        assert!(
+            line_text(&buffer, name_y).contains("   workspace/fi█x"),
+            "name cursor block: {:?}",
+            line_text(&buffer, name_y)
+        );
+        // The unfocused base field renders plain, without a block.
+        let base_y = lines_containing(&buffer, "Base · jj revset")[0] + 1;
+        assert!(!line_text(&buffer, base_y).contains('█'));
+    }
+
+    #[test]
+    fn wizard_renders_base_cursor_block_at_the_cursor_position() {
+        let buffer =
+            render_wizard_with_cursors(WizardField::Base, "workspace/fix", 13, "trunk()", 5);
+        let base_y = lines_containing(&buffer, "Base · jj revset")[0] + 1;
+        assert!(
+            line_text(&buffer, base_y).contains("   trunk█()"),
+            "base cursor block: {:?}",
+            line_text(&buffer, base_y)
+        );
+        // The unfocused name field renders plain, without a block.
+        let name_y = lines_containing(&buffer, "New Workspace Name")[0] + 1;
+        assert!(!line_text(&buffer, name_y).contains('█'));
+    }
+
+    #[test]
+    fn review_dialog_renders_commit_cursor_at_the_cursor_position() {
+        let model = ReviewModel::new(sample_review_rows());
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Commit, None, "fix", 2))
+            .expect("draw review dialog");
+        let buffer = terminal.backend().buffer();
+        let y = *lines_containing(buffer, "c commit>")
+            .first()
+            .expect("commit status line");
+        assert!(
+            line_text(buffer, y).contains("c commit> fi█x"),
+            "commit cursor block: {:?}",
+            line_text(buffer, y)
+        );
     }
 
     /// Palette probes for render assertions (mirrors `catppuccin`).
