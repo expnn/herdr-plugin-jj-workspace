@@ -1657,7 +1657,7 @@ fn run_remove_pipeline(jj: &ResolvedJj, herdr: &str, plan: &RemovePlan) -> bool 
             state.running(StatusTask::Delete);
             let _ = view.update(&state);
             match fs::remove_dir_all(dir) {
-                Ok(()) => state.done(StatusTask::Delete, dir.display().to_string()),
+                Ok(()) => state.done(StatusTask::Delete, delete_done_message(dir, plan.forced)),
                 Err(err) => {
                     return fail_pipeline(
                         &mut view,
@@ -1757,6 +1757,18 @@ fn close_summary(closed: usize, failed: usize) -> String {
         format!("{closed} pane(s) closed")
     } else {
         format!("{closed} closed, {failed} failed (warning)")
+    }
+}
+
+/// Delete-stage Done message; a forced removal records how many uncommitted
+/// changes were abandoned alongside the deleted path.
+fn delete_done_message(dir: &Path, forced: Option<usize>) -> String {
+    match forced {
+        Some(abandoned) => format!(
+            "{} (forced: abandoned {abandoned} uncommitted change(s))",
+            dir.display()
+        ),
+        None => dir.display().to_string(),
     }
 }
 
@@ -2731,6 +2743,7 @@ const REMOVE_MODAL_WIDTH: u16 = 96;
 const PICKER_HINT: &str = "↑↓ move · ↵ select · esc cancel";
 const REVIEW_HINT: &str = "↑↓ move · space toggle · a all/none · c commit… · ↵ remove · esc cancel";
 const COMMIT_HINT: &str = "type message · ↵ commit · esc back";
+const FORCE_CONFIRM_HINT: &str = "↵ confirm force remove · esc back";
 const STATUS_WORKING_HINT: &str = "removing workspace…";
 const STATUS_FAILED_HINT: &str = "↵ close · esc close";
 
@@ -2739,6 +2752,8 @@ const STATUS_FAILED_HINT: &str = "↵ close · esc close";
 const PANE_WARNING_ID: &str = "pane-warning";
 const SESSION_COUNT_ID: &str = "session-count";
 const PANE_COUNT_ID: &str = "pane-count";
+/// The single selectable `force remove` toggle row (dirty-workcopy bypass).
+const FORCE_ROW_ID: &str = "force-remove";
 
 /// What a flat review row represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2751,6 +2766,9 @@ enum RowKind {
     Note,
     Check,
     Warning,
+    /// The single selectable `force remove` toggle (bypasses a successfully
+    /// detected dirty work copy; never offered for a failed check).
+    Force,
 }
 
 /// Semantic color of a row, mapped to the palette at render time.
@@ -2873,6 +2891,18 @@ impl ReviewRow {
             id: Some(PANE_WARNING_ID.to_string()),
         }
     }
+
+    /// The dirty-workcopy bypass toggle; only produced when the clean check
+    /// succeeded and reported changes (see [`build_review_rows`]).
+    fn force(abandoned: usize) -> ReviewRow {
+        ReviewRow {
+            kind: RowKind::Force,
+            depth: 1,
+            text: format!("force remove (abandon {abandoned} uncommitted change(s))"),
+            tone: RowTone::Warning,
+            id: Some(FORCE_ROW_ID.to_string()),
+        }
+    }
 }
 
 /// Which Plan tasks a review target can perform. A picker entry whose `root`
@@ -2910,6 +2940,9 @@ struct RemovePlan {
     workspace_name: Option<String>,
     session_ids: Vec<String>,
     pane_ids: Vec<String>,
+    /// `Some(n)` when the user authorized a force removal of `n` uncommitted
+    /// changes (the clean gate was bypassed); `None` for a clean removal.
+    forced: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3214,6 +3247,8 @@ fn build_review_rows(data: &ReviewData) -> Vec<ReviewRow> {
                 2,
                 RowTone::Dim,
             ));
+            // The dirty-workcopy bypass toggle, only for a detected dirty copy.
+            rows.push(ReviewRow::force(changes.len()));
         }
         Some(Err(message)) => {
             rows.push(ReviewRow::check(
@@ -3272,18 +3307,35 @@ fn build_review_rows(data: &ReviewData) -> Vec<ReviewRow> {
     rows
 }
 
+/// The uncommitted-change count of a successfully detected dirty copy;
+/// `None` for a clean copy, an unknown path, or a failed check.
+fn dirty_change_count(data: &ReviewData) -> Option<usize> {
+    match &data.clean {
+        Some(Ok(changes)) if !changes.is_empty() => Some(changes.len()),
+        _ => None,
+    }
+}
+
 /// Why `↵` must not authorize yet: `Some(summary)` when any check is ✗.
 /// Path-unknown targets skip the clean check, so nothing blocks them there.
-fn review_blocking_reason(data: &ReviewData) -> Option<String> {
+/// `force` only bypasses a *successfully detected* dirty work copy — a failed
+/// check stays fail-closed, and other refusals are unaffected.
+fn review_blocking_reason(data: &ReviewData, force: bool) -> Option<String> {
     match &data.clean {
         Some(Err(message)) => {
             let first = message.lines().next().unwrap_or(message);
             Some(format!("blocked: {first}"))
         }
-        Some(Ok(changes)) if !changes.is_empty() => Some(format!(
-            "blocked: {} uncommitted change(s) — press c to commit, or run jj restore outside the dialog",
-            changes.len()
-        )),
+        Some(Ok(changes)) if !changes.is_empty() => {
+            if force {
+                None
+            } else {
+                Some(format!(
+                    "blocked: {} uncommitted change(s) — press c to commit, or run jj restore outside the dialog",
+                    changes.len()
+                ))
+            }
+        }
         _ => match &data.sessions {
             SessionPreview::Refused(reason) => {
                 let first = reason.lines().next().unwrap_or(reason);
@@ -3293,6 +3345,27 @@ fn review_blocking_reason(data: &ReviewData) -> Option<String> {
             }
             _ => None,
         },
+    }
+}
+
+/// What the review `↵` does after the fresh recheck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewSubmit {
+    /// Blocked: show this reason and stay in review.
+    Blocked(String),
+    /// Force is armed and the copy is still dirty: show the warning page.
+    ConfirmForce,
+    /// Authorize the removal.
+    Authorize,
+}
+
+/// Pure verdict for review `↵`: recheck has already refreshed `data`, `force`
+/// is the value captured before that refresh cleared it.
+fn review_submit_outcome(data: &ReviewData, force: bool) -> ReviewSubmit {
+    match review_blocking_reason(data, force) {
+        Some(reason) => ReviewSubmit::Blocked(reason),
+        None if force && dirty_change_count(data).is_some() => ReviewSubmit::ConfirmForce,
+        None => ReviewSubmit::Authorize,
     }
 }
 
@@ -3316,6 +3389,8 @@ struct ReviewModel {
     scroll: usize,
     selected_sessions: HashSet<String>,
     selected_panes: HashSet<String>,
+    /// The `force remove` toggle (transient: any row refresh clears it).
+    force: bool,
 }
 
 impl ReviewModel {
@@ -3327,6 +3402,7 @@ impl ReviewModel {
             scroll: 0,
             selected_sessions: HashSet::new(),
             selected_panes: HashSet::new(),
+            force: false,
         };
         model.select_all(true);
         model.cursor = model.first_toggleable().unwrap_or(0);
@@ -3337,6 +3413,7 @@ impl ReviewModel {
         match kind {
             RowKind::Session => self.selected_sessions.contains(id),
             RowKind::Pane => self.selected_panes.contains(id),
+            RowKind::Force => self.force,
             _ => false,
         }
     }
@@ -3345,6 +3422,10 @@ impl ReviewModel {
         let set = match kind {
             RowKind::Session => &mut self.selected_sessions,
             RowKind::Pane => &mut self.selected_panes,
+            RowKind::Force => {
+                self.force = selected;
+                return;
+            }
             _ => return,
         };
         if selected {
@@ -3387,7 +3468,7 @@ impl ReviewModel {
     fn is_toggleable(&self, index: usize) -> bool {
         match self.rows.get(index) {
             Some(row) => match row.kind {
-                RowKind::Session | RowKind::Pane => row.id.is_some(),
+                RowKind::Session | RowKind::Pane | RowKind::Force => row.id.is_some(),
                 RowKind::Group => self.has_descendants(index),
                 _ => false,
             },
@@ -3425,7 +3506,7 @@ impl ReviewModel {
             return;
         };
         match kind {
-            RowKind::Session | RowKind::Pane => {
+            RowKind::Session | RowKind::Pane | RowKind::Force => {
                 if let Some(id) = id {
                     let selected = !self.is_selected(kind, &id);
                     self.set_selected(kind, &id, selected);
@@ -3601,9 +3682,12 @@ impl ReviewModel {
     }
 
     /// Rebuild rows (e.g. after a commit refreshed the checks) keeping the
-    /// current selection; the cursor is clamped to a toggleable row.
+    /// current selection; the cursor is clamped to a toggleable row. The
+    /// `force` toggle is transient authorization: any refresh clears it so the
+    /// user must re-arm it deliberately.
     fn replace_rows(&mut self, rows: Vec<ReviewRow>) {
         self.rows = rows;
+        self.force = false;
         if self.cursor >= self.rows.len() {
             self.cursor = self.rows.len().saturating_sub(1);
         }
@@ -3620,6 +3704,7 @@ impl ReviewModel {
         dir: Option<PathBuf>,
         main_repo: PathBuf,
         workspace_name: Option<String>,
+        forced: Option<usize>,
     ) -> RemovePlan {
         let path_known = dir.is_some();
         RemovePlan {
@@ -3636,6 +3721,7 @@ impl ReviewModel {
             } else {
                 Vec::new()
             },
+            forced,
         }
     }
 }
@@ -3756,11 +3842,13 @@ impl StatusState {
     }
 }
 
-/// Review modes (the commit sub-mode swaps the hint and the status line).
+/// Review modes (the commit sub-mode swaps the hint and the status line; the
+/// force-confirm page shows the abandon warning and requires a second `↵`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DialogMode {
     Review,
     Commit,
+    ForceConfirm,
 }
 
 /// Adaptive modal height: content-sized, clamped to
@@ -3868,7 +3956,7 @@ fn draw_review_row(
     };
     let depth = "  ".repeat(usize::from(row.depth));
     let marker = match row.kind {
-        RowKind::Session | RowKind::Pane => {
+        RowKind::Session | RowKind::Pane | RowKind::Force => {
             let id = row.id.as_deref().unwrap_or_default();
             if model.is_selected(row.kind, id) {
                 "[x] "
@@ -3909,9 +3997,51 @@ fn draw_review_row(
     );
 }
 
+/// The force-confirm warning body: the target, the changes about to be
+/// abandoned (same 3-line cap as the Checks row) and the consequences.
+fn force_confirm_lines(data: &ReviewData) -> Vec<(String, RowTone)> {
+    let mut lines = vec![
+        (
+            format!("Force remove: {}", data.target_label),
+            RowTone::Error,
+        ),
+        (String::new(), RowTone::Normal),
+    ];
+    match &data.clean {
+        Some(Ok(changes)) if !changes.is_empty() => {
+            lines.push((
+                format!("This abandons {} uncommitted change(s):", changes.len()),
+                RowTone::Warning,
+            ));
+            for line in changes.iter().take(3) {
+                lines.push((format!("  {line}"), RowTone::Dim));
+            }
+            if changes.len() > 3 {
+                lines.push((format!("  … {} more", changes.len() - 3), RowTone::Dim));
+            }
+        }
+        _ => lines.push(("No uncommitted changes detected.".to_string(), RowTone::Dim)),
+    }
+    lines.push((String::new(), RowTone::Normal));
+    lines.push((
+        "The changes will NOT reach the main repo.".to_string(),
+        RowTone::Dim,
+    ));
+    lines.push((
+        "The dirty @ stays in the shared store as an anonymous commit.".to_string(),
+        RowTone::Dim,
+    ));
+    lines.push((
+        "The working directory will be deleted.".to_string(),
+        RowTone::Warning,
+    ));
+    lines
+}
+
 fn draw_review_dialog(
     frame: &mut Frame,
     model: &ReviewModel,
+    data: &ReviewData,
     mode: DialogMode,
     error: Option<&str>,
     commit_message: &str,
@@ -3931,6 +4061,7 @@ fn draw_review_dialog(
     let hint = match mode {
         DialogMode::Review => REVIEW_HINT,
         DialogMode::Commit => COMMIT_HINT,
+        DialogMode::ForceConfirm => FORCE_CONFIRM_HINT,
     };
     let mut y = inner.y;
     render_modal_header(
@@ -3949,33 +4080,54 @@ fn draw_review_dialog(
     let buttons_y = inner.y + inner.height.saturating_sub(1);
     let status_y = buttons_y.saturating_sub(1);
     let content_height = status_y.saturating_sub(y) as usize;
-    let offset = model.scroll_offset(content_height);
-    for (row_index, row) in model
-        .rows
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(content_height)
-    {
-        let rect = Rect::new(inner.x, y + (row_index - offset) as u16, inner.width, 1);
-        draw_review_row(frame, rect, model, row_index, row, &p);
-    }
+    if mode == DialogMode::ForceConfirm {
+        for (index, (text, tone)) in force_confirm_lines(data)
+            .into_iter()
+            .take(content_height)
+            .enumerate()
+        {
+            let style = match tone {
+                RowTone::Normal => Style::default().fg(p.text),
+                RowTone::Dim => Style::default().fg(p.overlay0),
+                RowTone::Accent => Style::default().fg(p.accent),
+                RowTone::Error => Style::default().fg(p.red),
+                RowTone::Ok => Style::default().fg(p.green),
+                RowTone::Warning => Style::default().fg(p.yellow),
+            };
+            frame.render_widget(
+                Paragraph::new(text).style(style),
+                Rect::new(inner.x, y + index as u16, inner.width, 1),
+            );
+        }
+    } else {
+        let offset = model.scroll_offset(content_height);
+        for (row_index, row) in model
+            .rows
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(content_height)
+        {
+            let rect = Rect::new(inner.x, y + (row_index - offset) as u16, inner.width, 1);
+            draw_review_row(frame, rect, model, row_index, row, &p);
+        }
 
-    // Vertical scrollbar on the right edge inside the border, only while the
-    // rows overflow the viewport.
-    render_list_scrollbar(
-        frame,
-        Rect::new(
-            inner.x + inner.width.saturating_sub(1),
-            y,
-            1,
-            content_height as u16,
-        ),
-        model.rows.len(),
-        content_height,
-        offset,
-        &p,
-    );
+        // Vertical scrollbar on the right edge inside the border, only while
+        // the rows overflow the viewport.
+        render_list_scrollbar(
+            frame,
+            Rect::new(
+                inner.x + inner.width.saturating_sub(1),
+                y,
+                1,
+                content_height as u16,
+            ),
+            model.rows.len(),
+            content_height,
+            offset,
+            &p,
+        );
+    }
 
     // Blocked/error/commit line, always directly above the buttons.
     let (status_text, status_style) = match mode {
@@ -3986,7 +4138,7 @@ fn draw_review_dialog(
             ),
             Style::default().fg(p.text),
         ),
-        DialogMode::Review => match error {
+        DialogMode::Review | DialogMode::ForceConfirm => match error {
             Some(message) => (message.to_string(), Style::default().fg(p.red)),
             None => (String::new(), Style::default().fg(p.overlay0)),
         },
@@ -4330,6 +4482,7 @@ fn run_remove_dialog(jj: &ResolvedJj, target: &RemoveTarget, herdr: &str) -> Rev
             draw_review_dialog(
                 frame,
                 &model,
+                &data,
                 mode,
                 error.as_deref(),
                 &commit_message.text,
@@ -4342,6 +4495,9 @@ fn run_remove_dialog(jj: &ResolvedJj, target: &RemoveTarget, herdr: &str) -> Rev
                     if mode == DialogMode::Commit {
                         mode = DialogMode::Review;
                         commit_message.clear();
+                        error = None;
+                    } else if mode == DialogMode::ForceConfirm {
+                        mode = DialogMode::Review;
                         error = None;
                     } else {
                         break ReviewOutcome::Cancelled;
@@ -4399,23 +4555,40 @@ fn run_remove_dialog(jj: &ResolvedJj, target: &RemoveTarget, herdr: &str) -> Rev
                     DialogMode::Review => {
                         // Task 5.1: recheck the work copy immediately before
                         // authorizing (TOCTOU convergence). A fresh failure or
-                        // new dirt refreshes the checks, returns to review and
-                        // executes nothing.
+                        // new dirt refreshes the checks. The force toggle is
+                        // captured *before* the refresh clears it: it arms this
+                        // attempt only.
+                        let force = model.force;
                         if let Some(dir) = data.dir.clone() {
                             data.clean = Some(workspace_change_lines(jj, &dir));
                             model.replace_rows(build_review_rows(&data));
                             model.follow_cursor(view_height);
                         }
-                        match review_blocking_reason(&data) {
-                            Some(reason) => error = Some(reason),
-                            None => {
+                        match review_submit_outcome(&data, force) {
+                            ReviewSubmit::Blocked(reason) => error = Some(reason),
+                            // A successfully detected dirty copy with force
+                            // armed goes through the warning page.
+                            ReviewSubmit::ConfirmForce => {
+                                mode = DialogMode::ForceConfirm;
+                                error = None;
+                            }
+                            ReviewSubmit::Authorize => {
                                 break ReviewOutcome::Authorized(model.to_plan(
                                     data.dir.clone(),
                                     data.main_repo.clone(),
                                     data.workspace_name.clone(),
+                                    None,
                                 ))
                             }
                         }
+                    }
+                    DialogMode::ForceConfirm => {
+                        break ReviewOutcome::Authorized(model.to_plan(
+                            data.dir.clone(),
+                            data.main_repo.clone(),
+                            data.workspace_name.clone(),
+                            dirty_change_count(&data),
+                        ))
                     }
                     DialogMode::Commit => {
                         if commit_message.text.trim().is_empty() {
@@ -6745,7 +6918,7 @@ esac
         assert!(rendered.contains("jj commit"), "{rendered}");
         assert!(rendered.contains("jj restore"), "{rendered}");
         assert!(rendered.contains("bookmarks stay"), "{rendered}");
-        let blocked = review_blocking_reason(&data).expect("dirty blocks authorization");
+        let blocked = review_blocking_reason(&data, false).expect("dirty blocks authorization");
         assert!(blocked.contains("uncommitted change(s)"), "{blocked}");
     }
 
@@ -6780,6 +6953,7 @@ esac
             workspace_name: name.map(str::to_string),
             session_ids: Vec::new(),
             pane_ids: Vec::new(),
+            forced: None,
         }
     }
 
@@ -6838,6 +7012,16 @@ printf 'other\t%s\nfound\t%s\n' "$D/unrelated" "$D/workspace/checkout"
         assert_eq!(close_summary(3, 0), "3 pane(s) closed");
         assert_eq!(close_summary(3, 1), "3 closed, 1 failed (warning)");
         assert_eq!(close_summary(0, 2), "0 closed, 2 failed (warning)");
+    }
+
+    #[test]
+    fn delete_done_message_records_forced_abandonment() {
+        let dir = Path::new("/ws");
+        assert_eq!(delete_done_message(dir, None), "/ws");
+        assert_eq!(
+            delete_done_message(dir, Some(2)),
+            "/ws (forced: abandoned 2 uncommitted change(s))"
+        );
     }
 
     // --- remove dialog data sources -------------------------------------
@@ -7745,10 +7929,13 @@ pwd > "$D/cwd"
     fn review_rows_render_scrollbar_only_when_content_overflows() {
         // Fits: 13 rows in a 40-line terminal → no scrollbar arrows.
         let fits = ReviewModel::new(sample_review_rows());
+        let fits_data = known_review_data(PathBuf::from("/ws"));
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw_review_dialog(frame, &fits, DialogMode::Review, None, "", 0))
+            .draw(|frame| {
+                draw_review_dialog(frame, &fits, &fits_data, DialogMode::Review, None, "", 0)
+            })
             .expect("draw review dialog");
         let buffer = terminal.backend().buffer();
         assert!(
@@ -7765,7 +7952,9 @@ pwd > "$D/cwd"
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw_review_dialog(frame, &many, DialogMode::Review, None, "", 0))
+            .draw(|frame| {
+                draw_review_dialog(frame, &many, &fits_data, DialogMode::Review, None, "", 0)
+            })
             .expect("draw review dialog");
         let buffer = terminal.backend().buffer();
         assert!(
@@ -7822,40 +8011,220 @@ pwd > "$D/cwd"
     #[test]
     fn review_plan_omits_path_scoped_selections_for_unknown_paths() {
         let model = ReviewModel::new(sample_review_rows());
-        let stale = model.to_plan(None, PathBuf::from("/main"), Some("ws-old".into()));
+        let stale = model.to_plan(None, PathBuf::from("/main"), Some("ws-old".into()), None);
         assert_eq!(stale.dir, None);
         assert!(stale.session_ids.is_empty());
         assert!(stale.pane_ids.is_empty());
 
-        let known = model.to_plan(Some(PathBuf::from("/ws")), PathBuf::from("/main"), None);
+        let known = model.to_plan(
+            Some(PathBuf::from("/ws")),
+            PathBuf::from("/main"),
+            None,
+            None,
+        );
         assert_eq!(known.workspace_name, None);
         assert_eq!(known.session_ids, vec!["s1", "s2"]);
         assert_eq!(known.pane_ids, vec!["p1", "p2", "p3"]);
     }
 
     #[test]
+    fn review_plan_carries_the_forced_change_count() {
+        let model = ReviewModel::new(sample_review_rows());
+        let clean = model.to_plan(
+            Some(PathBuf::from("/ws")),
+            PathBuf::from("/main"),
+            None,
+            None,
+        );
+        assert_eq!(clean.forced, None);
+
+        let forced = model.to_plan(
+            Some(PathBuf::from("/ws")),
+            PathBuf::from("/main"),
+            None,
+            Some(3),
+        );
+        assert_eq!(forced.forced, Some(3));
+    }
+
+    #[test]
     fn review_blocking_reason_reports_dirty_and_refused_checks() {
         let mut data = known_review_data(PathBuf::from("/ws"));
-        assert!(review_blocking_reason(&data).is_none());
+        assert!(review_blocking_reason(&data, false).is_none());
 
         data.clean = Some(Ok(vec!["M a.txt".to_string()]));
-        assert!(review_blocking_reason(&data)
+        assert!(review_blocking_reason(&data, false)
             .expect("dirty blocks")
             .contains("uncommitted change(s)"));
 
         data.clean = Some(Err(
             "cannot check workspace 'ws' (refusing to remove): boom".to_string(),
         ));
-        let reason = review_blocking_reason(&data).expect("check failure blocks");
+        let reason = review_blocking_reason(&data, false).expect("check failure blocks");
         assert!(reason.starts_with("blocked: cannot check"), "{reason}");
 
         data.clean = Some(Ok(Vec::new()));
         data.sessions = SessionPreview::Refused("schema mismatch".to_string());
-        let reason = review_blocking_reason(&data).expect("refused preview blocks");
+        let reason = review_blocking_reason(&data, false).expect("refused preview blocks");
         assert!(reason.contains("schema mismatch"), "{reason}");
 
         // A stale target skips the clean check and has no sessions to block.
-        assert!(review_blocking_reason(&stale_review_data()).is_none());
+        assert!(review_blocking_reason(&stale_review_data(), false).is_none());
+    }
+
+    #[test]
+    fn review_blocking_reason_force_only_bypasses_a_detected_dirty_copy() {
+        // Dirty + force: the one bypass.
+        let mut data = known_review_data(PathBuf::from("/ws"));
+        data.clean = Some(Ok(vec!["M a.txt".to_string()]));
+        assert!(review_blocking_reason(&data, true).is_none());
+
+        // A failed check stays fail-closed even with force armed.
+        data.clean = Some(Err(
+            "cannot check workspace 'ws' (refusing to remove): boom".to_string(),
+        ));
+        assert!(
+            review_blocking_reason(&data, true).is_some(),
+            "a failed check must never be forceable"
+        );
+
+        // Refused opencode sessions are unaffected by force.
+        data.clean = Some(Ok(Vec::new()));
+        data.sessions = SessionPreview::Refused("schema mismatch".to_string());
+        assert!(review_blocking_reason(&data, true).is_some());
+    }
+
+    #[test]
+    fn review_submit_outcome_blocks_confirms_or_authorizes() {
+        // Dirty without force: blocked in review.
+        let mut data = known_review_data(PathBuf::from("/ws"));
+        data.clean = Some(Ok(vec!["M a.txt".to_string()]));
+        assert!(matches!(
+            review_submit_outcome(&data, false),
+            ReviewSubmit::Blocked(_)
+        ));
+
+        // Dirty with force: the warning page, not a direct removal.
+        assert_eq!(
+            review_submit_outcome(&data, true),
+            ReviewSubmit::ConfirmForce
+        );
+
+        // Clean: authorize; force is moot.
+        data.clean = Some(Ok(Vec::new()));
+        assert_eq!(review_submit_outcome(&data, false), ReviewSubmit::Authorize);
+        assert_eq!(review_submit_outcome(&data, true), ReviewSubmit::Authorize);
+
+        // Failed check with force: still blocked (fail-closed).
+        data.clean = Some(Err("boom".to_string()));
+        assert!(matches!(
+            review_submit_outcome(&data, true),
+            ReviewSubmit::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn review_rows_expose_the_force_toggle_only_for_a_detected_dirty_copy() {
+        let has_force = |data: &ReviewData| {
+            build_review_rows(data)
+                .iter()
+                .any(|row| row.id.as_deref() == Some(FORCE_ROW_ID))
+        };
+
+        let mut data = known_review_data(PathBuf::from("/ws"));
+        assert!(!has_force(&data), "clean copy has no force row");
+
+        data.clean = Some(Ok(vec!["M a.txt".to_string(), "A b.txt".to_string()]));
+        let rows = build_review_rows(&data);
+        let force = rows
+            .iter()
+            .find(|row| row.id.as_deref() == Some(FORCE_ROW_ID))
+            .expect("dirty copy exposes the force row");
+        assert!(
+            force.text.contains("abandon 2 uncommitted change(s)"),
+            "{:?}",
+            force.text
+        );
+
+        data.clean = Some(Ok(Vec::new()));
+        assert!(!has_force(&data), "clean has no force row");
+
+        data.clean = Some(Err("boom".to_string()));
+        assert!(!has_force(&data), "failed check has no force row");
+
+        data.clean = None;
+        assert!(!has_force(&data), "unknown path has no force row");
+    }
+
+    #[test]
+    fn review_model_force_toggles_and_resets_on_refresh() {
+        let mut data = known_review_data(PathBuf::from("/ws"));
+        data.clean = Some(Ok(vec!["M a.txt".to_string()]));
+        let mut model = ReviewModel::new(build_review_rows(&data));
+        let index = model
+            .rows
+            .iter()
+            .position(|row| row.id.as_deref() == Some(FORCE_ROW_ID))
+            .expect("force row");
+        model.cursor = index;
+        assert!(!model.force);
+        assert!(!model.is_selected(RowKind::Force, FORCE_ROW_ID));
+
+        model.toggle_current();
+        assert!(model.force);
+        assert!(model.is_selected(RowKind::Force, FORCE_ROW_ID));
+
+        // Any row refresh clears the transient authorization.
+        model.replace_rows(build_review_rows(&data));
+        assert!(!model.force, "refresh must reset the force toggle");
+    }
+
+    #[test]
+    fn force_confirm_lines_show_the_abandoned_changes() {
+        let mut data = known_review_data(PathBuf::from("/ws"));
+        data.clean = Some(Ok(vec![
+            "M a.txt".to_string(),
+            "A b.txt".to_string(),
+            "D c.txt".to_string(),
+            "M d.txt".to_string(),
+        ]));
+        let text: String = force_confirm_lines(&data)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Force remove: /ws"), "{text}");
+        assert!(text.contains("abandons 4 uncommitted change(s)"), "{text}");
+        assert!(text.contains("M a.txt"), "{text}");
+        assert!(text.contains("… 1 more"), "{text}");
+        assert!(text.contains("NOT reach the main repo"), "{text}");
+        assert!(text.contains("anonymous commit"), "{text}");
+    }
+
+    #[test]
+    fn force_confirm_page_renders_warning_and_hint() {
+        let mut data = known_review_data(PathBuf::from("/ws"));
+        data.clean = Some(Ok(vec!["M a.txt".to_string()]));
+        let model = ReviewModel::new(build_review_rows(&data));
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_review_dialog(frame, &model, &data, DialogMode::ForceConfirm, None, "", 0)
+            })
+            .expect("draw force confirm");
+        let buffer = terminal.backend().buffer();
+        for needle in [
+            "confirm force remove",
+            "Force remove: /ws",
+            "abandons 1 uncommitted change(s)",
+            "NOT reach the main repo",
+        ] {
+            assert!(
+                !lines_containing(buffer, needle).is_empty(),
+                "force-confirm page must render {needle:?}"
+            );
+        }
     }
 
     #[test]
@@ -7981,7 +8350,7 @@ pwd > "$D/cwd"
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, "", 0))
+            .draw(|frame| draw_review_dialog(frame, &model, &data, DialogMode::Review, None, "", 0))
             .expect("draw review dialog");
         let buffer = terminal.backend().buffer();
         for needle in [
@@ -8008,10 +8377,11 @@ pwd > "$D/cwd"
     #[test]
     fn review_rows_render_flush_sections_and_plain_task_rows() {
         let model = ReviewModel::new(sample_review_rows());
+        let data = known_review_data(PathBuf::from("/ws"));
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, "", 0))
+            .draw(|frame| draw_review_dialog(frame, &model, &data, DialogMode::Review, None, "", 0))
             .expect("draw review dialog");
         let buffer = terminal.backend().buffer();
 
@@ -8208,10 +8578,11 @@ pwd > "$D/cwd"
         assert_eq!(model.pane_count_text().as_deref(), Some("2 of 3 selected"));
 
         // The rendered dialog shows both live counts.
+        let data = known_review_data(PathBuf::from("/ws"));
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Review, None, "", 0))
+            .draw(|frame| draw_review_dialog(frame, &model, &data, DialogMode::Review, None, "", 0))
             .expect("draw review dialog");
         let buffer = terminal.backend().buffer();
         assert!(
@@ -8596,10 +8967,13 @@ pwd > "$D/cwd"
     #[test]
     fn review_dialog_renders_commit_cursor_at_the_cursor_position() {
         let model = ReviewModel::new(sample_review_rows());
+        let data = known_review_data(PathBuf::from("/ws"));
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw_review_dialog(frame, &model, DialogMode::Commit, None, "fix", 2))
+            .draw(|frame| {
+                draw_review_dialog(frame, &model, &data, DialogMode::Commit, None, "fix", 2)
+            })
             .expect("draw review dialog");
         let buffer = terminal.backend().buffer();
         let y = *lines_containing(buffer, "c commit>")
