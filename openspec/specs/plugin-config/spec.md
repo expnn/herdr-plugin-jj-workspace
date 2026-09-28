@@ -8,7 +8,7 @@ TBD - created by archiving change config-foundation. Update Purpose after archiv
 
 #### Scenario: 配置文件不存在时使用默认值
 - **WHEN** `$HERDR_PLUGIN_CONFIG_DIR/config.toml` 不存在
-- **THEN** 插件以全部内置默认值正常运行（`jj.base_rev = "trunk()"`、`jj.workspace_root = "~/.herdr/workspaces"`、`agent.command = "codex"`、`agent.bootstrap_paths` 为 34 项跨 agent 默认清单，定义见"分节 schema 与内置默认值"）
+- **THEN** 插件以全部内置默认值正常运行（`jj.base_rev = "trunk()"`、`jj.workspace_root = "~/.herdr/workspaces"`、`agent.command = "opencode"`、`agent.bootstrap_paths` 为 34 项跨 agent 默认清单，定义见"分节 schema 与内置默认值"）
 
 #### Scenario: 进程环境变量不再作为配置通道
 - **WHEN** 进程环境中存在 `JJ_BASE_REV=main@origin`，且 config.toml 未定义 `jj.base_rev`
@@ -37,7 +37,7 @@ config.toml 存在语法错误、类型错误或空字符串值时，插件 MUST
 - **THEN** 插件拒绝运行，错误信息指出未知键 `agent.start_command`
 
 ### Requirement: 分节 schema 与内置默认值
-配置文件 SHALL 使用分节结构：`[jj]` 节含 `base_rev`（字符串，revset 语法）与 `workspace_root`（字符串，支持 `~` 展开）；`[agent]` 节含 `command`（字符串）、`bootstrap_paths`（字符串数组）与 `extend_bootstrap_paths`（字符串数组）。各键内置默认值 SHALL 为：`base_rev = "trunk()"`、`workspace_root = "~/.herdr/workspaces"`、`command = "codex"`、`bootstrap_paths` 为下列 34 项（顺序即传入 `jj sparse set` 的顺序）、`extend_bootstrap_paths = []`：
+配置文件 SHALL 使用分节结构：`[jj]` 节含 `base_rev`（字符串，revset 语法）与 `workspace_root`（字符串，支持 `~` 展开）；`[agent]` 节含 `command`（字符串）、`bootstrap_paths`（字符串数组）与 `extend_bootstrap_paths`（字符串数组）。各键内置默认值 SHALL 为：`base_rev = "trunk()"`、`workspace_root = "~/.herdr/workspaces"`、`command = "opencode"`、`bootstrap_paths` 为下列 34 项（顺序即传入 `jj sparse set` 的顺序）、`extend_bootstrap_paths = []`：
 
 - 根目录指令文件（8）：`AGENTS.md`、`AGENT.md`、`AGENTS.override.md`、`CLAUDE.md`、`CLAUDE.local.md`、`GEMINI.md`、`QWEN.md`、`CRUSH.md`
 - 根目录工具专属文件（8）：`.mcp.json`、`opencode.json`、`opencode.jsonc`、`.cursorrules`、`.windsurfrules`、`.goosehints`、`.augment-guidelines`、`.github/copilot-instructions.md`
@@ -45,9 +45,15 @@ config.toml 存在语法错误、类型错误或空字符串值时，插件 MUST
 
 默认清单 SHALL 为对上一版本 4 项默认（`AGENTS.md`、`AGENTS.override.md`、`.codex`、`.agents`）的纯超集。清单的调研依据（15 个主流编码 agent 的官方文档矩阵与排除理由）记录于 change `agent-agnostic-bootstrap-paths` 的 design.md。
 
+默认 `command` 仅是开箱即用的便利值，不是能力边界：插件对 herdr 能检测的任意 agent 均可用（`agent.command` 可设为任意经用户 shell 解析的命令）。
+
+#### Scenario: agent.command 默认值
+- **WHEN** config.toml 中未定义 `agent.command`
+- **THEN** 新工作区左 pane 以 `"opencode"` 启动 agent
+
 #### Scenario: 显式配置覆盖默认值
-- **WHEN** config.toml 定义 `[jj] base_rev = "dev"` 与 `[agent] command = "opencode"`
-- **THEN** 新工作区基于 revset `dev` 创建；左 pane 以 `opencode` 启动 agent
+- **WHEN** config.toml 定义 `[jj] base_rev = "dev"` 与 `[agent] command = "codex"`
+- **THEN** 新工作区基于 revset `dev` 创建；左 pane 以 `codex` 启动 agent
 
 #### Scenario: workspace_root 支持 ~ 展开
 - **WHEN** config.toml 定义 `jj.workspace_root = "~/code/workspaces"`
