@@ -48,11 +48,15 @@ TBD - created by archiving change right-pane-script. Update Purpose after archiv
 - **THEN** 脚本非零退出
 
 ### Requirement: pane 命令为单行脚本调用
-wizard 生成的右侧 pane 命令 SHALL 为一行脚本调用（脚本绝对路径 + 逐参数 `shell_quote`），MUST NOT 包含拼接的 jj 命令序列、`sh_c_escape` 转义内容或对 pane shell PATH 的依赖。脚本路径 MUST 为绝对路径（基于 `HERDR_PLUGIN_ROOT`）。
+wizard 生成的右侧 pane 命令 SHALL 为一行脚本调用（脚本绝对路径 + 逐参数 `shell_quote`），MUST NOT 包含拼接的 jj 命令序列、`sh_c_escape` 转义内容或对 pane shell PATH 的依赖。脚本路径 MUST 为绝对路径（基于 `HERDR_PLUGIN_ROOT`）。命令 MAY 携带来自 `[init]` 解析结果的可选前缀（`<init.right|init.default> && `，见 plugin-config 的 `[init]` 要求）：前缀为用户文本、原文注入、由 pane 的 shell 解析；无论是否携带前缀，脚本调用本身 MUST 仍是单次全参数引用调用，其参数形态 MUST NOT 因前缀存在而改变。
 
 #### Scenario: 一行调用
-- **WHEN** wizard 创建 jj 工作区
-- **THEN** 右侧 pane 收到 `nohup <脚本绝对路径> '<jj路径>' '<base-rev>' '<书签名>' '<ws>' '<t>' '<p>' [<'前导参数'>…]` 形态的单行命令，其中不含任何 `&&` 链或子 shell 组
+- **WHEN** wizard 创建 jj 工作区且 `[init]` 未提供右侧非空命令
+- **THEN** 右侧 pane 收到 `'<脚本绝对路径>' '<jj路径>' '<base-rev>' '<书签名>' '<ws>' '<t>' '<p>' [<'前导参数'>…]` 形态的单行命令，其中不含任何 `&&` 链或子 shell 组
+
+#### Scenario: 携带 init 前缀
+- **WHEN** wizard 创建 jj 工作区且 `init.right`（或 `init.default`）解析结果非空
+- **THEN** 右侧 pane 收到 `<init 前缀> && '<脚本绝对路径>' '<jj路径>' …` 形态的单行命令，其中脚本调用部分与未配置时逐字节相同
 
 ### Requirement: base revset 在主仓库上下文重解析
 脚本 SHALL 在 `jj git fetch` 之后、`rebase` 之前推导主仓库根并以主仓库上下文重解析 base revset：主仓库根 SHALL 由本工作区 `.jj/repo` 指针推导（指针相对 `.jj/` 解析、绝对路径原样使用，结果规范化；脚本签名不变、无新参数）；解析 SHALL 以 `jj -R <主仓库根> --ignore-working-copy log -r <base-rev> --no-graph -T 'commit_id ++ "\n"'`（每 commit 一行）进行，脚本 SHALL 将多行结果连接为 ` | ` 分隔的单一 union revset；解析结果非空时 `rebase -s @ -d` 的目标 MUST 为该 union（单参数），解析为空或失败时跳过（见失败语义）。`jj git fetch` 的位置与形态（副工作区、全量拉取）MUST 不变。

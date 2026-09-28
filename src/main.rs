@@ -389,6 +389,7 @@ const DEFAULT_BOOTSTRAP_PATHS: [&str; 34] = [
 struct Config {
     jj: JjConfig,
     agent: AgentConfig,
+    init: InitConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -477,11 +478,28 @@ struct AgentConfig {
     poll_interval_ms: u64,
 }
 
+/// `[init]` section: optional command prefixes run in a pane's interactive
+/// shell before that pane's main command. `Option<String>` distinguishes a
+/// missing key (fall back to `default`) from an explicit empty string, which
+/// is invalid config (`Config::validate` rejects it).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct InitConfig {
+    /// Default command prefix for both panes; an explicit `left`/`right`
+    /// overrides it (override, never concatenation).
+    default: Option<String>,
+    /// Command prefix for the left (agent) pane only.
+    left: Option<String>,
+    /// Command prefix for the right (setup script) pane only.
+    right: Option<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             jj: JjConfig::default(),
             agent: AgentConfig::default(),
+            init: InitConfig::default(),
         }
     }
 }
@@ -605,6 +623,15 @@ impl Config {
         }
         if self.agent.command.is_empty() {
             return Err(ConfigError::Empty("agent.command".into()));
+        }
+        for (key, value) in [
+            ("init.default", &self.init.default),
+            ("init.left", &self.init.left),
+            ("init.right", &self.init.right),
+        ] {
+            if matches!(value, Some(value) if value.is_empty()) {
+                return Err(ConfigError::Empty(key.into()));
+            }
         }
         match &self.jj.command {
             JjCommandValue::Single(value) if value.is_empty() => {
@@ -1074,9 +1101,12 @@ fn cmd_wizard() -> ! {
     }
     run_or(bootstrap, "materialize agent bootstrap files", fail);
 
+    let herdr = herdr_bin();
     open_tab_layout(
         &config,
         &jj,
+        &herdr,
+        &setup_script_path(),
         &selection.source.id,
         &dest,
         &selection.name,
@@ -1176,18 +1206,53 @@ fn resolve_start_command(agent: &AgentConfig) -> String {
     agent.command.clone()
 }
 
+/// Which pane an `[init]` resolution targets: left = agent, right = setup
+/// script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitPane {
+    Left,
+    Right,
+}
+
+/// Resolve one pane's `[init]` prefix: the pane's explicit key wins; an
+/// absent key falls back to `init.default`; both absent = `None` (no prefix).
+/// The explicit key *replaces* `default` — the two are never concatenated.
+fn resolved_init(init: &InitConfig, pane: InitPane) -> Option<&str> {
+    let explicit = match pane {
+        InitPane::Left => init.left.as_deref(),
+        InitPane::Right => init.right.as_deref(),
+    };
+    explicit.or(init.default.as_deref())
+}
+
+/// The text injected into one pane via a single `herdr pane run`: the
+/// resolved init prefix (when present) joined to the pane's main command with
+/// `&&` — the shell runs the main command only after init exits 0. No init =
+/// the main command byte-for-byte unchanged.
+fn compose_pane_command(init: Option<&str>, main: &str) -> String {
+    match init {
+        None => main.to_string(),
+        Some(init) => format!("{init} && {main}"),
+    }
+}
+
+/// herdr and the setup script path are injected by the caller (`cmd_wizard`
+/// passes `herdr_bin()` and `setup_script_path()`), so this function reads no
+/// process environment and tests can drive it against a fake herdr and a
+/// fixed script path.
 fn open_tab_layout(
     config: &Config,
     jj: &ResolvedJj,
+    herdr: &str,
+    setup_script: &Path,
     workspace_id: &str,
     cwd: &str,
     label: &str,
     base_rev: &str,
 ) {
-    let herdr = herdr_bin();
     eprintln!("+ herdr tab create --workspace {workspace_id} --cwd {cwd}");
     let created = command_json(
-        Command::new(&herdr).args([
+        Command::new(herdr).args([
             "tab",
             "create",
             "--workspace",
@@ -1204,7 +1269,7 @@ fn open_tab_layout(
     let left_pane = required_json_string(&created, "/result/root_pane/pane_id");
 
     let split = command_json(
-        Command::new(&herdr).args([
+        Command::new(herdr).args([
             "pane",
             "split",
             "--pane",
@@ -1220,26 +1285,35 @@ fn open_tab_layout(
         "herdr pane split",
     );
     let right_pane = required_json_string(&split, "/result/pane/pane_id");
-    let right_command = setup_script_command(
-        &setup_script_path(),
-        jj,
-        base_rev,
-        label,
-        workspace_id,
-        &tab_id,
-        &left_pane,
+    // `[init]` prefix (when resolved): injected verbatim as user shell text
+    // ahead of the script call, still one `pane run`; without it the command
+    // is byte-for-byte the pre-`[init]` script call.
+    let right_command = compose_pane_command(
+        resolved_init(&config.init, InitPane::Right),
+        &setup_script_command(
+            setup_script,
+            jj,
+            base_rev,
+            label,
+            workspace_id,
+            &tab_id,
+            &left_pane,
+        ),
     );
-    let mut run_right = Command::new(&herdr);
+    let mut run_right = Command::new(herdr);
     run_right.args(["pane", "run", &right_pane, &right_command]);
     run_or(run_right, "start right-pane setup", fail);
 
     // Give checkout materialization a head start, then launch the coding
     // agent without changing focus away from the left pane. The start command
-    // comes from `agent.command` (default "opencode"): panes run the user's
-    // shell, where agent launch aliases vary between setups and cannot be
-    // assumed.
-    let start_command = resolve_start_command(&config.agent);
-    let mut start_agent = Command::new(&herdr);
+    // comes from `agent.command` (default "opencode"), optionally prefixed by
+    // the resolved `[init]` command: panes run the user's shell, where agent
+    // launch aliases vary between setups and cannot be assumed.
+    let start_command = compose_pane_command(
+        resolved_init(&config.init, InitPane::Left),
+        &resolve_start_command(&config.agent),
+    );
+    let mut start_agent = Command::new(herdr);
     start_agent.args(["pane", "run", &left_pane, &start_command]);
     run_or(start_agent, "start agent in left pane", fail);
 }
@@ -5187,6 +5261,25 @@ mod tests {
     }
 
     #[test]
+    fn init_prefix_leaves_the_right_pane_script_call_byte_identical() {
+        // The workspace-setup-script carve-out: a prefix may ride ahead of
+        // the script call, but the call itself (quoting, argument form,
+        // order) must not change when the prefix is present.
+        let script = Path::new("/opt/plugin/scripts/setup-workspace.sh");
+        let jj = ResolvedJj {
+            executable: PathBuf::from("/usr/bin/jj"),
+            extra_args: vec!["--at-op".into(), "@-".into()],
+        };
+        let main = setup_script_command(script, &jj, "trunk()", "workspace/fix-api", "w", "t", "p");
+        let init = "export HTTPS_PROXY=http://proxy:8080";
+        let prefix = "export HTTPS_PROXY=http://proxy:8080 && ";
+        let composed = compose_pane_command(Some(init), &main);
+        assert_eq!(composed, format!("{prefix}{main}"));
+        // The script-call portion is byte-for-byte the unprefixed command.
+        assert_eq!(composed.strip_prefix(prefix), Some(main.as_str()));
+    }
+
+    #[test]
     fn setup_script_parses_under_sh() {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-workspace.sh");
         let status = std::process::Command::new("sh")
@@ -5362,6 +5455,53 @@ mod tests {
             message.contains("agent.command") && message.contains("empty"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn config_init_keys_parse_and_absent_keys_stay_none() {
+        let dir = TempDir::new();
+        let path = dir.write_config(
+            "[init]\n\
+             default = \"export A=1\"\n\
+             left = \"source .venv/bin/activate\"\n\
+             right = \"true\"\n",
+        );
+        let config = load_config_from(&path).expect("valid [init]");
+        assert_eq!(config.init.default.as_deref(), Some("export A=1"));
+        assert_eq!(
+            config.init.left.as_deref(),
+            Some("source .venv/bin/activate")
+        );
+        assert_eq!(config.init.right.as_deref(), Some("true"));
+
+        // No `[init]` section at all: every key is absent (Option::None), so
+        // the panes inject their pre-change commands untouched.
+        assert_eq!(Config::default().init, InitConfig::default());
+        assert_eq!(InitConfig::default().default, None);
+        assert_eq!(InitConfig::default().left, None);
+        assert_eq!(InitConfig::default().right, None);
+    }
+
+    #[test]
+    fn config_empty_init_value_is_rejected_per_key() {
+        for key in ["default", "left", "right"] {
+            let dir = TempDir::new();
+            let path = dir.write_config(&format!("[init]\n{key} = \"\"\n"));
+            let err = load_config_from(&path).expect_err("empty init value");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("init.{key}")) && message.contains("empty"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_unknown_init_key_is_rejected() {
+        let dir = TempDir::new();
+        let path = dir.write_config("[init]\nlef = \"x\"\n");
+        let err = load_config_from(&path).expect_err("unknown init key");
+        assert!(err.to_string().contains("lef"), "{}", err);
     }
 
     #[test]
@@ -5643,6 +5783,77 @@ mod tests {
             ..AgentConfig::default()
         };
         assert_eq!(resolve_start_command(&agent), "codex --full-auto");
+    }
+
+    // --- [init] per-pane resolution and command composition -------------------
+
+    #[test]
+    fn resolved_init_prefers_each_panes_explicit_key_over_default() {
+        // Explicit keys win on both sides, replacing `default` entirely (the
+        // assertion would fail on any concatenation of the two).
+        let init = InitConfig {
+            default: Some("D".into()),
+            left: Some("L".into()),
+            right: Some("R".into()),
+        };
+        assert_eq!(resolved_init(&init, InitPane::Left), Some("L"));
+        assert_eq!(resolved_init(&init, InitPane::Right), Some("R"));
+
+        // `default` only: both panes fall back to it.
+        let init = InitConfig {
+            default: Some("D".into()),
+            left: None,
+            right: None,
+        };
+        assert_eq!(resolved_init(&init, InitPane::Left), Some("D"));
+        assert_eq!(resolved_init(&init, InitPane::Right), Some("D"));
+
+        // One explicit side, the other falls back to `default`.
+        let init = InitConfig {
+            default: Some("D".into()),
+            left: Some("L".into()),
+            right: None,
+        };
+        assert_eq!(resolved_init(&init, InitPane::Left), Some("L"));
+        assert_eq!(resolved_init(&init, InitPane::Right), Some("D"));
+
+        let init = InitConfig {
+            default: Some("D".into()),
+            left: None,
+            right: Some("R".into()),
+        };
+        assert_eq!(resolved_init(&init, InitPane::Left), Some("D"));
+        assert_eq!(resolved_init(&init, InitPane::Right), Some("R"));
+
+        // Single explicit side without `default`: the other side stays empty.
+        let init = InitConfig {
+            default: None,
+            left: Some("L".into()),
+            right: None,
+        };
+        assert_eq!(resolved_init(&init, InitPane::Left), Some("L"));
+        assert_eq!(resolved_init(&init, InitPane::Right), None);
+
+        // All absent: no initialization on either side.
+        let init = InitConfig::default();
+        assert_eq!(resolved_init(&init, InitPane::Left), None);
+        assert_eq!(resolved_init(&init, InitPane::Right), None);
+    }
+
+    #[test]
+    fn compose_pane_command_joins_init_with_one_ampersand_pair() {
+        // No init: byte-for-byte the main command, whatever it contains.
+        assert_eq!(compose_pane_command(None, "opencode"), "opencode");
+        assert_eq!(
+            compose_pane_command(None, "codex --full-auto 'x y'"),
+            "codex --full-auto 'x y'"
+        );
+        // Init: exactly `<init> && <main>` — one space on each side of `&&`.
+        assert_eq!(
+            compose_pane_command(Some("export A='x y'"), "opencode"),
+            "export A='x y' && opencode"
+        );
+        assert_eq!(compose_pane_command(Some("true"), "sh /x"), "true && sh /x");
     }
 
     /// Runs the shipped setup script inside a fake plugin layout
@@ -8992,5 +9203,163 @@ pwd > "$D/cwd"
     }
     fn palette_subtext0() -> Color {
         Color::Rgb(166, 173, 200)
+    }
+
+    // --- [init] pane injection (fake herdr end to end) ------------------------
+
+    /// Script path injected into `open_tab_layout` by these tests: a fixed
+    /// literal, so the expected right-pane command never depends on the test
+    /// binary's own location (and no test needs to touch `HERDR_PLUGIN_ROOT`).
+    #[cfg(unix)]
+    const TEST_LAYOUT_SCRIPT: &str = "/opt/plugin/scripts/setup-workspace.sh";
+
+    /// Fake herdr for `open_tab_layout`: answers `tab create` and `pane split`
+    /// with the JSON envelope shape the layout reads, and appends every
+    /// `pane run` argument pair (pane id, injected text, NUL-separated) to
+    /// `pane-run.log`. Every branch succeeds because the layout's error path
+    /// is fail-fast (process exit).
+    #[cfg(unix)]
+    fn make_fake_herdr_layout(dir: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = r#"#!/bin/sh
+D=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+case "$1 $2" in
+  "tab create")
+    echo '{"result":{"tab":{"tab_id":"tab-1"},"root_pane":{"pane_id":"pane-left"}}}'
+    ;;
+  "pane split")
+    echo '{"result":{"pane":{"pane_id":"pane-right"}}}'
+    ;;
+  "pane run")
+    printf '%s\0%s\0' "$3" "$4" >> "$D/pane-run.log"
+    ;;
+esac
+"#;
+        let bin = dir.join("herdr-layout");
+        std::fs::write(&bin, script).expect("write fake herdr");
+        // Sync before spawn: executing a freshly written script can race the
+        // kernel's write-open tracking and fail with ETXTBSY ("Text file
+        // busy", rust-lang/rust #114554).
+        std::fs::File::open(&bin)
+            .and_then(|file| file.sync_all())
+            .expect("sync fake herdr");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake herdr executable");
+        bin.display().to_string()
+    }
+
+    /// Reads the NUL-separated `(pane id, injected text)` pairs the fake
+    /// herdr logged, in call order.
+    #[cfg(unix)]
+    fn read_pane_runs(dir: &Path) -> Vec<(String, String)> {
+        let bytes = std::fs::read(dir.join("pane-run.log")).expect("pane run log");
+        let fields: Vec<&[u8]> = bytes
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty())
+            .collect();
+        assert_eq!(fields.len() % 2, 0, "pane run log must hold id/text pairs");
+        fields
+            .chunks(2)
+            .map(|pair| {
+                (
+                    String::from_utf8(pair[0].to_vec()).expect("utf8 pane id"),
+                    String::from_utf8(pair[1].to_vec()).expect("utf8 injected text"),
+                )
+            })
+            .collect()
+    }
+
+    /// Runs `open_tab_layout` against a fresh fake herdr and returns the two
+    /// `(pane id, injected text)` pairs it logged (right pane first, the
+    /// layout's call order).
+    #[cfg(unix)]
+    fn run_layout(config: &Config) -> Vec<(String, String)> {
+        let dir = TempDir::new();
+        let herdr = make_fake_herdr_layout(dir.path());
+        let jj = ResolvedJj {
+            executable: PathBuf::from("/usr/bin/jj"),
+            extra_args: Vec::new(),
+        };
+        open_tab_layout(
+            config,
+            &jj,
+            &herdr,
+            Path::new(TEST_LAYOUT_SCRIPT),
+            "w1",
+            "/tmp/ws",
+            "fix-api",
+            "trunk()",
+        );
+        read_pane_runs(dir.path())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn init_prefix_reaches_both_pane_run_injections() {
+        // The right-pane script call, pinned as a literal: a single quoted
+        // call with the resolved script path, jj path, and positional
+        // arguments in order.
+        let right_main = "'/opt/plugin/scripts/setup-workspace.sh' '/usr/bin/jj' \
+                          'trunk()' 'fix-api' 'w1' 'tab-1' 'pane-left'";
+
+        // (a) No `[init]`: both injections are byte-for-byte the pre-change
+        // text (`agent.command` on the left, the script call on the right).
+        let runs = run_layout(&Config::default());
+        assert_eq!(
+            runs,
+            vec![
+                ("pane-right".to_string(), right_main.to_string()),
+                ("pane-left".to_string(), "opencode".to_string()),
+            ]
+        );
+
+        // (b) `default` only: the same prefix on both sides.
+        let default = "export HTTPS_PROXY=http://proxy:8080";
+        let mut config = Config::default();
+        config.init.default = Some(default.to_string());
+        let runs = run_layout(&config);
+        assert_eq!(
+            runs,
+            vec![
+                (
+                    "pane-right".to_string(),
+                    format!("{default} && {right_main}")
+                ),
+                ("pane-left".to_string(), format!("{default} && opencode")),
+            ]
+        );
+
+        // (c) `default` + `left` override: the left side uses its own prefix
+        // (default is not concatenated), the right side keeps `default`.
+        let mut config = Config::default();
+        config.init.default = Some("true".to_string());
+        config.init.left = Some("source .venv/bin/activate".to_string());
+        let runs = run_layout(&config);
+        assert_eq!(
+            runs,
+            vec![
+                ("pane-right".to_string(), format!("true && {right_main}")),
+                (
+                    "pane-left".to_string(),
+                    "source .venv/bin/activate && opencode".to_string()
+                ),
+            ]
+        );
+
+        // (d) `left` only: the right injection is byte-identical to (a)'s.
+        let mut config = Config::default();
+        config.init.left = Some("sh ~/init.sh".to_string());
+        let runs = run_layout(&config);
+        assert_eq!(
+            runs,
+            vec![
+                ("pane-right".to_string(), right_main.to_string()),
+                (
+                    "pane-left".to_string(),
+                    "sh ~/init.sh && opencode".to_string()
+                ),
+            ]
+        );
     }
 }

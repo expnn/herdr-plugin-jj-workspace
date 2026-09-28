@@ -75,6 +75,11 @@ left.
 The setup script runs under `/bin/sh`, so it works no matter which interactive
 shell your Herdr panes use (fish, bash, zsh, and other POSIX shells).
 
+Both panes can also run an optional initialization command before their main
+command — for example to export proxy variables or activate an environment —
+see
+[Init commands before each pane's main command](#init-commands-before-each-panes-main-command).
+
 ## Configuration
 
 Optional plugin settings live in `config.toml` in the plugin config directory:
@@ -105,6 +110,11 @@ auto_trust = false                        # auto-press Enter for the codex trust
 # trust_window_secs = 10                  # window (seconds) in which auto_trust may answer the trust prompt
 # startup_timeout_secs = 20               # wait budget (seconds) for the agent to be detected
 # poll_interval_ms = 200                  # agent-status polling interval (ms)
+
+[init]
+# default = "export HTTPS_PROXY=http://proxy:8080"  # run in both panes before their main command
+# left = "source .venv/bin/activate"                # override for the left (agent) pane
+# right = "true"                                    # override for the right (setup) pane
 ```
 
 Unknown keys are rejected (`deny_unknown_fields`), so a typo like `bas_rev`
@@ -166,6 +176,55 @@ Keys:
   **only** your own files, combine `bootstrap_paths = []` with this key: the
   explicit empty list clears the baseline, so the startup step materializes
   just what you listed (whitelist mode).
+
+### Init commands before each pane's main command
+
+Each pane can run one optional shell command in its own interactive shell
+right before its main command — the agent on the left, the setup script on
+the right:
+
+```toml
+[init]
+default = "export HTTPS_PROXY=http://proxy:8080"  # both panes
+# left = "source .venv/bin/activate"              # left pane only (overrides default)
+# right = "true"                                  # right pane only (overrides default)
+```
+
+The value is a shell command line as a single string (array form is not
+supported), injected verbatim into the pane's shell (same model as
+`agent.command` — no escaping, no second round of quoting).
+Each pane resolves independently: `init.left` for the left pane (right:
+`init.right`) when present, otherwise `init.default`, otherwise nothing. An
+explicit key **overrides** `default` for that pane; the two are never
+concatenated.
+
+A pane with a resolution receives a single `herdr pane run` of
+`<init> && <main command>`, so an init that exits non-zero blocks that pane's
+main command instead of being ignored — soften it yourself when you want
+best-effort, for example `default = "nix develop || true"`. There is no
+fallback to `default` on failure; `default` only covers a missing key.
+
+Boundaries and caveats:
+
+- **Pre-checkout only.** Both hooks run before the full checkout (`jj sparse
+  set --clear --add .`): at that moment the new workspace holds only the
+  bootstrap files (`agent.bootstrap_paths`), so do not touch project files
+  (dependencies, virtualenvs, git hooks, `direnv`). Post-checkout
+  initialization is not part of `[init]`.
+- **Shell portability.** The command runs in that pane's interactive shell
+  (whatever Herdr starts: fish, bash, zsh, …), so anything that must leave
+  state behind (`. /path`, `source /path`) has to match that shell's syntax.
+  For a cross-shell, no-state one-shot, invoke it explicitly: `sh /path`.
+- **Turning one side off.** An empty value is invalid config. When `default`
+  is set but one pane should not run it, use an explicit no-op:
+  `right = "true"` (or `left = "true"`).
+- **Failure visibility.** If the left init fails, the agent never starts and
+  the existing agent-readiness wait reports no agent detected (`finish-tab`,
+  after `agent.startup_timeout_secs`). If the right init fails, the setup
+  script does not run, so the checkout does not happen either; the error
+  stays visible in the right pane.
+- Keep init commands short — they delay the pane's main command, and on the
+  right pane the checkout as well.
 
 ### Choosing the base revision
 
