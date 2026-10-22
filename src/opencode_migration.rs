@@ -1,12 +1,18 @@
 //! opencode session migration for `remove`.
 //!
-//! opencode binds every session to a directory (`session.directory`) and a
-//! project (`session.project_id`). When a jj workspace directory is deleted,
-//! those rows become invisible forever, so `cmd_remove` migrates them to the
-//! main repo first, mirroring opencode's own `SessionEvent.Moved` projection
-//! plus its project adoption: `project_id` is rewritten to the main repo's
-//! project, `directory` to the main repo root, `path` flattened to `''`,
-//! `workspace_id` released to NULL and `time_updated` stamped now.
+//! opencode binds every session to a directory (`directory`) and a project
+//! (`project_id`). When a jj workspace directory is deleted, those rows become
+//! invisible forever, so `cmd_remove` migrates them to the main repo first,
+//! mirroring opencode's own `SessionEvent.Moved` projection plus its project
+//! adoption: `project_id` is rewritten to the main repo's project, `directory`
+//! to the main repo root, `path` flattened to `''`, `workspace_id` released to
+//! NULL and `time_updated` stamped now.
+//!
+//! The live session table is selected by schema presence: opencode v2 writes
+//! `session_v2` (the v1 `session` table it leaves behind is history only), so a
+//! DB containing `session_v2` migrates that table exclusively; a v1-only DB
+//! keeps using `session`. Version strings are never consulted, and the table
+//! name is an internal constant — never user input.
 //!
 //! The removal dialog previews the rows a migration would rewrite with the
 //! read-only [`inspect_opencode_sessions`] (same discovery chain and range
@@ -81,6 +87,29 @@ pub enum Inspection {
         rows: Vec<SessionRow>,
         main_repo: PathBuf,
     },
+}
+
+/// The live opencode session table. opencode v2 writes `session_v2`; the v1
+/// `session` table is kept as history only. Selected by schema presence (never
+/// by a version string) and used verbatim in generated SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionStore {
+    V1,
+    V2,
+}
+
+impl SessionStore {
+    /// Physical table name (internal constant — never user input).
+    fn table(self) -> &'static str {
+        match self {
+            SessionStore::V1 => "session",
+            SessionStore::V2 => "session_v2",
+        }
+    }
+
+    fn is_v2(self) -> bool {
+        matches!(self, SessionStore::V2)
+    }
 }
 
 /// Columns the migration reads or writes; probed before any write (D7).
@@ -362,7 +391,7 @@ fn db_path_from_output(stdout: &[u8]) -> Option<PathBuf> {
 /// run the fail-closed schema probe. Shared by preview and migration so a
 /// would-be-working migration is never refused merely because a read-only
 /// open failed.
-fn open_and_probe(db_path: &Path) -> Result<Connection, String> {
+fn open_and_probe(db_path: &Path) -> Result<(Connection, SessionStore), String> {
     let conn = Connection::open(db_path).map_err(|err| {
         format!(
             "cannot open the opencode DB (refusing to remove): {err}\n\
@@ -380,38 +409,43 @@ fn open_and_probe(db_path: &Path) -> Result<Connection, String> {
         .map_err(|err| {
             format!("cannot configure the opencode DB connection (refusing to remove): {err}")
         })?;
-    probe_schema(&conn)?;
-    Ok(conn)
+    let store = probe_schema(&conn)?;
+    Ok((conn, store))
 }
 
 /// Read-only counterpart of the migration: same discovery, schema and
 /// target checks, SELECTs only. `Ok(None)` = no matching sessions (skip);
 /// `Err` = fail-closed (the dialog blocks).
 fn inspect_db(db_path: &Path, ws: &Path, main: &Path) -> Result<Option<Vec<SessionRow>>, String> {
-    let conn = open_and_probe(db_path)?;
+    let (conn, store) = open_and_probe(db_path)?;
     // Mirror the migration: an empty match set is a skip even when the target
     // project cannot be resolved.
-    if count_sessions(&conn, ws)? == 0 {
+    if count_sessions(&conn, store, ws)? == 0 {
         return Ok(None);
     }
     // A target the migration could not resolve must block the preview too,
     // so the dialog never offers a migration that will refuse later.
-    resolve_target(&conn, main)?;
-    Ok(Some(select_sessions(&conn, ws)?))
+    resolve_target(&conn, store, main)?;
+    Ok(Some(select_sessions(&conn, store, ws)?))
 }
 
 /// The rows a migration would rewrite, newest first. `session.title` is not
 /// part of the fail-closed probe (opencode added it later), so a schema
 /// without it selects a literal `''` — the dialog renders a placeholder.
-fn select_sessions(conn: &Connection, ws: &Path) -> Result<Vec<SessionRow>, String> {
-    let has_title = table_columns(conn, "session")?
+fn select_sessions(
+    conn: &Connection,
+    store: SessionStore,
+    ws: &Path,
+) -> Result<Vec<SessionRow>, String> {
+    let table = store.table();
+    let has_title = table_columns(conn, table)?
         .iter()
         .any(|name| name == "title");
     let title = if has_title { "title" } else { "''" };
     let ws = ws.to_string_lossy();
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT id, {title}, directory, time_updated FROM session \
+            "SELECT id, {title}, directory, time_updated FROM {table} \
              WHERE {WORKSPACE_RANGE} ORDER BY time_updated DESC, id"
         ))
         .map_err(|err| format!("cannot enumerate opencode sessions (refusing to remove): {err}"))?;
@@ -439,24 +473,44 @@ fn migrate_selected_db(
     main: &Path,
     selected: &[String],
 ) -> Result<Option<usize>, String> {
-    let mut conn = open_and_probe(db_path)?;
-    if count_selected_sessions(&conn, ws, selected)? == 0 {
+    let (mut conn, store) = open_and_probe(db_path)?;
+    if count_selected_sessions(&conn, store, ws, selected)? == 0 {
         return Ok(None);
     }
-    let target = resolve_target(&conn, main)?;
-    let updated = run_migration_tx(&mut conn, ws, main, &target, Some(selected))?;
+    let target = resolve_target(&conn, store, main)?;
+    let updated = run_migration_tx(&mut conn, store, ws, main, &target, Some(selected))?;
     Ok(Some(updated))
 }
 
-/// Fail-closed schema probe (D7): every column the migration touches must
-/// exist before the first write. opencode's history is ADD COLUMN-only for
-/// these tables, but a future rewrite must stop us rather than corrupt data.
-fn probe_schema(conn: &Connection) -> Result<(), String> {
-    let session_columns = table_columns(conn, "session")?;
+/// Select the live session table: `session_v2` when it exists (opencode v2
+/// writes it), otherwise `session` (v1). A DB with neither table cannot be
+/// reasoned about, so it refuses instead of matching zero rows.
+fn select_session_store(conn: &Connection) -> Result<SessionStore, String> {
+    if table_exists(conn, "session_v2")? {
+        return Ok(SessionStore::V2);
+    }
+    if table_exists(conn, "session")? {
+        return Ok(SessionStore::V1);
+    }
+    Err(
+        "opencode DB has neither session_v2 nor session table (refusing to remove): \
+         cannot enumerate opencode sessions"
+            .to_string(),
+    )
+}
+
+/// Fail-closed schema probe (D7): every column the migration touches on the
+/// selected live table must exist before the first write. opencode's history is
+/// ADD COLUMN-only for these tables, but a future rewrite must stop us rather
+/// than corrupt data.
+fn probe_schema(conn: &Connection) -> Result<SessionStore, String> {
+    let store = select_session_store(conn)?;
+    let table = store.table();
+    let session_columns = table_columns(conn, table)?;
     for column in SESSION_REQUIRED_COLUMNS {
         if !session_columns.iter().any(|name| name == column) {
             return Err(format!(
-                "opencode DB schema is missing session.{column} (refusing to remove)"
+                "opencode DB schema is missing {table}.{column} (refusing to remove)"
             ));
         }
     }
@@ -468,7 +522,7 @@ fn probe_schema(conn: &Connection) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(store)
 }
 
 /// Column names of `table` (SQLite `PRAGMA table_info`). Table names come
@@ -491,11 +545,12 @@ fn schema_error(err: rusqlite::Error) -> String {
 
 /// Number of session rows whose directory is `ws` or below it (D4 range
 /// predicate — never LIKE).
-fn count_sessions(conn: &Connection, ws: &Path) -> Result<usize, String> {
+fn count_sessions(conn: &Connection, store: SessionStore, ws: &Path) -> Result<usize, String> {
     let ws = ws.to_string_lossy();
+    let table = store.table();
     let count: i64 = conn
         .query_row(
-            &format!("SELECT COUNT(*) FROM session WHERE {WORKSPACE_RANGE}"),
+            &format!("SELECT COUNT(*) FROM {table} WHERE {WORKSPACE_RANGE}"),
             params![ws.as_ref()],
             |row| row.get(0),
         )
@@ -507,6 +562,7 @@ fn count_sessions(conn: &Connection, ws: &Path) -> Result<usize, String> {
 /// selection matches nothing.
 fn count_selected_sessions(
     conn: &Connection,
+    store: SessionStore,
     ws: &Path,
     selected: &[String],
 ) -> Result<usize, String> {
@@ -516,10 +572,11 @@ fn count_selected_sessions(
     let placeholders = id_placeholders(2, selected.len());
     let mut values = vec![Value::Text(ws.to_string_lossy().into_owned())];
     values.extend(selected.iter().cloned().map(Value::Text));
+    let table = store.table();
     let count: i64 = conn
         .query_row(
             &format!(
-                "SELECT COUNT(*) FROM session \
+                "SELECT COUNT(*) FROM {table} \
                  WHERE ({WORKSPACE_RANGE}) AND id IN ({placeholders})"
             ),
             params_from_iter(values),
@@ -538,10 +595,58 @@ fn id_placeholders(start: usize, count: usize) -> String {
         .join(", ")
 }
 
-/// Resolve the main repo's opencode project id without re-deriving any hash
-/// (D3): pure-jj repo → `'global'`; else the `.git/opencode` memo; else the
-/// `project` row keyed by worktree; else fail-closed with guidance.
-fn resolve_target(conn: &Connection, main: &Path) -> Result<String, String> {
+/// Resolve the main repo's opencode project id without re-deriving any hash.
+/// The selected live table decides the chain: v2 trusts the durable
+/// `project.worktree` answer only; v1 keeps its historical chain.
+fn resolve_target(conn: &Connection, store: SessionStore, main: &Path) -> Result<String, String> {
+    if store.is_v2() {
+        return resolve_target_v2(conn, main);
+    }
+    resolve_target_v1(conn, main)
+}
+
+/// opencode v2 resolves non-git directories to `directory:<hash>` projects, so
+/// the v1 `'global'` assumption no longer holds. The `project` row keyed by the
+/// main repo's worktree is opencode's own durable answer; require exactly one.
+fn resolve_target_v2(conn: &Connection, main: &Path) -> Result<String, String> {
+    let main_str = main.to_string_lossy();
+    let rows: Vec<String> = conn
+        .prepare("SELECT id FROM project WHERE worktree = ?1")
+        .map_err(|err| {
+            format!("cannot query the opencode project table (refusing to remove): {err}")
+        })?
+        .query_map(params![main_str.as_ref()], |row| row.get(0))
+        .map_err(|err| {
+            format!("cannot query the opencode project table (refusing to remove): {err}")
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| {
+            format!("cannot query the opencode project table (refusing to remove): {err}")
+        })?;
+    match rows.len() {
+        1 => Ok(rows.into_iter().next().expect("one row")),
+        0 => Err(format!(
+            "open opencode in the main repo once, then retry remove\n\
+             could not resolve the main repo's opencode project id for opencode v2 \
+             (no project row has worktree = the main repo root)\n\
+             main repo: {}\n\
+             the workspace was not removed; opencode session data is unchanged",
+            main.display()
+        )),
+        count => Err(format!(
+            "open opencode in the main repo once, then retry remove\n\
+             the main repo's opencode project id is ambiguous for opencode v2 \
+             ({count} project rows have worktree = the main repo root)\n\
+             main repo: {}\n\
+             the workspace was not removed; opencode session data is unchanged",
+            main.display()
+        )),
+    }
+}
+
+/// v1 chain (D3): pure-jj repo → `'global'`; else the `.git/opencode` memo;
+/// else the `project` row keyed by worktree; else fail-closed with guidance.
+fn resolve_target_v1(conn: &Connection, main: &Path) -> Result<String, String> {
     // (0) No `.git` at all: a pure jj main repo. opencode resolves such a
     // directory to the built-in 'global' project, whose row always exists.
     if !main.join(".git").exists() {
@@ -593,13 +698,17 @@ fn project_exists(conn: &Connection, id: &str) -> Result<bool, String> {
 }
 
 /// One immediate write transaction (D2): rewrite the matching session rows,
-/// drop stale `project_directory` rows, then commit. Any error rolls back
-/// and the caller refuses the removal; nothing is half-written. `selected`
-/// restricts the session UPDATE to those ids (`None` = every row in range,
-/// `Some(&[])` = nothing to do); `project_directory` cleanup always covers
-/// the full workspace range.
+/// then commit. Any error rolls back and the caller refuses the removal;
+/// nothing is half-written. `selected` restricts the session UPDATE to those
+/// ids (`None` = every row in range, `Some(&[])` = nothing to do).
+///
+/// v1 also drops stale `project_directory` rows for the workspace range. v2
+/// leaves `project` / `worktree` / deprecated `project_directory` rows alone:
+/// opencode's own `Project.sweep` archives projects whose directory is gone,
+/// and deleting a `project` row would cascade into `session_v2`.
 fn run_migration_tx(
     conn: &mut Connection,
+    store: SessionStore,
     ws: &Path,
     main: &Path,
     target: &str,
@@ -607,6 +716,7 @@ fn run_migration_tx(
 ) -> Result<usize, String> {
     let ws = ws.to_string_lossy();
     let main = main.to_string_lossy();
+    let table = store.table();
     let now_ms = unix_millis();
     // Placeholders: ?1 range root, ?2 target project, ?3 main repo root,
     // ?4 timestamp, ?5+ selected ids (bound in this order).
@@ -623,7 +733,7 @@ fn run_migration_tx(
             values.extend(ids.iter().cloned().map(Value::Text));
             (
                 format!(
-                    "UPDATE session SET project_id = ?2, directory = ?3, path = '', \
+                    "UPDATE {table} SET project_id = ?2, directory = ?3, path = '', \
                      workspace_id = NULL, time_updated = ?4 \
                      WHERE ({WORKSPACE_RANGE}) AND id IN ({placeholders})"
                 ),
@@ -632,7 +742,7 @@ fn run_migration_tx(
         }
         None => (
             format!(
-                "UPDATE session SET project_id = ?2, directory = ?3, path = '', \
+                "UPDATE {table} SET project_id = ?2, directory = ?3, path = '', \
                  workspace_id = NULL, time_updated = ?4 WHERE {WORKSPACE_RANGE}"
             ),
             vec![
@@ -651,7 +761,7 @@ fn run_migration_tx(
     let updated = tx
         .execute(&sql, params_from_iter(values))
         .map_err(|err| format!("cannot migrate opencode sessions (refusing to remove): {err}"))?;
-    if table_exists(&tx, "project_directory")? {
+    if !store.is_v2() && table_exists(&tx, "project_directory")? {
         tx.execute(
             &format!("DELETE FROM project_directory WHERE {WORKSPACE_RANGE}"),
             params![ws.as_ref()],
@@ -746,6 +856,32 @@ mod tests {
         .expect("create fixture schema");
     }
 
+    /// opencode v2.0-shaped fixture: the live `session_v2` table, plus the v1
+    /// `session` history table the v1→v2 migration leaves behind, the
+    /// deprecated `project_directory` table and the v2 `worktree` table — the
+    /// last two exist so tests can prove v2 leaves them untouched.
+    fn fixture_schema_v2(conn: &Connection) {
+        fixture_schema(conn);
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL DEFAULT '',
+                 project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+                 directory TEXT NOT NULL,
+                 path TEXT NOT NULL DEFAULT '',
+                 workspace_id TEXT,
+                 time_updated INTEGER NOT NULL DEFAULT 0,
+                 parent_id TEXT
+             );
+             CREATE TABLE worktree (
+                 project_id TEXT NOT NULL,
+                 directory TEXT NOT NULL,
+                 PRIMARY KEY (project_id, directory)
+             );",
+        )
+        .expect("create v2 fixture schema");
+    }
+
     fn insert_project(conn: &Connection, id: &str, worktree: &str) {
         conn.execute(
             "INSERT INTO project (id, worktree) VALUES (?1, ?2)",
@@ -795,11 +931,48 @@ mod tests {
         .expect("insert session");
     }
 
+    /// Session insert into the v2 live table (sub-agent rows carry a parent).
+    #[allow(clippy::too_many_arguments)]
+    fn insert_session_v2(
+        conn: &Connection,
+        id: &str,
+        title: &str,
+        project_id: &str,
+        directory: &str,
+        path: &str,
+        workspace_id: Option<&str>,
+        parent_id: Option<&str>,
+        time_updated: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO session_v2 \
+             (id, title, project_id, directory, path, workspace_id, parent_id, time_updated) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                title,
+                project_id,
+                directory,
+                path,
+                workspace_id,
+                parent_id,
+                time_updated
+            ],
+        )
+        .expect("insert session_v2");
+    }
+
     /// The five migration-relevant columns of one session row.
-    fn migration_row(conn: &Connection, id: &str) -> (String, String, String, Option<String>, i64) {
+    fn migration_row(
+        conn: &Connection,
+        table: &str,
+        id: &str,
+    ) -> (String, String, String, Option<String>, i64) {
         conn.query_row(
-            "SELECT project_id, directory, path, workspace_id, time_updated \
-             FROM session WHERE id = ?1",
+            &format!(
+                "SELECT project_id, directory, path, workspace_id, time_updated \
+                 FROM {table} WHERE id = ?1"
+            ),
             params![id],
             |row| {
                 Ok((
@@ -817,11 +990,11 @@ mod tests {
     /// Every session column, ordered by id, for before/after comparisons.
     type Snapshot = Vec<(String, String, String, String, String, Option<String>, i64)>;
 
-    fn session_snapshot(conn: &Connection) -> Snapshot {
-        conn.prepare(
+    fn session_snapshot(conn: &Connection, table: &str) -> Snapshot {
+        conn.prepare(&format!(
             "SELECT id, title, project_id, directory, path, workspace_id, time_updated \
-             FROM session ORDER BY id",
-        )
+             FROM {table} ORDER BY id"
+        ))
         .expect("prepare snapshot")
         .query_map([], |row| {
             Ok((
@@ -862,7 +1035,10 @@ mod tests {
         );
         // Longer-prefix sibling: `...proj-id-longer` must not match either.
         insert_session(&conn, "longer", "global", &format!("{ws}-longer"), "", None);
-        assert_eq!(count_sessions(&conn, Path::new(ws)).expect("count"), 3);
+        assert_eq!(
+            count_sessions(&conn, SessionStore::V1, Path::new(ws)).expect("count"),
+            3
+        );
     }
 
     // --- 6.2 target resolution chain ---------------------------------------
@@ -877,7 +1053,10 @@ mod tests {
         // (0) No .git at all → the built-in global project.
         let pure_jj = dir.path().join("pure-jj");
         fs::create_dir_all(&pure_jj).expect("create main dir");
-        assert_eq!(resolve_target(&conn, &pure_jj).expect("global"), "global");
+        assert_eq!(
+            resolve_target(&conn, SessionStore::V1, &pure_jj).expect("global"),
+            "global"
+        );
 
         // (1) Cache file + matching project row wins.
         let cached = dir.path().join("cached");
@@ -885,7 +1064,7 @@ mod tests {
         fs::write(cached.join(".git").join("opencode"), "cache-id\n").expect("write cache");
         insert_project(&conn, "cache-id", "/somewhere/else");
         assert_eq!(
-            resolve_target(&conn, &cached).expect("cache id"),
+            resolve_target(&conn, SessionStore::V1, &cached).expect("cache id"),
             "cache-id"
         );
 
@@ -893,12 +1072,15 @@ mod tests {
         let by_row = dir.path().join("by-row");
         fs::create_dir_all(by_row.join(".git")).expect("create .git");
         insert_project(&conn, "row-id", &by_row.to_string_lossy());
-        assert_eq!(resolve_target(&conn, &by_row).expect("row id"), "row-id");
+        assert_eq!(
+            resolve_target(&conn, SessionStore::V1, &by_row).expect("row id"),
+            "row-id"
+        );
 
         // (3) Neither → fail-closed with actionable guidance.
         let missing = dir.path().join("missing");
         fs::create_dir_all(missing.join(".git")).expect("create .git");
-        let err = resolve_target(&conn, &missing).expect_err("must refuse");
+        let err = resolve_target(&conn, SessionStore::V1, &missing).expect_err("must refuse");
         assert!(err.contains("open opencode in the main repo once"), "{err}");
         assert!(err.contains("retry remove"), "{err}");
         // Task 5.2: the toast only shows the first line (truncated at 120 by
@@ -917,7 +1099,10 @@ mod tests {
         fs::create_dir_all(main.join(".git")).expect("create .git");
         fs::write(main.join(".git").join("opencode"), "not-a-project\n").expect("write cache");
         insert_project(&conn, "row-id", &main.to_string_lossy());
-        assert_eq!(resolve_target(&conn, &main).expect("row id"), "row-id");
+        assert_eq!(
+            resolve_target(&conn, SessionStore::V1, &main).expect("row id"),
+            "row-id"
+        );
     }
 
     // --- 6.3 probe refusal / skip paths ------------------------------------
@@ -955,6 +1140,31 @@ mod tests {
         .expect("create schema");
         let err = probe_schema(&conn).expect_err("missing project.worktree must refuse");
         assert!(err.contains("project.worktree"), "{err}");
+
+        // v2: the live table is session_v2 and the refusal must name it.
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session_v2 (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT,
+                 directory TEXT,
+                 path TEXT,
+                 time_updated INTEGER
+             );",
+        )
+        .expect("create v2 schema");
+        let err = probe_schema(&conn).expect_err("missing session_v2.workspace_id must refuse");
+        assert!(err.contains("session_v2.workspace_id"), "{err}");
+        assert!(err.contains("refusing to remove"), "{err}");
+
+        // Neither table: refuse, never treat it as an empty match set.
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch("CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);")
+            .expect("create project-only schema");
+        let err = probe_schema(&conn).expect_err("no session table must refuse");
+        assert!(err.contains("neither session_v2 nor session"), "{err}");
+        assert!(err.contains("refusing to remove"), "{err}");
     }
 
     #[test]
@@ -1252,6 +1462,7 @@ mod tests {
         let mut conn = conn;
         let err = run_migration_tx(
             &mut conn,
+            SessionStore::V1,
             Path::new(ws),
             Path::new(main),
             "no-such-project",
@@ -1301,8 +1512,15 @@ mod tests {
         )
         .expect("create trigger");
         let mut conn = conn;
-        let err = run_migration_tx(&mut conn, Path::new(ws), Path::new(main), "target-id", None)
-            .expect_err("cleanup failure must refuse");
+        let err = run_migration_tx(
+            &mut conn,
+            SessionStore::V1,
+            Path::new(ws),
+            Path::new(main),
+            "target-id",
+            None,
+        )
+        .expect_err("cleanup failure must refuse");
         assert!(err.contains("project_directory"), "{err}");
 
         let directory: String = conn
@@ -1319,15 +1537,21 @@ mod tests {
 
     /// Whole-DB content snapshot (fixture tables only) for write-freedom
     /// checks.
-    fn db_snapshot(conn: &Connection) -> (Snapshot, Vec<(String, String)>) {
-        let project_dirs = conn
-            .prepare("SELECT directory, project_id FROM project_directory ORDER BY directory")
+    /// Deprecated v1 mapping rows, ordered by directory.
+    fn project_directory_snapshot(conn: &Connection) -> Vec<(String, String)> {
+        conn.prepare("SELECT directory, project_id FROM project_directory ORDER BY directory")
             .expect("prepare project_directory")
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .expect("query project_directory")
             .collect::<Result<Vec<_>, _>>()
-            .expect("collect project_directory");
-        (session_snapshot(conn), project_dirs)
+            .expect("collect project_directory")
+    }
+
+    fn db_snapshot(conn: &Connection, table: &str) -> (Snapshot, Vec<(String, String)>) {
+        (
+            session_snapshot(conn, table),
+            project_directory_snapshot(conn),
+        )
     }
 
     #[test]
@@ -1477,7 +1701,7 @@ mod tests {
             params![ws, format!("{ws}/sub")],
         )
         .expect("seed project_directory");
-        let before = db_snapshot(&conn);
+        let before = db_snapshot(&conn, "session");
         drop(conn);
 
         let rows = inspect_db(&db_path, Path::new(ws), &main_path)
@@ -1486,7 +1710,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
 
         let conn = Connection::open(&db_path).expect("reopen db");
-        assert_eq!(db_snapshot(&conn), before, "preview must not write");
+        assert_eq!(
+            db_snapshot(&conn, "session"),
+            before,
+            "preview must not write"
+        );
     }
 
     #[test]
@@ -1619,26 +1847,27 @@ mod tests {
 
         let conn = Connection::open(&db_path).expect("reopen db");
         let (project_id, directory, path, workspace_id, time_updated) =
-            migration_row(&conn, "chosen-a");
+            migration_row(&conn, "session", "chosen-a");
         assert_eq!(project_id, "target-id");
         assert_eq!(directory, main);
         assert_eq!(path, "");
         assert_eq!(workspace_id, None);
         assert!(time_updated >= before, "{time_updated} < {before}");
-        let (project_id, directory, path, workspace_id, _) = migration_row(&conn, "chosen-b");
+        let (project_id, directory, path, workspace_id, _) =
+            migration_row(&conn, "session", "chosen-b");
         assert_eq!(project_id, "target-id");
         assert_eq!(directory, main);
         assert_eq!(path, "");
         assert_eq!(workspace_id, None);
         // Unselected rows keep every column.
         let (project_id, directory, path, workspace_id, time_updated) =
-            migration_row(&conn, "left-out");
+            migration_row(&conn, "session", "left-out");
         assert_eq!(project_id, "global");
         assert_eq!(directory, format!("{ws}/other"));
         assert_eq!(path, "");
         assert_eq!(workspace_id, None);
         assert_eq!(time_updated, 0);
-        let (project_id, directory, ..) = migration_row(&conn, "sibling");
+        let (project_id, directory, ..) = migration_row(&conn, "session", "sibling");
         assert_eq!(project_id, "global");
         assert_eq!(directory, format!("{ws}_sibling"));
 
@@ -1666,7 +1895,7 @@ mod tests {
         insert_project(&conn, "global", "");
         insert_project(&conn, "target-id", &main);
         insert_session(&conn, "root", "global", ws, "", None);
-        let before = db_snapshot(&conn);
+        let before = db_snapshot(&conn, "session");
         drop(conn);
 
         // The empty selection short-circuits before PATH discovery, so this
@@ -1678,7 +1907,7 @@ mod tests {
         }
 
         let conn = Connection::open(&db_path).expect("reopen db");
-        assert_eq!(db_snapshot(&conn), before, "skip must not write");
+        assert_eq!(db_snapshot(&conn, "session"), before, "skip must not write");
     }
 
     #[test]
@@ -1694,7 +1923,7 @@ mod tests {
         insert_project(&conn, "global", "");
         insert_project(&conn, "target-id", &main);
         insert_session(&conn, "still-here", "global", ws, "", None);
-        let before = db_snapshot(&conn);
+        let before = db_snapshot(&conn, "session");
         drop(conn);
 
         // The preview listed ids that are gone (or out of range) by the time
@@ -1705,7 +1934,7 @@ mod tests {
         assert!(outcome.is_none(), "no selected rows left must skip");
 
         let conn = Connection::open(&db_path).expect("reopen db");
-        assert_eq!(db_snapshot(&conn), before);
+        assert_eq!(db_snapshot(&conn, "session"), before);
     }
 
     #[test]
@@ -1759,5 +1988,399 @@ mod tests {
         fs::create_dir_all(self_ptr.join(".jj")).expect("create .jj");
         fs::write(self_ptr.join(".jj").join("repo"), "../self/.jj/repo").expect("write pointer");
         assert!(resolve_main_repo(&self_ptr).is_none());
+    }
+
+    // --- v2 live-table migration (opencode-v2-session-migration) ------------
+
+    #[test]
+    fn session_store_selection_prefers_v2_then_v1_and_refuses_neither() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT,
+                 directory TEXT,
+                 path TEXT,
+                 workspace_id TEXT,
+                 time_updated INTEGER
+             );",
+        )
+        .expect("create v1 schema");
+        assert_eq!(
+            select_session_store(&conn).expect("v1 only"),
+            SessionStore::V1
+        );
+
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT,
+                 directory TEXT,
+                 path TEXT,
+                 workspace_id TEXT,
+                 time_updated INTEGER
+             );",
+        )
+        .expect("create v2 table");
+        assert_eq!(
+            select_session_store(&conn).expect("both tables prefer v2"),
+            SessionStore::V2
+        );
+
+        conn.execute_batch("DROP TABLE session;")
+            .expect("drop v1 table");
+        assert_eq!(
+            select_session_store(&conn).expect("v2 only"),
+            SessionStore::V2
+        );
+
+        conn.execute_batch("DROP TABLE session_v2;")
+            .expect("drop v2 table");
+        let err = select_session_store(&conn).expect_err("neither table must refuse");
+        assert!(err.contains("neither session_v2 nor session"), "{err}");
+        assert!(err.contains("refusing to remove"), "{err}");
+    }
+
+    #[test]
+    fn v2_migration_updates_session_v2_only_and_leaves_legacy_rows_alone() {
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let ws = "/home/user/Workspace/main-repo/workspace-feature";
+        let main_path = dir.path().join("main-repo");
+        fs::create_dir_all(main_path.join(".git")).expect("create main .git");
+        let main = main_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).expect("create db");
+        fixture_schema_v2(&conn);
+        insert_project(&conn, "ws-proj", ws);
+        insert_project(&conn, "target-id", &main);
+        // v2 live rows: root, a sub-agent row under a subdirectory, a sibling.
+        insert_session_v2(&conn, "root", "Root", "ws-proj", ws, "", None, None, 5);
+        insert_session_v2(
+            &conn,
+            "sub",
+            "Sub agent",
+            "ws-proj",
+            &format!("{ws}/pkg"),
+            "pkg",
+            Some("wrk_old"),
+            Some("root"),
+            7,
+        );
+        insert_session_v2(
+            &conn,
+            "sibling",
+            "Sibling",
+            "ws-proj",
+            &format!("{ws}_sibling"),
+            "",
+            None,
+            None,
+            9,
+        );
+        // v1 history rows for the same workspace: v2 must never touch them.
+        insert_session_row(
+            &conn,
+            "legacy-root",
+            "Legacy root",
+            "ws-proj",
+            ws,
+            "",
+            None,
+            3,
+        );
+        insert_session_row(
+            &conn,
+            "legacy-sub",
+            "Legacy sub",
+            "ws-proj",
+            &format!("{ws}/pkg"),
+            "pkg",
+            None,
+            4,
+        );
+        conn.execute(
+            "INSERT INTO project_directory (directory, project_id) \
+             VALUES (?1, 'ws-proj'), (?2, 'ws-proj'), (?3, 'ws-proj')",
+            params![ws, format!("{ws}/pkg"), format!("{ws}_sibling")],
+        )
+        .expect("seed project_directory");
+        conn.execute(
+            "INSERT INTO worktree (project_id, directory) VALUES ('ws-proj', ?1)",
+            params![ws],
+        )
+        .expect("seed worktree");
+        let legacy_before = session_snapshot(&conn, "session");
+        let project_dirs_before = project_directory_snapshot(&conn);
+        drop(conn);
+
+        let before = unix_millis();
+        let selected = vec![
+            "root".to_string(),
+            "sub".to_string(),
+            "legacy-root".to_string(),
+        ];
+        let migrated = migrate_selected_db(&db_path, Path::new(ws), &main_path, &selected)
+            .expect("migration succeeds")
+            .expect("v2 rows matched");
+        assert_eq!(migrated, 2, "only session_v2 rows count");
+
+        let conn = Connection::open(&db_path).expect("reopen db");
+        let (project_id, directory, path, workspace_id, time_updated) =
+            migration_row(&conn, "session_v2", "root");
+        assert_eq!(project_id, "target-id");
+        assert_eq!(directory, main);
+        assert_eq!(path, "");
+        assert_eq!(workspace_id, None);
+        assert!(time_updated >= before, "{time_updated} < {before}");
+
+        // The sub-agent row (parent_id non-null) migrated too.
+        let (project_id, directory, path, workspace_id, _) =
+            migration_row(&conn, "session_v2", "sub");
+        assert_eq!(project_id, "target-id");
+        assert_eq!(directory, main);
+        assert_eq!(path, "");
+        assert_eq!(workspace_id, None);
+
+        // The underscore sibling and every v1 history row stay untouched.
+        let (project_id, directory, ..) = migration_row(&conn, "session_v2", "sibling");
+        assert_eq!(project_id, "ws-proj");
+        assert_eq!(directory, format!("{ws}_sibling"));
+        assert_eq!(session_snapshot(&conn, "session"), legacy_before);
+        // v2 leaves the deprecated mapping and worktree rows alone.
+        assert_eq!(project_directory_snapshot(&conn), project_dirs_before);
+        let worktrees: i64 = conn
+            .query_row("SELECT COUNT(*) FROM worktree", [], |row| row.get(0))
+            .expect("count worktree");
+        assert_eq!(worktrees, 1);
+    }
+
+    #[test]
+    fn inspect_and_migrate_use_session_v2_when_both_tables_exist() {
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let ws = "/home/user/Workspace/main-repo/workspace-feature";
+        let main_path = dir.path().join("main-repo");
+        fs::create_dir_all(main_path.join(".git")).expect("create main .git");
+        let main = main_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).expect("create db");
+        fixture_schema_v2(&conn);
+        insert_project(&conn, "ws-proj", ws);
+        insert_project(&conn, "target-id", &main);
+        insert_session_v2(
+            &conn, "v2-root", "V2 root", "ws-proj", ws, "", None, None, 10,
+        );
+        insert_session_v2(
+            &conn,
+            "v2-sub",
+            "V2 sub",
+            "ws-proj",
+            &format!("{ws}/sub"),
+            "sub",
+            None,
+            Some("v2-root"),
+            20,
+        );
+        insert_session_row(&conn, "v1-root", "V1 root", "ws-proj", ws, "", None, 30);
+        let v2_before = session_snapshot(&conn, "session_v2");
+        let v1_before = session_snapshot(&conn, "session");
+        drop(conn);
+
+        let rows = inspect_db(&db_path, Path::new(ws), &main_path)
+            .expect("inspect succeeds")
+            .expect("v2 rows");
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["v2-sub", "v2-root"],
+            "preview must list the live v2 table only"
+        );
+
+        // An id that exists only in the v1 table is drift for a v2 DB: skip,
+        // and write nothing.
+        let outcome = migrate_selected_db(
+            &db_path,
+            Path::new(ws),
+            &main_path,
+            &["v1-root".to_string()],
+        )
+        .expect("drift is not a failure");
+        assert!(outcome.is_none(), "v1-only id must not match");
+
+        let conn = Connection::open(&db_path).expect("reopen db");
+        assert_eq!(session_snapshot(&conn, "session_v2"), v2_before);
+        assert_eq!(session_snapshot(&conn, "session"), v1_before);
+    }
+
+    #[test]
+    fn v2_target_resolution_uses_worktree_only_and_refuses_ambiguity() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        fixture_schema_v2(&conn);
+        insert_project(&conn, "global", "");
+        insert_project(&conn, "cache-id", "/somewhere/else");
+        let dir = TempDir::new();
+
+        // A `.git/opencode` memo and the built-in global row must not be used
+        // by v2: only `project.worktree` answers.
+        let main = dir.path().join("main");
+        fs::create_dir_all(main.join(".git")).expect("create .git");
+        fs::write(main.join(".git").join("opencode"), "cache-id\n").expect("write cache");
+        let err = resolve_target(&conn, SessionStore::V2, &main).expect_err("no row must refuse");
+        assert!(err.contains("open opencode in the main repo once"), "{err}");
+        assert!(err.contains("opencode v2"), "{err}");
+
+        // Pure jj (no .git) without a worktree row refuses too — never 'global'.
+        let pure_jj = dir.path().join("pure-jj");
+        fs::create_dir_all(&pure_jj).expect("create pure jj dir");
+        resolve_target(&conn, SessionStore::V2, &pure_jj)
+            .expect_err("must not fall back to global");
+
+        // Exactly one matching row wins.
+        insert_project(&conn, "target-id", &main.to_string_lossy());
+        assert_eq!(
+            resolve_target(&conn, SessionStore::V2, &main).expect("row id"),
+            "target-id"
+        );
+
+        // A second row sharing the worktree is ambiguous and must refuse.
+        insert_project(&conn, "second-id", &main.to_string_lossy());
+        let err = resolve_target(&conn, SessionStore::V2, &main).expect_err("ambiguous");
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("2 project rows"), "{err}");
+    }
+
+    #[test]
+    fn inspect_refuses_v2_schema_gap_and_missing_session_tables() {
+        // v2 table present but missing a required column.
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).expect("create db");
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session_v2 (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT,
+                 directory TEXT,
+                 path TEXT,
+                 time_updated INTEGER
+             );",
+        )
+        .expect("create v2 schema");
+        drop(conn);
+        let err = inspect_db(
+            &db_path,
+            Path::new("/tmp/jj-workspace-inspect/ws"),
+            Path::new("/tmp/jj-workspace-inspect/main"),
+        )
+        .expect_err("missing session_v2.workspace_id must refuse");
+        assert!(err.contains("session_v2.workspace_id"), "{err}");
+
+        // Neither session table: refuse instead of reporting zero matches.
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).expect("create db");
+        conn.execute_batch("CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);")
+            .expect("create project-only schema");
+        drop(conn);
+        let err = inspect_db(
+            &db_path,
+            Path::new("/tmp/jj-workspace-inspect/ws"),
+            Path::new("/tmp/jj-workspace-inspect/main"),
+        )
+        .expect_err("no session table must refuse");
+        assert!(err.contains("neither session_v2 nor session"), "{err}");
+    }
+
+    #[test]
+    fn inspect_refuses_ambiguous_v2_target_after_matching_rows() {
+        let dir = TempDir::new();
+        let db_path = dir.path().join("opencode.db");
+        let ws = "/home/user/Workspace/main-repo/workspace-feature";
+        let main_path = dir.path().join("main-repo");
+        let main = main_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).expect("create db");
+        fixture_schema_v2(&conn);
+        insert_project(&conn, "ws-proj", ws);
+        insert_project(&conn, "target-id", &main);
+        insert_project(&conn, "second-id", &main);
+        insert_session_v2(&conn, "root", "Root", "ws-proj", ws, "", None, None, 1);
+        drop(conn);
+
+        let err = inspect_db(&db_path, Path::new(ws), &main_path)
+            .expect_err("ambiguous target must block the preview");
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("workspace was not removed"), "{err}");
+    }
+
+    /// Manual verification harness (ignored by default): runs the production
+    /// preview + migration against a copied real DB. Set:
+    ///   JJ_VERIFY_XDG=/tmp/... (contains opencode/opencode.db)
+    ///   JJ_VERIFY_WS=<jj workspace path>
+    ///   JJ_VERIFY_MAIN=<main repo path>
+    /// and run:
+    ///   cargo test manual_v2_real_db_copy_verification -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn manual_v2_real_db_copy_verification() {
+        let (Ok(xdg), Ok(ws), Ok(main)) = (
+            std::env::var("JJ_VERIFY_XDG"),
+            std::env::var("JJ_VERIFY_WS"),
+            std::env::var("JJ_VERIFY_MAIN"),
+        ) else {
+            eprintln!("skipping: set JJ_VERIFY_XDG / JJ_VERIFY_WS / JJ_VERIFY_MAIN");
+            return;
+        };
+        let ws = PathBuf::from(ws);
+        let main = PathBuf::from(main);
+        std::env::set_var("XDG_DATA_HOME", &xdg);
+
+        let rows = match inspect_opencode_sessions(&ws, &main) {
+            Inspection::Ready { rows, .. } => rows,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        assert!(!rows.is_empty(), "the copy must have rows for {ws:?}");
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+
+        match migrate_selected_opencode_sessions(&ws, &main, &ids) {
+            Outcome::Migrated { count, .. } => assert_eq!(count, ids.len()),
+            other => panic!("expected Migrated, got {other:?}"),
+        }
+        match inspect_opencode_sessions(&ws, &main) {
+            Inspection::Skipped(_) => {}
+            other => panic!("expected no rows after migration, got {other:?}"),
+        }
+
+        // Direct column check on the copy: every selected row landed on the
+        // main repo project with the official Moved projection values.
+        let main_str = main.to_string_lossy();
+        let db = Path::new(&xdg).join("opencode").join("opencode.db");
+        let conn = Connection::open(&db).expect("open copy");
+        let target: String = conn
+            .query_row(
+                "SELECT id FROM project WHERE worktree = ?1",
+                params![main_str.as_ref()],
+                |row| row.get(0),
+            )
+            .expect("target project");
+        for id in &ids {
+            let (project_id, directory, path, workspace_id) = conn
+                .query_row(
+                    "SELECT project_id, directory, path, workspace_id \
+                     FROM session_v2 WHERE id = ?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .expect("migrated row");
+            assert_eq!(project_id, target, "{id}");
+            assert_eq!(directory, main_str, "{id}");
+            assert_eq!(path, "", "{id}");
+            assert_eq!(workspace_id, None, "{id}");
+        }
     }
 }
